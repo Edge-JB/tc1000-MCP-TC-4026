@@ -11,5 +11,6 @@
     { "match": "Microsoft Visual Studio", "textMatch": "has been modified outside", "button": "Yes" }
   ],
   "rules": [
+    { "match": "TcXaeShell", "textMatch": "changed outside the environment", "button": "Yes" }
   ]
 }

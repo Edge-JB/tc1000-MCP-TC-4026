@@ -178,11 +178,24 @@ qualify). On finding one it either:
 Detection is dialog-driven, **not** a wall-clock timeout, so long legitimate
 operations (a multi-minute build) are never killed just for taking a while.
 
+### Pre-flight gate
+
+The watcher above catches dialogs that appear *during* a call. But a dialog that
+is **already open before** the command (you edited a file outside XAE, the target
+connection dropped, an earlier prompt was never cleared) corrupts the next
+command's result — e.g. a build returns a bogus *"No solution is open"* — and on
+the old code simply hung. So before every bridge call, `index.js` runs a one-shot
+pre-flight probe: it auto-dismisses an allowlisted dialog, and otherwise
+**refuses to run the command**, returning the dialog's title/text/buttons instead
+of firing into a poisoned XAE.
+
 ### Allowlist (`powershell/dialog-allowlist.json`)
 
-Ships with `rules: []` (report-only). Each rule: `match` (regex on the title,
-required), optional `textMatch` (regex on the body), and `button` (exact label to
-click). First matching rule wins; unmatched dialogs are reported, never clicked.
+Ships with one rule — the *"file has been changed outside the environment →
+reload?"* prompt is auto-answered **Yes**, so an agent's own source edits load
+into XAE. Each rule: `match` (regex on the title, required), optional `textMatch`
+(regex on the body), and `button` (exact label to click). First matching rule
+wins; unmatched dialogs are reported, never clicked.
 
 > **Live cell.** Only add dialogs that are safe to auto-answer unattended. Never
 > allowlist Activate Configuration / Run-mode / restart / download / safety
@@ -200,6 +213,29 @@ click). First matching rule wins; unmatched dialogs are reported, never clicked.
 Run `dialog-watch.ps1 -Mode probe` at any time to see the current dialog (if any)
 as JSON — useful for discovering the exact `title`/`button` strings for a new
 allowlist rule.
+
+## PLC session control (auto-logout)
+
+While the IDE is **logged in** to the PLC, TwinCAT will not load source edited
+outside the editor — it defers it ("*File will be loaded after logout*"). So an
+agent that edits a POU mid-session can't get that change compiled or deployed
+until a logout happens. On the 64-bit TcXaeShell the DTE Login/Logout commands
+are unreachable (they never report `IsAvailable=true` and have no key binding),
+which is why they were dropped from the tool surface.
+
+`powershell/plc-session.ps1` works around this with **UI Automation**: the IDE's
+Login/Logout toolbar buttons are reachable even when the DTE commands are not.
+Their enabled state is also a reliable session detector (Logout enabled ⇒ logged
+in; the two flip on logout).
+
+- **`plc_session` tool** — `action: "status"` (read-only `{ loggedIn }`) or
+  `action: "logout"` (invoke the Logout button; guarded with
+  `confirm="ALLOW_PLC_LOGOUT"`). It **never invokes Login** — there is no
+  auto-login by design.
+- **`plc_download` auto-logout** — with `autoLogout` (default `true`), the deploy
+  first checks the session and, if logged in, logs out so any deferred source
+  edits are applied before the boot project is generated. It never logs back in;
+  pass `autoLogout: false` to skip.
 
 ## Build Support
 

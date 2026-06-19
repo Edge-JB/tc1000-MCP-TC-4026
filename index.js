@@ -20,6 +20,7 @@ const z = require("zod/v4");
 const ACTIVATE_CONFIRMATION = "ALLOW_TWINCAT_ACTIVATE";
 const RESTART_CONFIRMATION = "ALLOW_TWINCAT_RESTART";
 const XAE_COMMAND_CONFIRMATION = "ALLOW_XAE_COMMAND_EXEC";
+const PLC_LOGOUT_CONFIRMATION = "ALLOW_PLC_LOGOUT";
 
 // --- Modal-dialog watchdog -------------------------------------------------
 // A bridge COM call into XAE blocks until any modal dialog it raises is
@@ -45,8 +46,102 @@ function killTree(child) {
   try { spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
 }
 
-function bridgeCall(action, payload = {}) {
+// 64-bit TcXaeShell (DTE.17.0) needs 64-bit PowerShell; the legacy 32-bit shell (DTE.15.0) needs SysWOW64.
+function resolveBridgePaths() {
+  const winDir = process.env.WINDIR || "C:\\Windows";
+  const ps64 = path.join(winDir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const psWow = path.join(winDir, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const use64 = fs.existsSync("C:\\Program Files\\Beckhoff\\TcXaeShell\\Common7\\IDE\\PublicAssemblies\\envdte.dll");
+  return {
+    psExe: use64 ? ps64 : psWow,
+    scriptPath: path.join(__dirname, "powershell", "te1000-bridge.ps1"),
+    watchPath: path.join(__dirname, "powershell", "dialog-watch.ps1"),
+    allowlistPath: path.join(__dirname, "powershell", "dialog-allowlist.json"),
+  };
+}
+
+// One-shot dialog probe (auto-dismisses allowlisted dialogs when AUTO_DISMISS).
+// Returns the snapshot object, or null if the probe couldn't run.
+function probeDialogOnce() {
+  return new Promise((resolve) => {
+    const { psExe, watchPath, allowlistPath } = resolveBridgePaths();
+    const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", watchPath, "-Mode", "probe", "-AllowlistPath", allowlistPath];
+    if (AUTO_DISMISS) args.push("-AutoDismiss");
+    let out = "";
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const c = spawn(psExe, args, { stdio: ["ignore", "pipe", "ignore"] });
+      c.stdout.on("data", (d) => { out += d.toString(); });
+      c.on("error", () => finish(null));
+      c.on("close", () => {
+        const line = out.trim().split(/\r?\n/).filter(Boolean).pop();
+        try { finish(JSON.parse(line)); } catch { finish(null); }
+      });
+      setTimeout(() => { try { c.kill(); } catch {} finish(null); }, 15000); // don't let the gate itself hang
+    } catch { finish(null); }
+  });
+}
+
+// Pre-flight: a modal dialog already sitting in XAE (file changed outside the
+// editor, lost target connection, an earlier un-cleared prompt) corrupts the
+// next command's result ("No solution is open", etc.) and hangs the old code.
+// So before running anything: probe, auto-dismiss if allowlisted, and refuse to
+// run with the dialog's details if a blocking prompt remains.
+async function preflightGate(action) {
+  if (!DIALOG_WATCH) return;
+  let snap = await probeDialogOnce();
+  if (snap && snap.found && snap.dismissed) {
+    await new Promise((r) => setTimeout(r, 400)); // let the dismissed dialog tear down
+    snap = await probeDialogOnce();
+  }
+  if (snap && snap.found && snap.blocking) {
+    const btns = Array.isArray(snap.buttons) && snap.buttons.length ? snap.buttons.map((b) => `[${b}]`).join(" ") : "(none detected)";
+    throw new Error(
+      `Pre-flight blocked '${action}': XAE already has a modal dialog open, so the command was NOT run ` +
+      `(a lingering prompt corrupts command results and would otherwise hang).\n` +
+      `  Title:   ${snap.title || "(untitled)"}\n` +
+      `  Message: ${snap.text || "(no text)"}\n` +
+      `  Buttons: ${btns}\n` +
+      `Clear it on the machine, or add a rule to powershell/dialog-allowlist.json to auto-dismiss ` +
+      `it (then this call proceeds automatically).`,
+    );
+  }
+}
+
+// PLC online-session control via UI Automation (powershell/plc-session.ps1).
+// The 64-bit shell's DTE can't log the PLC out (Logout command never IsAvailable,
+// no key binding), but the IDE's Login/Logout toolbar buttons are reachable via
+// UIA. mode "status" reports { loggedIn, ... }; mode "logout" invokes the Logout
+// button (never Login). Returns the parsed snapshot, or null if it couldn't run.
+function sessionCall(mode) {
+  return new Promise((resolve) => {
+    const { psExe } = resolveBridgePaths();
+    const scriptPath = path.join(__dirname, "powershell", "plc-session.ps1");
+    const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-Mode", mode];
+    let out = "";
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const c = spawn(psExe, args, { stdio: ["ignore", "pipe", "ignore"] });
+      c.stdout.on("data", (d) => { out += d.toString(); });
+      c.on("error", () => finish(null));
+      c.on("close", () => {
+        const line = out.trim().split(/\r?\n/).filter(Boolean).pop();
+        try { finish(JSON.parse(line)); } catch { finish(null); }
+      });
+      setTimeout(() => { try { c.kill(); } catch {} finish(null); }, 30000);
+    } catch { finish(null); }
+  });
+}
+
+async function bridgeCall(action, payload = {}) {
   if (process.env.TE1000_PROGID && !payload.progId) payload.progId = process.env.TE1000_PROGID;
+  await preflightGate(action);
+  return runBridge(action, payload);
+}
+
+function runBridge(action, payload = {}) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(__dirname, "powershell", "te1000-bridge.ps1");
     const watchPath = path.join(__dirname, "powershell", "dialog-watch.ps1");
@@ -383,15 +478,49 @@ server.registerTool(
 server.registerTool(
   "plc_download",
   {
-    description: 'Deploy the active PLC project. method "bootproject" (default): headless via ITcPlcProject — writes the boot project to the target boot dir; twincat_restart_runtime loads and runs it. method "command": legacy DTE command route (needs a shell with window automation).',
+    description: 'Deploy the active PLC project. method "bootproject" (default): headless via ITcPlcProject — writes the boot project to the target boot dir; twincat_restart_runtime loads and runs it. method "command": legacy DTE command route (needs a shell with window automation). autoLogout (default true): if the IDE is logged into the PLC, log out first via UI Automation so any source edits deferred by the online lock are applied before deploy. Never logs back in.',
     inputSchema: {
       method: z.enum(["bootproject", "command"]).default("bootproject"),
       treePath: z.string().optional().describe("PLC root node, default first project under TIPC"),
       autostart: z.boolean().default(true),
       commandName: z.string().optional(),
+      autoLogout: z.boolean().default(true),
     },
   },
-  async (params) => textResult(await bridgeCall("plc_download", params)),
+  async (params) => {
+    let logoutNote = null;
+    if (params.autoLogout !== false) {
+      const st = await sessionCall("status");
+      if (st && st.loggedIn) {
+        const lo = await sessionCall("logout");
+        logoutNote = lo && lo.loggedIn === false
+          ? "auto-logout: IDE was logged in; logged out before deploy so deferred source edits are applied (not logged back in)."
+          : "auto-logout requested but the IDE still appears logged in — deploy may not include deferred source edits.";
+      }
+    }
+    const data = await bridgeCall("plc_download", params);
+    if (logoutNote && data && typeof data === "object") data.autoLogout = logoutNote;
+    return textResult(data);
+  },
+);
+
+server.registerTool(
+  "plc_session",
+  {
+    description: `PLC online-session control via UI Automation (the DTE Login/Logout commands are unavailable on the 64-bit shell). action "status" (read-only): reports { loggedIn }. action "logout": logs the IDE out of the PLC — this also applies any source edits the online lock deferred ("loaded after logout"). Never logs back in. Guarded: logout needs confirm="${PLC_LOGOUT_CONFIRMATION}".`,
+    inputSchema: {
+      action: z.enum(["status", "logout"]),
+      confirm: z.string().optional(),
+    },
+  },
+  async ({ action, confirm }) => {
+    if (action === "logout" && confirm !== PLC_LOGOUT_CONFIRMATION) {
+      throw new Error(`Blocked. Re-run with confirm="${PLC_LOGOUT_CONFIRMATION}" to log the PLC out (the IDE Login button is never invoked — no auto-login).`);
+    }
+    const data = await sessionCall(action);
+    if (!data) throw new Error("plc-session helper failed, or XAE is not reachable via UI Automation.");
+    return textResult(data);
+  },
 );
 
 server.registerTool(

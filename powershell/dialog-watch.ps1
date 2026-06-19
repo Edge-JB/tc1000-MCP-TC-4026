@@ -63,9 +63,13 @@ public static class DlgWatch {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessage")] static extern IntPtr SendMessageStr(IntPtr h, uint msg, IntPtr w, StringBuilder l);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr h);
 
     const uint GW_OWNER = 4;
     const uint BM_CLICK = 0x00F5;
+    const uint WM_COMMAND = 0x0111;
+    const uint WM_LBUTTONDOWN = 0x0201;
+    const uint WM_LBUTTONUP = 0x0202;
     const uint WM_GETTEXT = 0x000D;
     const uint WM_GETTEXTLENGTH = 0x000E;
 
@@ -114,16 +118,25 @@ public static class DlgWatch {
 
     public static bool Click(long hwnd, string label) {
         string want = (label ?? "").Replace("&", "").Trim().ToLowerInvariant();
-        bool[] done = { false };
+        IntPtr btn = IntPtr.Zero;
         EnumChildWindows((IntPtr)hwnd, (c, l) => {
             if (ClassOf(c) == "Button" && CtlText(c).Replace("&", "").Trim().ToLowerInvariant() == want) {
-                SendMessage(c, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
-                done[0] = true;
+                btn = c;
                 return false;
             }
             return true;
         }, IntPtr.Zero);
-        return done[0];
+        if (btn == IntPtr.Zero) return false;
+        IntPtr dlg = (IntPtr)hwnd;
+        // BM_CLICK alone is honored by true MessageBoxes but not by some themed VS/TcXaeShell
+        // dialogs. Drive the dialog proc directly via WM_COMMAND(controlId, BN_CLICKED=0), and
+        // add a simulated mouse down/up, then BM_CLICK as a fallback.
+        int id = GetDlgCtrlID(btn);
+        if (id != 0) SendMessage(dlg, WM_COMMAND, (IntPtr)(id & 0xFFFF), btn);
+        SendMessage(btn, WM_LBUTTONDOWN, (IntPtr)1, IntPtr.Zero);
+        SendMessage(btn, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero);
+        SendMessage(btn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+        return true;
     }
 }
 '@
