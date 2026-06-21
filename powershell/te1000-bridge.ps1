@@ -1528,6 +1528,11 @@ try {
                 $closeExisting = [bool]$payload.closeExisting
             }
 
+            $discardChanges = $false
+            if ($payload.PSObject.Properties.Name -contains 'discardChanges') {
+                $discardChanges = [bool]$payload.discardChanges
+            }
+
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $visible
             try {
                 $dte.MainWindow.Visible = $visible
@@ -1536,7 +1541,7 @@ try {
 
             $current = Get-SolutionInfo -Dte $dte
             if ($current.isOpen -and $closeExisting) {
-                $dte.Solution.Close($true)
+                $dte.Solution.Close(-not $discardChanges)
             }
 
             $dte.Solution.Open($solutionPath)

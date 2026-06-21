@@ -22,6 +22,7 @@ const RESTART_CONFIRMATION = "ALLOW_TWINCAT_RESTART";
 const XAE_COMMAND_CONFIRMATION = "ALLOW_XAE_COMMAND_EXEC";
 const PLC_LOGOUT_CONFIRMATION = "ALLOW_PLC_LOGOUT";
 const DELETE_CONFIRMATION = "ALLOW_TWINCAT_DELETE";
+const PLC_DOWNLOAD_CONFIRMATION = "ALLOW_PLC_DOWNLOAD";
 
 // --- Modal-dialog watchdog -------------------------------------------------
 // A bridge COM call into XAE blocks until any modal dialog it raises is
@@ -316,21 +317,22 @@ const XAE_ACTIONS = {
 server.registerTool(
   "xae",
   {
-    description: "XAE shell: status, open_solution (solutionPath), save_all, active_document, selected_items, error_list, clear_error_list, list_commands (filter regex, limit).",
+    description: "XAE shell: status, open_solution (solutionPath; closeExisting:true reopens, discardChanges:true closes the current solution WITHOUT saving before reopening), save_all, active_document, selected_items, error_list, clear_error_list, list_commands (filter regex, limit).",
     inputSchema: {
       action: z.enum(Object.keys(XAE_ACTIONS)),
       solutionPath: z.string().optional(),
       closeExisting: z.boolean().optional(),
+      discardChanges: z.boolean().optional(),
       filter: z.string().optional(),
       limit: z.number().int().positive().max(5000).optional(),
       mode: z.enum(["active", "activeOrCreate", "create"]).optional().describe("DTE attach mode; default active (open_solution: activeOrCreate)"),
     },
   },
-  async ({ action, solutionPath, closeExisting, filter, limit, mode }) => {
+  async ({ action, solutionPath, closeExisting, discardChanges, filter, limit, mode }) => {
     const payload = { mode };
     if (action === "open_solution") {
       need({ solutionPath }, ["solutionPath"], action);
-      Object.assign(payload, { solutionPath, visible: true, closeExisting: closeExisting || false, mode: mode || "activeOrCreate" });
+      Object.assign(payload, { solutionPath, visible: true, closeExisting: closeExisting || false, discardChanges: discardChanges === true, mode: mode || "activeOrCreate" });
     }
     if (action === "list_commands") Object.assign(payload, { filter, limit });
     if (action === "error_list") payload.limit = limit;
@@ -375,7 +377,7 @@ server.registerTool(
     description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml raw XML; summary:true for a compact identity + slot-module list instead of the full blob); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); DELETE — delete / delete_batch (deletes:[{parent,name}], GUARDED: pass dryRun:true to preview which children exist without deleting, or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete). Mutating *_batch verbs (set_xml_batch, rename_batch, create_batch, delete_batch) accept optional save:true to save the solution once after the batch. No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
     inputSchema: {
       action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "create_batch", "delete", "delete_batch", "import", "export", "focus"]),
-      path: z.string(),
+      path: z.string().optional(),
       paths: z.array(z.string()).optional(),
       xml: z.string().optional(),
       returnXml: z.boolean().optional(),
@@ -399,36 +401,38 @@ server.registerTool(
   async (p) => {
     const t = { treePath: p.path };
     switch (p.action) {
-      case "get": return textResult(await bridgeCall("twincat_lookup_tree_item", t));
-      case "children": return textResult(await bridgeCall("twincat_list_children", t));
-      case "exists": return textResult(await bridgeCall("twincat_test_item_path", t));
+      case "get": need(p, ["path"], p.action); return textResult(await bridgeCall("twincat_lookup_tree_item", t));
+      case "children": need(p, ["path"], p.action); return textResult(await bridgeCall("twincat_list_children", t));
+      case "exists": need(p, ["path"], p.action); return textResult(await bridgeCall("twincat_test_item_path", t));
       case "exists_batch":
         need(p, ["paths"], p.action);
         return textResult(await bridgeCall("twincat_test_item_paths", { paths: p.paths }));
       case "get_batch":
         need(p, ["paths"], p.action);
         return textResult(await bridgeCall("twincat_lookup_tree_items", { paths: p.paths }));
-      case "get_xml": return textResult(await bridgeCall("twincat_get_tree_item_xml", { ...t, summary: p.summary === true }));
+      case "get_xml":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_get_tree_item_xml", { ...t, summary: p.summary === true }));
       case "set_xml":
-        need(p, ["xml"], p.action);
+        need(p, ["path", "xml"], p.action);
         return textResult(await bridgeCall("twincat_set_tree_item_xml", { ...t, xml: p.xml, returnXml: p.returnXml === true }));
       case "set_xml_batch":
         need(p, ["items"], p.action);
         return textResult(await bridgeCall("twincat_set_tree_item_xml_batch", { items: p.items, returnXml: p.returnXml === true, save: p.save === true }));
       case "rename":
-        need(p, ["newName"], p.action);
+        need(p, ["path", "newName"], p.action);
         return textResult(await bridgeCall("twincat_rename_tree_item", { treePath: p.path, newName: p.newName }));
       case "rename_batch":
         need(p, ["renames"], p.action);
         return textResult(await bridgeCall("twincat_rename_tree_items", { basePath: p.path, renames: p.renames, save: p.save === true }));
       case "create":
-        need(p, ["name", "subType"], p.action);
+        need(p, ["path", "name", "subType"], p.action);
         return textResult(await bridgeCall("twincat_create_child", { parentPath: p.path, childName: p.name, subType: p.subType, beforeChildName: p.before, createInfo: p.createInfo }));
       case "create_batch":
         need(p, ["creates"], p.action);
         return textResult(await bridgeCall("twincat_create_children", { creates: p.creates, save: p.save === true }));
       case "delete":
-        need(p, ["name"], p.action);
+        need(p, ["path", "name"], p.action);
         return textResult(await bridgeCall("twincat_delete_child", { parentPath: p.path, childName: p.name }));
       case "delete_batch":
         need(p, ["deletes"], p.action);
@@ -437,12 +441,12 @@ server.registerTool(
         }
         return textResult(await bridgeCall("twincat_delete_children", { deletes: p.deletes, dryRun: p.dryRun === true, save: p.save === true }));
       case "import":
-        need(p, ["file"], p.action);
+        need(p, ["path", "file"], p.action);
         return textResult(await bridgeCall("twincat_import_child", { parentPath: p.path, filePath: p.file, beforeChildName: p.before, reconnect: p.reconnect, importAsName: p.newName }));
       case "export":
-        need(p, ["name", "file"], p.action);
+        need(p, ["path", "name", "file"], p.action);
         return textResult(await bridgeCall("twincat_export_child", { parentPath: p.path, childName: p.name, filePath: p.file }));
-      case "focus": return textResult(await bridgeCall("xae_focus_tree_item", t));
+      case "focus": need(p, ["path"], p.action); return textResult(await bridgeCall("xae_focus_tree_item", t));
     }
   },
 );
@@ -527,8 +531,9 @@ server.registerTool(
 server.registerTool(
   "plc_download",
   {
-    description: 'Deploy the active PLC project. method "bootproject" (default): headless via ITcPlcProject — writes the boot project to the target boot dir; twincat_restart_runtime loads and runs it. method "command": legacy DTE command route (needs a shell with window automation). autoLogout (default true): if the IDE is logged into the PLC, log out first via UI Automation so any source edits deferred by the online lock are applied before deploy. Never logs back in.',
+    description: 'Deploy the active PLC project. Guarded: confirm="ALLOW_PLC_DOWNLOAD" (deploys a boot project to the live target). method "bootproject" (default): headless via ITcPlcProject — writes the boot project to the target boot dir; twincat_restart_runtime loads and runs it. method "command": legacy DTE command route (needs a shell with window automation). autoLogout (default true): if the IDE is logged into the PLC, log out first via UI Automation so any source edits deferred by the online lock are applied before deploy. Never logs back in.',
     inputSchema: {
+      confirm: z.string().optional(),
       method: z.enum(["bootproject", "command"]).default("bootproject"),
       treePath: z.string().optional().describe("PLC root node, default first project under TIPC"),
       autostart: z.boolean().default(true),
@@ -537,6 +542,9 @@ server.registerTool(
     },
   },
   async (params) => {
+    if (params.confirm !== PLC_DOWNLOAD_CONFIRMATION) {
+      throw new Error('Blocked. plc_download deploys a boot project to the live target. Re-run with confirm="' + PLC_DOWNLOAD_CONFIRMATION + '" to proceed.');
+    }
     let logoutNote = null;
     if (params.autoLogout !== false) {
       const st = await sessionCall("status");

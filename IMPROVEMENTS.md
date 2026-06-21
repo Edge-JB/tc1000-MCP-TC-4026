@@ -5,6 +5,40 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-21 — Three test-driven fixes (download guard, optional `tc_tree` path, `open_solution` discard) — branch `improve/test-fixes`
+
+Found during live testing of the v2 tool surface; all three are small and mechanical.
+
+- **`plc_download` confirm guard.** It was the one cell-impacting deploy with **no** confirm
+  token (activate / restart / xae_command / plc logout all already had one), so a bare call
+  would push a boot project to the live target. Added `PLC_DOWNLOAD_CONFIRMATION =
+  "ALLOW_PLC_DOWNLOAD"` and a guard at the very top of the handler (before the auto-logout
+  status check and the bridge call): without `confirm="ALLOW_PLC_DOWNLOAD"` it throws and
+  deploys nothing. All other behavior (method / autostart / autoLogout) is unchanged.
+
+- **`tc_tree` top-level `path` made optional.** `path: z.string()` was *required*, so the
+  batch actions (`exists_batch` / `get_batch` / `set_xml_batch` / `create_batch` /
+  `delete_batch` / `rename_batch`) — which carry their targets in `paths` / `items` / `creates`
+  / `deletes` / `renames` — rejected the call until a throwaway `path` was supplied. Changed to
+  `z.string().optional()` and added an explicit `need(p, ["path"], action)` to each
+  path-requiring case (`get`, `children`, `exists`, `get_xml`, `set_xml`, `rename`, `create`,
+  `delete`, `import`, `export`, `focus`) so those still validate. The batch cases keep only
+  their existing field checks; `rename_batch` tolerates an absent `path` (its `basePath` is just
+  an optional base for relative names — entries with absolute `path` work without it).
+
+- **`xae open_solution` discard-on-close option.** The bridge's `xae_open_solution` closed the
+  current solution with the hardcoded `$dte.Solution.Close($true)` — **save-first** — which
+  persists unwanted in-memory edits when you only meant to reopen/discard. Added an optional
+  `discardChanges` (index.js schema + payload, read in the bridge via the
+  `PSObject.Properties.Name -contains` idiom, default `$false`) and changed the close to
+  `$dte.Solution.Close(-not $discardChanges)`: default stays save-first (current behavior),
+  `discardChanges:true` → `Close($false)` = discard. Only meaningful with `closeExisting:true`.
+
+Static checks only (`node --check`, PowerShell `ParseFile`) — the server could not be reloaded
+to exercise the tools live during this change.
+
+---
+
 ## 2026-06-20 — `delete_batch` guarded (dryRun/confirm) + opt-in `save:true` on mutating batch ops — branch `improve/batch-ops`
 
 Two safety/convenience improvements to the batch surface:
