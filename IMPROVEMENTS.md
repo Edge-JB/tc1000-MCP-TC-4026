@@ -5,6 +5,79 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-21 — `tc_tree action:create_rack` v1.1 — ANALOG input terminals (EL3xxx) — branch `improve/create-rack-analog`
+
+**Feature.** Extends the ESI→`.xti` generator from digital-only to **analog input** terminals
+(ESI `GroupType` `AnaIn`, EL3xxx). Validated against `EL3064` (4-ch, the calibration target) and
+sanity-checked against `EL3104` (4-ch) and `EL3162` (2-ch, legacy byte-status layout). The digital
+path is unchanged.
+
+**ESI → `.xti` mapping added for analog.**
+- **PDOs.** Only the **SM-assigned** `<TxPdo Sm="…">` PDOs are emitted (e.g. EL3064's four
+  *AI Standard Channel* PDOs on SM3). The unassigned *AI Compact* PDOs (Value-only alternative the
+  user does not get by default) are **skipped**. Each `<Pdo>` carries `Flags="#x0001"` and
+  `SyncMan="<the ESI PDO's own Sm index>"` (vs digital's fixed `Flags="#x0011" SyncMan="0"`).
+- **Entry data types.** `INT`→`INT` (16-bit value), `BIT2`/2-bit→`BIT2`, 1-bit→`BIT`, and the
+  byte/word status fields used by older terminals (`USINT`/`BYTE`/`SINT`/`WORD`/`DWORD`,
+  `UINT`/`DINT`/`UDINT`). **Padding gaps** (ESI `<Entry>` with `Index #x0`/no name) are preserved
+  **in order** as typeless `<Entry Index="#x0000" Sub="#x00"><BitLen>N</BitLen></Entry>` so the
+  16-bit analog status-word bit layout stays intact. An unmapped data type errors per-entry.
+- **`<SyncMan>` (the key calibration).** Despite the analog ESI declaring **four** SyncManagers
+  (MBoxOut/MBoxIn/Outputs/Inputs), the box-level `<SyncMan>` blob is the **same fixed 3-record
+  (24-byte)** structure as digital — only the process-SM start/control differ. Record 0 = the
+  **Inputs** SM (start + ESI control byte; Length=0 and Enable=0 because TwinCAT recomputes those),
+  record 1 = `04 00…`, record 2 = `01 00 <start LE> 00 01 00 00` (same direction-fixed tail as a
+  digital **input**).
+- **`<Fmmu>`.** Two 16-byte records: record 0 = process/**Inputs** SM (physAddr = Inputs start,
+  dir = input, active), record 1 = **mailbox-state** (physAddr = **MBoxIn** SM start, dir = input,
+  active) — vs digital's single process FMMU + zero tail.
+
+**How the SM/Fmmu were calibrated (no native reference was obtainable).** `CreateChild` with
+`subType:9099` + ESI `createInfo` is rejected ("Invalid item sub type"), so a *native* TwinCAT
+EL3064 `.xti` could **not** be produced for diffing. Instead the reference was obtained by the
+**import→export loop**: a hand-built box was imported under `EK1200`, then **exported**, and
+TwinCAT's *import-normalised* serialization was read back. A first guess (one 8-byte SM record per
+ESI SM = 32 bytes) was **blanked** by TwinCAT on import — proving that guess wrong and revealing the
+correct length is the fixed 24-byte/3-record blob. The digital-input recipe generalised to the
+analog Inputs SM was then **kept verbatim** by TwinCAT (it only zeroes Length/Enable, which we now
+emit as 0). So the analog SM/Fmmu encoding is **calibrated against TwinCAT's own normalised export**,
+which is the authoritative reference here.
+
+**Catalog-stub revision fix.** Auto-selecting the highest ESI revision could pick a thin
+**placeholder Device block** from a master ESI file (e.g. `Beckhoff EtherCAT Terminals.xml`,
+revision `#x270b0000`) whose PDOs have empty `Index`/`Name` and no real entries — yielding "no usable
+PDOs". `Resolve-EsiDevice` now prefers the **highest revision that has real process PDOs**
+(`Test-EsiDeviceHasRealPdos`), falling back to plain-highest only if none qualify. This is what makes
+`EL3162` resolve to a usable revision without an explicit `revision`.
+
+**Import → export → compare results (live, with cleanup).**
+- **EL3064** (built by the production `create_rack` verb): imported non-hollow, `pdoCount:4`; all four
+  `AI Standard Channel N^Value` leaves **resolve/link**. Exported SyncMan
+  `801100002000000004000000000000000100801100010000` and Fmmu
+  `0000000000000000801100010100000000000000000000008010000101000000` match the generator output
+  byte-for-byte (this is the calibration reference).
+- **EL3104**: `pdoCount:4`, channels 1–4 `Value` resolve; export SM/Fmmu **identical** to input.
+- **EL3162**: `pdoCount:2`, `Channel 1/2 Value` resolve; TwinCAT preserved the `USINT`+`INT` entry
+  types; export SM **identical** to input.
+- Every scratch box used a `ZZ_*` name, was deleted, and the `EK1200` tree was left at exactly **13
+  children**. The solution was **never saved**.
+
+**What generalises vs. what still needs care.**
+- Generalises cleanly: any EL3xxx **AnaIn** with a CoE mailbox and an Inputs SM whose process PDOs
+  are SM-assigned — the SM (start 0x1180) / MBoxIn (0x1080) addresses and the 24-byte SM / 2-record
+  Fmmu structure held across EL3064/EL3104/EL3162.
+- **Not** covered / needs separate calibration: **analog OUTPUT** (`AnaOut`, EL4xxx) — its process SM
+  is an *Outputs* SM with a different control byte and FMMU direction, and was **not** reverse-engineered
+  here; it errors per-entry. IO-Link and modular terminals remain unsupported.
+- A device whose **only** real PDOs live in a non-default alternative assignment, or whose status word
+  uses an entry data type outside the supported set, will error per-entry (by design — no wrong box).
+
+**Verification.** `node --check index.js` → OK. PowerShell `Parser::ParseFile` on the bridge → 0
+errors. Digital regression: regenerated `EL1008`/`EL2008` `.xti` still byte-for-byte match their real
+exports.
+
+---
+
 ## 2026-06-21 — `tc_tree action:create_rack` — ESI-backed EtherCAT rack creator — branch `improve/create-rack`
 
 **Feature.** A new `tc_tree` action `create_rack` that, given a parent path and an ordered list of

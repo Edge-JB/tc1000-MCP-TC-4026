@@ -1158,6 +1158,27 @@ function ConvertFrom-EsiHex {
     return [Convert]::ToUInt32($v, 16)
 }
 
+function Test-EsiDeviceHasRealPdos {
+    # Returns $true if a Device block has at least one Tx/RxPdo carrying a real
+    # process entry (non-empty Index AND at least one Entry with a non-empty Index).
+    # Used to reject thin "catalog stub" Device blocks (which list PDOs with empty
+    # Index/Name and no usable entries) when auto-selecting the highest revision.
+    param([Parameter(Mandatory = $true)][System.Xml.XmlElement]$Device)
+    foreach ($tag in @('TxPdo', 'RxPdo')) {
+        foreach ($pdo in $Device.SelectNodes($tag)) {
+            $pIdxNode = $pdo.SelectSingleNode('Index')
+            if ($null -eq $pIdxNode -or [string]::IsNullOrWhiteSpace([string]$pIdxNode.InnerText)) { continue }
+            foreach ($e in $pdo.SelectNodes('Entry')) {
+                $eIdxNode = $e.SelectSingleNode('Index')
+                if ($null -eq $eIdxNode) { continue }
+                $eIdx = ConvertFrom-EsiHex ([string]$eIdxNode.InnerText)
+                if ($null -ne $eIdx -and $eIdx -ne 0) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
 function Resolve-EsiDevice {
     # Finds a Beckhoff terminal <Device> across the ESI files by exact <Type> name.
     # Picks the highest RevisionNo unless $Revision (e.g. "#x00120000") is given.
@@ -1211,7 +1232,16 @@ function Resolve-EsiDevice {
             throw "ESI device '$TypeName' has no revision $Revision. Available: $have."
         }
     } else {
-        $chosen = $candidates | Sort-Object Rev -Descending | Select-Object -First 1
+        # Default to the highest revision -- but skip "catalog stub" Device blocks
+        # (placeholder entries in master ESI files like 'Beckhoff EtherCAT
+        # Terminals.xml' that carry a huge fake revision and PDOs with empty
+        # Index/Name and no real entries). Prefer the highest revision that has
+        # real process PDOs; only if none qualify fall back to the plain highest.
+        $sorted = $candidates | Sort-Object Rev -Descending
+        foreach ($cand in $sorted) {
+            if (Test-EsiDeviceHasRealPdos -Device $cand.Dev) { $chosen = $cand; break }
+        }
+        if ($null -eq $chosen) { $chosen = $sorted | Select-Object -First 1 }
     }
 
     $dev = $chosen.Dev
@@ -1221,39 +1251,59 @@ function Resolve-EsiDevice {
     $gtNode = $dev.SelectSingleNode('GroupType')
     if ($null -ne $gtNode) { $groupType = ([string]$gtNode.InnerText).Trim() }
 
+    # Device class drives the SyncMan/Fmmu/Pdo model used below.
+    #   digital -> DigIn  (EL1xxx, TxPdo, 1-bit BOOL, no mailbox, single process SM)
+    #   digital -> DigOut (EL2xxx, RxPdo, 1-bit BOOL, no mailbox, single process SM)
+    #   analog  -> AnaIn  (EL3xxx, TxPdo, INT value + BIT/BIT2 status, CoE mailbox, 4 SMs)
+    $class = $null
     $direction = $null
     $pdoTag = $null
-    if ($groupType -eq 'DigIn') { $direction = 'in';  $pdoTag = 'TxPdo' }
-    elseif ($groupType -eq 'DigOut') { $direction = 'out'; $pdoTag = 'RxPdo' }
+    if ($groupType -eq 'DigIn') { $class = 'digital'; $direction = 'in';  $pdoTag = 'TxPdo' }
+    elseif ($groupType -eq 'DigOut') { $class = 'digital'; $direction = 'out'; $pdoTag = 'RxPdo' }
+    elseif ($groupType -eq 'AnaIn') { $class = 'analog'; $direction = 'in'; $pdoTag = 'TxPdo' }
     else {
-        throw "Unsupported device class for '$TypeName' (GroupType='$groupType'). create_rack v1 supports only digital terminals (DigIn / DigOut, e.g. EL1xxx / EL2xxx). Analog / IO-Link / complex devices are deferred to v2."
+        throw "Unsupported device class for '$TypeName' (GroupType='$groupType'). create_rack supports digital terminals (DigIn / DigOut, e.g. EL1xxx / EL2xxx) and analog INPUT terminals (AnaIn, e.g. EL30xx). Analog output / IO-Link / modular devices are not yet supported."
     }
 
-    # Mailbox-based devices (CoE/EoE/FoE) carry a <Mailbox> element and multiple
-    # SyncManagers; the simple v1 SyncMan/Fmmu template does not model them.
-    if ($null -ne $dev.SelectSingleNode('Mailbox')) {
-        throw "Unsupported device '$TypeName': has a Mailbox (CoE/EoE/FoE) -- not a simple digital terminal. Deferred to create_rack v2."
+    # Mailbox gating: a digital terminal must NOT carry a <Mailbox>; an analog
+    # terminal is expected to carry a CoE mailbox (that is how it exposes 4 SMs).
+    # The analog SyncMan/Fmmu model below was validated against TwinCAT's own
+    # import-normalised export for the EL3064; output-direction analog (AnaOut,
+    # EL40xx) is NOT covered here because its process SM is an Outputs SM with a
+    # different control/FMMU direction and was not calibrated.
+    $hasMailbox = ($null -ne $dev.SelectSingleNode('Mailbox'))
+    if ($class -eq 'digital' -and $hasMailbox) {
+        throw "Unsupported device '$TypeName': has a Mailbox (CoE/EoE/FoE) -- not a simple digital terminal."
     }
 
-    # Single process-data SyncManager expected. Read the one whose label matches
-    # the direction (Inputs / Outputs).
+    # Process-data SyncManager (Inputs for DigIn/AnaIn, Outputs for DigOut). For
+    # analog we also capture the MBoxIn SM start, used by the MBoxState FMMU record.
     $smWanted = if ($direction -eq 'in') { 'Inputs' } else { 'Outputs' }
     $smNode = $null
+    $mboxInStart = $null
     foreach ($sm in $dev.SelectNodes('Sm')) {
-        if (([string]$sm.InnerText).Trim() -eq $smWanted) { $smNode = $sm; break }
+        $smLabel = ([string]$sm.InnerText).Trim()
+        if ($smLabel -eq $smWanted) { $smNode = $sm }
+        elseif ($smLabel -eq 'MBoxIn') { $mboxInStart = ConvertFrom-EsiHex ([string]$sm.GetAttribute('StartAddress')) }
     }
     if ($null -eq $smNode) {
-        throw "Unsupported device '$TypeName': no '$smWanted' SyncManager found (not a simple digital terminal). Deferred to v2."
+        throw "Unsupported device '$TypeName': no '$smWanted' SyncManager found in the ESI."
     }
     $smStart = ConvertFrom-EsiHex ([string]$smNode.GetAttribute('StartAddress'))
     $smCtrl = ConvertFrom-EsiHex ([string]$smNode.GetAttribute('ControlByte'))
     if ($null -eq $smCtrl) { $smCtrl = [uint32]0 }
 
     # ---- PDOs --------------------------------------------------------------
+    # Digital: every TxPdo/RxPdo is process data. Analog: only the SM-assigned
+    # PDOs (Sm attribute present, e.g. the "AI Standard Channel N" PDOs on SM3)
+    # are the default process image -- the unassigned "AI Compact" PDOs are an
+    # alternative the user does not get by default, so they are skipped.
     $pdos = @()
     foreach ($pdo in $dev.SelectNodes($pdoTag)) {
+        if ($class -eq 'analog' -and [string]::IsNullOrWhiteSpace([string]$pdo.GetAttribute('Sm'))) { continue }
         $pIndex = ConvertFrom-EsiHex ([string]$pdo.SelectSingleNode('Index').InnerText)
         $pName = [string]$pdo.SelectSingleNode('Name').InnerText
+        $pSm = ConvertFrom-EsiHex ([string]$pdo.GetAttribute('Sm'))
         $entries = @()
         foreach ($e in $pdo.SelectNodes('Entry')) {
             $eIdx = ConvertFrom-EsiHex ([string]$e.SelectSingleNode('Index').InnerText)
@@ -1265,19 +1315,36 @@ function Resolve-EsiDevice {
             $eName = if ($null -ne $eNameNode) { [string]$eNameNode.InnerText } else { '' }
             $eDtNode = $e.SelectSingleNode('DataType')
             $eDt = if ($null -ne $eDtNode) { ([string]$eDtNode.InnerText).Trim() } else { '' }
-            # v1 only handles 1-bit BOOL entries (gap/padding entries have no Index/Name).
-            if ($eIdx -eq $null -or [string]::IsNullOrWhiteSpace($eName)) { continue }
-            if ($eDt -ne 'BOOL' -or $eBit -ne 1) {
-                throw "Unsupported entry in '$TypeName' PDO '$pName': DataType='$eDt' BitLen=$eBit (create_rack v1 only handles 1-bit BOOL digital channels). Deferred to v2."
+
+            if ($class -eq 'digital') {
+                # Digital only handles 1-bit BOOL entries (gap/padding entries have no Index/Name).
+                if ($eIdx -eq $null -or [string]::IsNullOrWhiteSpace($eName)) { continue }
+                if ($eDt -ne 'BOOL' -or $eBit -ne 1) {
+                    throw "Unsupported entry in '$TypeName' PDO '$pName': DataType='$eDt' BitLen=$eBit (digital create_rack only handles 1-bit BOOL channels)."
+                }
+                $entries += @{ Name = $eName; Index = $eIdx; SubIndex = $eSub; BitLen = $eBit; DataType = $eDt; Type = 'BIT' }
+            } else {
+                # Analog: keep every entry IN ORDER (including padding gaps) so the
+                # bit layout of the status word is preserved. A gap entry has Index
+                # #x0 / no Name and is emitted as a typeless BitLen padding entry.
+                $isGap = ($eIdx -eq $null -or $eIdx -eq 0 -or [string]::IsNullOrWhiteSpace($eName))
+                $entryType = Get-AnalogEntryType -DataType $eDt -BitLen $eBit
+                if (-not $isGap -and $null -eq $entryType) {
+                    throw "Unsupported analog entry in '$TypeName' PDO '$pName': DataType='$eDt' BitLen=$eBit. Supported analog entry types: INT/UINT (16), DINT/UDINT (32), BIT (1), BIT2 (2)."
+                }
+                $entries += @{ Name = $eName; Index = $eIdx; SubIndex = $eSub; BitLen = $eBit; DataType = $eDt; Type = $entryType; IsGap = $isGap }
             }
-            $entries += @{ Name = $eName; Index = $eIdx; SubIndex = $eSub; BitLen = $eBit; DataType = $eDt }
         }
-        if ($entries.Count -gt 0) {
-            $pdos += @{ Name = $pName; Index = $pIndex; Entries = $entries }
+        # A PDO is kept if it has at least one real (non-gap) entry.
+        $hasReal = $false
+        foreach ($en in $entries) { if (-not $en.IsGap) { $hasReal = $true; break } }
+        if ($hasReal -or ($class -eq 'digital' -and $entries.Count -gt 0)) {
+            $pdos += @{ Name = $pName; Index = $pIndex; Sm = $pSm; Entries = $entries }
         }
     }
     if ($pdos.Count -eq 0) {
-        throw "Resolved '$TypeName' but found no usable digital PDOs -- aborting rather than emitting a hollow box."
+        $kind = if ($class -eq 'analog') { 'analog' } else { 'digital' }
+        throw "Resolved '$TypeName' but found no usable $kind PDOs -- aborting rather than emitting a hollow box."
     }
 
     $descNode = $dev.SelectSingleNode('Name[@LcId="1033"]')
@@ -1287,12 +1354,38 @@ function Resolve-EsiDevice {
     return @{
         Type = $longName
         Desc = $TypeName
+        Class = $class
         ProductCode = $chosen.ProductCode
         RevisionNo = $chosen.Rev
         Direction = $direction
-        Sm = @{ StartAddress = $smStart; ControlByte = $smCtrl }
+        Sm = @{ StartAddress = $smStart; ControlByte = $smCtrl; MBoxInStart = $mboxInStart }
         Pdos = $pdos
         EsiFile = $chosen.File
+    }
+}
+
+function Get-AnalogEntryType {
+    # Maps an ESI analog <Entry> (DataType + BitLen) to the .xti <Type> token.
+    # Returns $null for an unknown/unsupported type so the caller can reject it.
+    # Validated against the EL3064 export: INT value entries + BIT/BIT2 status.
+    param([string]$DataType, [int]$BitLen)
+    $dt = ([string]$DataType).Trim().ToUpperInvariant()
+    if ($BitLen -eq 1) { return 'BIT' }
+    if ($dt -eq 'BIT2' -or ($BitLen -eq 2 -and ($dt -eq '' -or $dt -eq 'BIT2'))) { return 'BIT2' }
+    switch ($dt) {
+        'INT'   { return 'INT' }
+        'UINT'  { return 'UINT' }
+        'DINT'  { return 'DINT' }
+        'UDINT' { return 'UDINT' }
+        'BOOL'  { return 'BIT' }
+        # Byte/word status fields used by older analog terminals (e.g. EL3162's
+        # USINT status byte). The .xti <Type> token is the same DataType name.
+        'BYTE'  { return 'BYTE' }
+        'SINT'  { return 'SINT' }
+        'USINT' { return 'USINT' }
+        'WORD'  { return 'WORD' }
+        'DWORD' { return 'DWORD' }
+        default { return $null }
     }
 }
 
@@ -1348,21 +1441,86 @@ function Get-DigitalFmmuBlob {
     return (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
 }
 
+function Get-AnalogSyncManBlob {
+    # Builds the box-level <SyncMan> hex blob for an analog INPUT terminal with a
+    # CoE mailbox (EL3xxx AnaIn). Despite the ESI declaring four SyncManagers
+    # (MBoxOut/MBoxIn/Outputs/Inputs), the .xti <SyncMan> blob is the SAME fixed
+    # 3-record (24-byte) structure used for digital terminals -- only the process
+    # SM start/control differ. This was confirmed by importing a hand-built box and
+    # reading back TwinCAT's normalised export (which left exactly this blob, only
+    # zeroing the length and enable fields it recomputes itself):
+    #   EL3064 (in): 8011 0000 20 00 00 00 | 04 00 00 00 00 00 00 00 | 01 00 8011 00 01 00 00
+    # so we emit Length=0 and Enable=0 in record 0 (TwinCAT owns those), the input
+    # SM start + the ESI control byte, then the same direction-fixed tail as digital
+    # inputs (record 1 = 04.., record 2 = 01 00 <start LE> 00 01 00 00).
+    param([Parameter(Mandatory = $true)][hashtable]$Esi)
+    $start = [uint32]$Esi.Sm.StartAddress
+    $ctrl = [byte]([uint32]$Esi.Sm.ControlByte)
+    $bytes = New-Object 'System.Collections.Generic.List[byte]'
+    # SM record 0: start(2 LE), len=0(2 LE; TwinCAT recomputes), ctrl(1), status=0(1), enable=0(1; TwinCAT recomputes), type=0(1)
+    $bytes.Add([byte]($start -band 0xff)); $bytes.Add([byte](($start -shr 8) -band 0xff))
+    $bytes.Add([byte]0); $bytes.Add([byte]0)
+    $bytes.Add($ctrl); $bytes.Add([byte]0); $bytes.Add([byte]0); $bytes.Add([byte]0)
+    # tail: 04 00 00 00 00 00 00 00 | 01 00 (start LE) 00 01 00 00
+    $tail = @(0x04,0,0,0,0,0,0,0, 0x01,0,($start -band 0xff),(($start -shr 8) -band 0xff),0x00,0x01,0,0)
+    foreach ($b in $tail) { $bytes.Add([byte]$b) }
+    return (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+}
+
+function Get-AnalogFmmuBlob {
+    # Builds the box-level <Fmmu> hex blob for an analog INPUT terminal with a CoE
+    # mailbox: two 16-byte FMMU records. Record 0 maps the process (Inputs) SM
+    # (physAddr = Inputs SM start, dir = 1 input, active = 1); record 1 maps the
+    # mailbox-state FMMU (physAddr = MBoxIn SM start, dir = 1 input, active = 1).
+    # Validated byte-for-byte against TwinCAT's import-normalised EL3064 export:
+    #   0000000000000000 8011 00 01 01000000 | 0000000000000000 8010 00 01 01000000
+    param([Parameter(Mandatory = $true)][hashtable]$Esi)
+    $start = [uint32]$Esi.Sm.StartAddress
+    $mboxIn = if ($null -ne $Esi.Sm.MBoxInStart) { [uint32]$Esi.Sm.MBoxInStart } else { [uint32]0 }
+    $bytes = New-Object 'System.Collections.Generic.List[byte]'
+    # FMMU record 0 (process / Inputs SM, direction input)
+    foreach ($b in @(0,0,0,0, 0,0, 0,0)) { $bytes.Add([byte]$b) }
+    $bytes.Add([byte]($start -band 0xff)); $bytes.Add([byte](($start -shr 8) -band 0xff))
+    $bytes.Add([byte]0)                                                    # physStartBit
+    $bytes.Add([byte]1)                                                    # direction = input
+    $bytes.Add([byte]1); $bytes.Add([byte]0); $bytes.Add([byte]0); $bytes.Add([byte]0) # active=1, pad
+    # FMMU record 1 (mailbox-state, MBoxIn SM, direction input)
+    foreach ($b in @(0,0,0,0, 0,0, 0,0)) { $bytes.Add([byte]$b) }
+    $bytes.Add([byte]($mboxIn -band 0xff)); $bytes.Add([byte](($mboxIn -shr 8) -band 0xff))
+    $bytes.Add([byte]0)
+    $bytes.Add([byte]1)
+    $bytes.Add([byte]1); $bytes.Add([byte]0); $bytes.Add([byte]0); $bytes.Add([byte]0)
+    return (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+}
+
 function Build-BoxXti {
-    # Emits a full .xti box string for a resolved digital terminal descriptor.
-    # The output matches a real TwinCAT export in every functional respect
+    # Emits a full .xti box string for a resolved terminal descriptor (digital or
+    # analog). The output matches a real TwinCAT export in every functional respect
     # (EtherCAT identity attributes, SyncMan/Fmmu, and the complete Pdo/Entry set);
     # instance-only noise (Box Id, ImageId/ImageDatas, <Mappings>) is intentionally
     # minimal -- TwinCAT fills those in on import.
+    #
+    # Digital: single process SM, 1-bit BIT entries, Flags #x0011, SyncMan="0".
+    # Analog (AnaIn): CoE-mailbox 3-record SyncMan + 2-record Fmmu, INT/BIT/BIT2
+    # entries (incl. typeless padding gaps), Flags #x0001 and SyncMan = the ESI
+    # PDO's own Sm index. Validated against TwinCAT's import-normalised EL3064.
     param(
         [Parameter(Mandatory = $true)][hashtable]$Esi,
         [Parameter(Mandatory = $true)][string]$BoxName
     )
+    $isAnalog = ($Esi.Class -eq 'analog')
     $pc = '#x{0:x8}' -f [uint32]$Esi.ProductCode
     $rev = '#x{0:x8}' -f [uint32]$Esi.RevisionNo
-    $inOutAttr = if ($Esi.Direction -eq 'out') { ' InOut="1"' } else { '' }
-    $syncMan = Get-DigitalSyncManBlob -Esi $Esi
-    $fmmu = Get-DigitalFmmuBlob -Esi $Esi
+    $inOutAttr = if ((-not $isAnalog) -and $Esi.Direction -eq 'out') { ' InOut="1"' } else { '' }
+    if ($isAnalog) {
+        $syncMan = Get-AnalogSyncManBlob -Esi $Esi
+        $fmmu = Get-AnalogFmmuBlob -Esi $Esi
+        $pdoFlags = '#x0001'
+    } else {
+        $syncMan = Get-DigitalSyncManBlob -Esi $Esi
+        $fmmu = Get-DigitalFmmuBlob -Esi $Esi
+        $pdoFlags = '#x0011'
+    }
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0"?>')
@@ -1374,12 +1532,23 @@ function Build-BoxXti {
     [void]$sb.AppendLine("			<Fmmu>$fmmu</Fmmu>")
     foreach ($pdo in $Esi.Pdos) {
         $pIdx = '#x{0:x4}' -f [uint32]$pdo.Index
-        [void]$sb.AppendLine('			<Pdo Name="' + [System.Security.SecurityElement]::Escape($pdo.Name) + '" Index="' + $pIdx + '"' + $inOutAttr + ' Flags="#x0011" SyncMan="0">')
+        # Digital: all PDOs map to the single process SM (SyncMan="0"). Analog: each
+        # PDO carries its own ESI Sm index (e.g. the AI Standard channels on SM3).
+        $pdoSm = if ($isAnalog -and $null -ne $pdo.Sm) { [string][uint32]$pdo.Sm } else { '0' }
+        [void]$sb.AppendLine('			<Pdo Name="' + [System.Security.SecurityElement]::Escape($pdo.Name) + '" Index="' + $pIdx + '"' + $inOutAttr + ' Flags="' + $pdoFlags + '" SyncMan="' + $pdoSm + '">')
         foreach ($e in $pdo.Entries) {
+            if ($isAnalog -and $e.IsGap) {
+                # Padding gap: typeless entry that only reserves bits in the PDO.
+                [void]$sb.AppendLine('				<Entry Index="#x0000" Sub="#x00">')
+                [void]$sb.AppendLine("					<BitLen>$([int]$e.BitLen)</BitLen>")
+                [void]$sb.AppendLine('				</Entry>')
+                continue
+            }
             $eIdx = '#x{0:x4}' -f [uint32]$e.Index
             $eSub = '#x{0:x2}' -f [int]$e.SubIndex
+            $eType = if ($e.ContainsKey('Type') -and $e.Type) { [string]$e.Type } else { 'BIT' }
             [void]$sb.AppendLine('				<Entry Name="' + [System.Security.SecurityElement]::Escape($e.Name) + '" Index="' + $eIdx + '" Sub="' + $eSub + '">')
-            [void]$sb.AppendLine('					<Type>BIT</Type>')
+            [void]$sb.AppendLine("					<Type>$eType</Type>")
             [void]$sb.AppendLine('				</Entry>')
         }
         [void]$sb.AppendLine('			</Pdo>')
@@ -3189,9 +3358,10 @@ try {
             # ESI-backed EtherCAT rack creator. For each requested module: resolve
             # its descriptor from the stock ESI folder, GENERATE a full .xti
             # (identity + PDOs + SyncMan/Fmmu) and IMPORT it under the parent.
-            # Sequential, continue-on-error; returns a compact roll-up. v1 = digital
-            # EL1xxx/EL2xxx only -- unsupported classes fail per-entry with a clear
-            # error (no wrong box emitted).
+            # Sequential, continue-on-error; returns a compact roll-up. Supports
+            # DIGITAL terminals (EL1xxx DigIn / EL2xxx DigOut) and ANALOG INPUT
+            # terminals (EL3xxx AnaIn, v1.1) -- unsupported classes (analog output,
+            # IO-Link, modular) fail per-entry with a clear error (no wrong box).
             $parentPath = [string]$payload.parentPath
             if ([string]::IsNullOrWhiteSpace($parentPath)) { throw 'parentPath is required' }
             $modules = $payload.modules
