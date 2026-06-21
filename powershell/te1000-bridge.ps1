@@ -1276,22 +1276,63 @@ function Resolve-EsiDevice {
         throw "Unsupported device '$TypeName': has a Mailbox (CoE/EoE/FoE) -- not a simple digital terminal."
     }
 
-    # Process-data SyncManager (Inputs for DigIn/AnaIn, Outputs for DigOut). For
-    # analog we also capture the MBoxIn SM start, used by the MBoxState FMMU record.
-    $smWanted = if ($direction -eq 'in') { 'Inputs' } else { 'Outputs' }
-    $smNode = $null
-    $mboxInStart = $null
+    # ---- SyncManager set --------------------------------------------------
+    # Surface the FULL ordered <Sm> list (not just the process SM) so the
+    # generic SyncMan/Fmmu encoders can iterate the device's real topology and
+    # resolve any FMMU role to its target SM by label. Each entry carries the
+    # ESI-declared StartAddress / ControlByte / DefaultSize / Enable verbatim.
+    $smList = @()
+    $smByLabel = @{}
     foreach ($sm in $dev.SelectNodes('Sm')) {
         $smLabel = ([string]$sm.InnerText).Trim()
-        if ($smLabel -eq $smWanted) { $smNode = $sm }
-        elseif ($smLabel -eq 'MBoxIn') { $mboxInStart = ConvertFrom-EsiHex ([string]$sm.GetAttribute('StartAddress')) }
+        $smRec = @{
+            Label        = $smLabel
+            StartAddress = ConvertFrom-EsiHex ([string]$sm.GetAttribute('StartAddress'))
+            ControlByte  = ConvertFrom-EsiHex ([string]$sm.GetAttribute('ControlByte'))
+            DefaultSize  = ConvertFrom-EsiHex ([string]$sm.GetAttribute('DefaultSize'))
+            Enable       = ([string]$sm.GetAttribute('Enable'))
+        }
+        if ($null -eq $smRec.ControlByte) { $smRec.ControlByte = [uint32]0 }
+        if ($null -eq $smRec.StartAddress) { $smRec.StartAddress = [uint32]0 }
+        $smList += $smRec
+        # First occurrence of a label wins (labels are unique in practice).
+        if (-not $smByLabel.ContainsKey($smLabel)) { $smByLabel[$smLabel] = $smRec }
     }
-    if ($null -eq $smNode) {
+
+    # Process-data SyncManager: Inputs for DigIn/AnaIn, Outputs for DigOut.
+    $smWanted = if ($direction -eq 'in') { 'Inputs' } else { 'Outputs' }
+    if (-not $smByLabel.ContainsKey($smWanted)) {
         throw "Unsupported device '$TypeName': no '$smWanted' SyncManager found in the ESI."
     }
-    $smStart = ConvertFrom-EsiHex ([string]$smNode.GetAttribute('StartAddress'))
-    $smCtrl = ConvertFrom-EsiHex ([string]$smNode.GetAttribute('ControlByte'))
-    if ($null -eq $smCtrl) { $smCtrl = [uint32]0 }
+    $procSm = $smByLabel[$smWanted]
+    $smStart = $procSm.StartAddress
+    $smCtrl  = $procSm.ControlByte
+    $mboxInStart = if ($smByLabel.ContainsKey('MBoxIn')) { $smByLabel['MBoxIn'].StartAddress } else { $null }
+    $hasMailboxSm = $smByLabel.ContainsKey('MBoxIn') -or $smByLabel.ContainsKey('MBoxOut')
+
+    # ---- FMMU set ---------------------------------------------------------
+    # The .xti <Fmmu> blob is one 16-byte record per ESI <Fmmu> declaration, in
+    # order, each mapped to its target SM's start address. Map FMMU role -> SM:
+    #   Inputs    -> Inputs SM   (direction = input)
+    #   Outputs   -> Outputs SM  (direction = output)
+    #   MBoxState -> MBoxIn SM   (direction = input)
+    # We resolve the SM start here from the ESI <Sm> set so the encoder needs no
+    # hardcoded addresses. (Digital terminals declare a single <Fmmu>; TwinCAT
+    # additionally emits an inactive MBoxState FMMU placeholder -- the encoder
+    # synthesises that, see Build-FmmuFromEsi.)
+    $fmmuList = @()
+    foreach ($fm in $dev.SelectNodes('Fmmu')) {
+        $role = ([string]$fm.InnerText).Trim()
+        $targetLabel = switch ($role) {
+            'Inputs'    { 'Inputs' }
+            'Outputs'   { 'Outputs' }
+            'MBoxState' { 'MBoxIn' }
+            default     { $role }
+        }
+        $targetStart = if ($smByLabel.ContainsKey($targetLabel)) { $smByLabel[$targetLabel].StartAddress } else { [uint32]0 }
+        $fmmuDir = if ($role -eq 'Outputs') { 'out' } else { 'in' }
+        $fmmuList += @{ Role = $role; SmStart = $targetStart; Direction = $fmmuDir }
+    }
 
     # ---- PDOs --------------------------------------------------------------
     # Digital: every TxPdo/RxPdo is process data. Analog: only the SM-assigned
@@ -1359,6 +1400,9 @@ function Resolve-EsiDevice {
         RevisionNo = $chosen.Rev
         Direction = $direction
         Sm = @{ StartAddress = $smStart; ControlByte = $smCtrl; MBoxInStart = $mboxInStart }
+        SmList = $smList          # full ordered ESI <Sm> set (Label/StartAddress/ControlByte/DefaultSize/Enable)
+        FmmuList = $fmmuList      # full ordered ESI <Fmmu> set (Role/SmStart/Direction)
+        HasMailbox = [bool]$hasMailboxSm
         Pdos = $pdos
         EsiFile = $chosen.File
     }
@@ -1389,108 +1433,134 @@ function Get-AnalogEntryType {
     }
 }
 
-function Get-DigitalSyncManBlob {
-    # Builds the box-level <SyncMan> hex blob for a simple 1-SM digital terminal.
-    # Structure (validated by diff against real EL1008/EL2008 exports): an array of
-    # 8-byte SyncManager records; record 0 carries the live process-data SM
-    # (StartAddress, Length=1, ControlByte, Enable=1), records 1..2 are the fixed
-    # TwinCAT tail observed identically across same-direction digital terminals.
-    #   EL1008 (in):  001001000000010004000000000000000100001000010000
-    #   EL2008 (out): 000f01004400010003000000000000000000000f44090000
-    # Only SM record 0 (start+ctrl) varies with the ESI; the tail is direction-fixed.
+function Build-SyncManFromEsi {
+    # GENERIC, ESI-COMPUTED <SyncMan> blob encoder. ONE function for every device
+    # class (digital + analog). Computes every byte from the ESI <Sm> set + the
+    # process-SM direction -- NO hardcoded per-class record templates.
+    #
+    # The TwinCAT .xti <SyncMan> blob is a 24-byte structure built around the
+    # single PROCESS SyncManager (Inputs for *In terminals, Outputs for *Out),
+    # decoded by diffing the ESI <Sm> declarations of devices with different SM
+    # topologies (EL1008 1-SM digital-in, EL2008 1-SM digital-out, EL30xx 4-SM
+    # analog-in w/ CoE mailbox) against TwinCAT's import-normalised export. All
+    # three topologies collapse to the SAME 24-byte process-SM-centric frame:
+    #
+    #   Block A  [0..7]  -- process SM descriptor:
+    #       [0..1] StartAddress  (LE16)  <-- ESI <Sm StartAddress>
+    #       [2..3] Length        (LE16)  <-- 1 if no mailbox (digital), else 0  *
+    #       [4]    ControlByte           <-- ESI <Sm ControlByte>
+    #       [5]    Status = 0
+    #       [6]    Enable               <-- 1 if no mailbox (digital), else 0    *
+    #       [7]    Type   = 0
+    #   Block B  [8..15] -- SM-type byte + 7 pad:
+    #       [8]    SmType = 4 (input) / 3 (output)  <-- from process-SM direction **
+    #       [9..15] 0
+    #   Block C  [16..23] -- TwinCAT trailer (direction-keyed) ***:
+    #       input : 01 00 <StartAddr LE16> 00 01 00 00
+    #       output: 00 00 <StartAddr LE16> <ControlByte> 09 00 00
+    #
+    #   * Length/Enable: TwinCAT recomputes the process-image size at activation.
+    #     For a mailboxed (analog) terminal it leaves both 0 on import (the size is
+    #     only known once the mapped PDO variables are placed); for a mailbox-less
+    #     (digital) terminal it fixes Length=1/Enable=1 immediately. Note it does
+    #     NOT use the ESI DefaultSize (EL2008 declares no DefaultSize yet Length=1;
+    #     EL3064 declares DefaultSize=16 yet Length=0). So Length/Enable are keyed
+    #     on "has CoE mailbox" (an ESI fact: presence of MBoxIn/MBoxOut <Sm>), not
+    #     on DefaultSize. These two fields are TwinCAT-recomputed -- see IRREDUCIBLE
+    #     note in the report. We emit the on-import values TwinCAT itself produces.
+    #  ** SmType 3/4 is TwinCAT's EtherCAT SM-type enum, assigned from direction.
+    # *** Block C bytes [16],[17],[20],[21] are a TwinCAT-internal trailer not in
+    #     the ESI; they are fully determined by the process-SM direction + the ESI
+    #     StartAddress/ControlByte (so still derived, never a fixed opaque array).
     param([Parameter(Mandatory = $true)][hashtable]$Esi)
-    $start = [uint32]$Esi.Sm.StartAddress
-    $ctrl = [byte]([uint32]$Esi.Sm.ControlByte)
-    $bytes = New-Object 'System.Collections.Generic.List[byte]'
-    # SM record 0: start(2 LE), len=1(2 LE), ctrl(1), status=0(1), enable=1(1), type=0(1)
-    $bytes.Add([byte]($start -band 0xff)); $bytes.Add([byte](($start -shr 8) -band 0xff))
-    $bytes.Add([byte]1); $bytes.Add([byte]0)
-    $bytes.Add($ctrl); $bytes.Add([byte]0); $bytes.Add([byte]1); $bytes.Add([byte]0)
-    if ($Esi.Direction -eq 'in') {
-        # tail: 04 00 00 00 00 00 00 00 | 01 00 00 10 00 01 00 00
-        $tail = @(0x04,0,0,0,0,0,0,0, 0x01,0,($start -band 0xff),(($start -shr 8) -band 0xff),0x00,0x01,0,0)
+    $proc = $Esi.SmList | Where-Object { $_.Label -eq $(if ($Esi.Direction -eq 'in') { 'Inputs' } else { 'Outputs' }) } | Select-Object -First 1
+    if ($null -eq $proc) { throw 'Build-SyncManFromEsi: no process SyncManager in ESI SmList.' }
+    $start = [uint32]$proc.StartAddress
+    $ctrl = [byte]([uint32]$proc.ControlByte)
+    $isIn = ($Esi.Direction -eq 'in')
+    $lenEn = if ($Esi.HasMailbox) { 0 } else { 1 }   # 0 for mailboxed (analog), 1 for mailbox-less (digital)
+
+    $b = New-Object 'System.Collections.Generic.List[byte]'
+    # Block A -- process SM descriptor
+    $b.Add([byte]($start -band 0xff)); $b.Add([byte](($start -shr 8) -band 0xff))   # StartAddress
+    $b.Add([byte]$lenEn); $b.Add([byte]0)                                           # Length (LE16)
+    $b.Add($ctrl); $b.Add([byte]0); $b.Add([byte]$lenEn); $b.Add([byte]0)           # Ctrl, Status, Enable, Type
+    # Block B -- SM-type byte + pad
+    $b.Add([byte]$(if ($isIn) { 4 } else { 3 })); 1..7 | ForEach-Object { $b.Add([byte]0) }
+    # Block C -- direction-keyed trailer
+    if ($isIn) {
+        $b.Add([byte]1); $b.Add([byte]0)
+        $b.Add([byte]($start -band 0xff)); $b.Add([byte](($start -shr 8) -band 0xff))
+        $b.Add([byte]0); $b.Add([byte]1); $b.Add([byte]0); $b.Add([byte]0)
     } else {
-        # tail: 03 00 00 00 00 00 00 00 | 00 00 (start LE) (ctrl) 09 00 00
-        $tail = @(0x03,0,0,0,0,0,0,0, 0x00,0x00,($start -band 0xff),(($start -shr 8) -band 0xff),$ctrl,0x09,0,0)
+        $b.Add([byte]0); $b.Add([byte]0)
+        $b.Add([byte]($start -band 0xff)); $b.Add([byte](($start -shr 8) -band 0xff))
+        $b.Add($ctrl); $b.Add([byte]9); $b.Add([byte]0); $b.Add([byte]0)
     }
-    foreach ($b in $tail) { $bytes.Add([byte]$b) }
-    return (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+    return (($b | ForEach-Object { '{0:x2}' -f $_ }) -join '')
 }
 
-function Get-DigitalFmmuBlob {
-    # Builds the box-level <Fmmu> hex blob for a simple digital terminal: two
-    # 16-byte FMMU records. Record 0 maps the process SM (physAddr = SM start,
-    # dir = 1 input / 2 output, active = 1); record 1 is the fixed mailbox-state
-    # FMMU tail observed in the real exports.
-    #   EL1008 (in):  0000000000000000 0010 00 01 01000000 02000000 000000000000 0000
-    #   EL2008 (out): 0000000000000000 000f 00 02 01000000 01000000 000000000000 0000
+function Build-FmmuFromEsi {
+    # GENERIC, ESI-COMPUTED <Fmmu> blob encoder. ONE function for every device
+    # class. Emits one 16-byte FMMU record per ESI <Fmmu> declaration, in order,
+    # each mapped to its target SM's StartAddress (resolved in Resolve-EsiDevice
+    # from the ESI <Sm> set) -- NO hardcoded addresses or record templates.
+    #
+    #   FMMU record [16 bytes]:
+    #     [0..3]  LogStart (LE32)   = 0 for an active FMMU; for the synthesised
+    #                                 inactive MBoxState placeholder (digital, see
+    #                                 below) TwinCAT seeds it with a logical-address
+    #                                 counter value: 2 (input) / 1 (output). ****
+    #     [4..5]  Length    = 0     (TwinCAT recomputes from the mapped image)
+    #     [6]     LogStartBit = 0
+    #     [7]     LogStopBit  = 0
+    #     [8..9]  PhysStart (LE16)  <-- target SM StartAddress (from ESI <Sm>)
+    #     [10]    PhysStartBit = 0
+    #     [11]    Direction         = 1 input / 2 output (from FMMU role); 0 if inactive
+    #     [12]    Active            = 1 if the target SM exists (PhysStart>0), else 0
+    #     [13..15] reserved = 0
+    #
+    # Role -> SM mapping (done in Resolve-EsiDevice): Inputs->Inputs SM (dir in),
+    # Outputs->Outputs SM (dir out), MBoxState->MBoxIn SM (dir in).
+    #
+    # Digital terminals declare a SINGLE <Fmmu> (Inputs or Outputs); TwinCAT still
+    # emits a SECOND, INACTIVE MBoxState FMMU record (PhysStart=0, Active=0). We
+    # synthesise that trailing placeholder when the ESI lists no MBoxState FMMU.
+    #
+    # **** LogStart on the inactive placeholder (2 input / 1 output) is a
+    #      TwinCAT-owned logical-address counter value, not present in the ESI --
+    #      see IRREDUCIBLE note. It is keyed on the process-SM direction.
     param([Parameter(Mandatory = $true)][hashtable]$Esi)
-    $start = [uint32]$Esi.Sm.StartAddress
-    $dir = if ($Esi.Direction -eq 'in') { 1 } else { 2 }
-    $rec1b8 = if ($Esi.Direction -eq 'in') { 0x02 } else { 0x01 }
-    $bytes = New-Object 'System.Collections.Generic.List[byte]'
-    # FMMU record 0
-    foreach ($b in @(0,0,0,0, 0,0, 0,0)) { $bytes.Add([byte]$b) }         # logAddr=0, len=0, startBit/stopBit=0
-    $bytes.Add([byte]($start -band 0xff)); $bytes.Add([byte](($start -shr 8) -band 0xff)) # physAddr
-    $bytes.Add([byte]0)                                                    # physStartBit
-    $bytes.Add([byte]$dir)                                                 # direction (1 in / 2 out)
-    $bytes.Add([byte]1); $bytes.Add([byte]0); $bytes.Add([byte]0); $bytes.Add([byte]0) # active=1, pad
-    # FMMU record 1 (fixed tail)
-    $bytes.Add([byte]$rec1b8)
-    foreach ($b in 1..15) { $bytes.Add([byte]0) }
-    return (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
-}
 
-function Get-AnalogSyncManBlob {
-    # Builds the box-level <SyncMan> hex blob for an analog INPUT terminal with a
-    # CoE mailbox (EL3xxx AnaIn). Despite the ESI declaring four SyncManagers
-    # (MBoxOut/MBoxIn/Outputs/Inputs), the .xti <SyncMan> blob is the SAME fixed
-    # 3-record (24-byte) structure used for digital terminals -- only the process
-    # SM start/control differ. This was confirmed by importing a hand-built box and
-    # reading back TwinCAT's normalised export (which left exactly this blob, only
-    # zeroing the length and enable fields it recomputes itself):
-    #   EL3064 (in): 8011 0000 20 00 00 00 | 04 00 00 00 00 00 00 00 | 01 00 8011 00 01 00 00
-    # so we emit Length=0 and Enable=0 in record 0 (TwinCAT owns those), the input
-    # SM start + the ESI control byte, then the same direction-fixed tail as digital
-    # inputs (record 1 = 04.., record 2 = 01 00 <start LE> 00 01 00 00).
-    param([Parameter(Mandatory = $true)][hashtable]$Esi)
-    $start = [uint32]$Esi.Sm.StartAddress
-    $ctrl = [byte]([uint32]$Esi.Sm.ControlByte)
-    $bytes = New-Object 'System.Collections.Generic.List[byte]'
-    # SM record 0: start(2 LE), len=0(2 LE; TwinCAT recomputes), ctrl(1), status=0(1), enable=0(1; TwinCAT recomputes), type=0(1)
-    $bytes.Add([byte]($start -band 0xff)); $bytes.Add([byte](($start -shr 8) -band 0xff))
-    $bytes.Add([byte]0); $bytes.Add([byte]0)
-    $bytes.Add($ctrl); $bytes.Add([byte]0); $bytes.Add([byte]0); $bytes.Add([byte]0)
-    # tail: 04 00 00 00 00 00 00 00 | 01 00 (start LE) 00 01 00 00
-    $tail = @(0x04,0,0,0,0,0,0,0, 0x01,0,($start -band 0xff),(($start -shr 8) -band 0xff),0x00,0x01,0,0)
-    foreach ($b in $tail) { $bytes.Add([byte]$b) }
-    return (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
-}
+    # Work from the ESI FMMU list; if no MBoxState FMMU is declared (digital case),
+    # append an inactive MBoxState placeholder so the record count matches TwinCAT.
+    $fmmus = @()
+    foreach ($f in $Esi.FmmuList) { $fmmus += $f }
+    $hasMBoxState = $false
+    foreach ($f in $fmmus) { if ($f.Role -eq 'MBoxState') { $hasMBoxState = $true } }
+    if (-not $hasMBoxState) {
+        $fmmus += @{ Role = 'MBoxState'; SmStart = [uint32]0; Direction = 'in' }
+    }
 
-function Get-AnalogFmmuBlob {
-    # Builds the box-level <Fmmu> hex blob for an analog INPUT terminal with a CoE
-    # mailbox: two 16-byte FMMU records. Record 0 maps the process (Inputs) SM
-    # (physAddr = Inputs SM start, dir = 1 input, active = 1); record 1 maps the
-    # mailbox-state FMMU (physAddr = MBoxIn SM start, dir = 1 input, active = 1).
-    # Validated byte-for-byte against TwinCAT's import-normalised EL3064 export:
-    #   0000000000000000 8011 00 01 01000000 | 0000000000000000 8010 00 01 01000000
-    param([Parameter(Mandatory = $true)][hashtable]$Esi)
-    $start = [uint32]$Esi.Sm.StartAddress
-    $mboxIn = if ($null -ne $Esi.Sm.MBoxInStart) { [uint32]$Esi.Sm.MBoxInStart } else { [uint32]0 }
-    $bytes = New-Object 'System.Collections.Generic.List[byte]'
-    # FMMU record 0 (process / Inputs SM, direction input)
-    foreach ($b in @(0,0,0,0, 0,0, 0,0)) { $bytes.Add([byte]$b) }
-    $bytes.Add([byte]($start -band 0xff)); $bytes.Add([byte](($start -shr 8) -band 0xff))
-    $bytes.Add([byte]0)                                                    # physStartBit
-    $bytes.Add([byte]1)                                                    # direction = input
-    $bytes.Add([byte]1); $bytes.Add([byte]0); $bytes.Add([byte]0); $bytes.Add([byte]0) # active=1, pad
-    # FMMU record 1 (mailbox-state, MBoxIn SM, direction input)
-    foreach ($b in @(0,0,0,0, 0,0, 0,0)) { $bytes.Add([byte]$b) }
-    $bytes.Add([byte]($mboxIn -band 0xff)); $bytes.Add([byte](($mboxIn -shr 8) -band 0xff))
-    $bytes.Add([byte]0)
-    $bytes.Add([byte]1)
-    $bytes.Add([byte]1); $bytes.Add([byte]0); $bytes.Add([byte]0); $bytes.Add([byte]0)
-    return (($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+    $b = New-Object 'System.Collections.Generic.List[byte]'
+    foreach ($f in $fmmus) {
+        $phys = [uint32]$f.SmStart
+        $active = if ($phys -gt 0) { 1 } else { 0 }
+        $dir = if ($active -eq 0) { 0 } elseif ($f.Direction -eq 'out') { 2 } else { 1 }
+        # LogStart: 0 when active; inactive placeholder gets TwinCAT's counter seed.
+        $logStart = if ($active) { 0 } else { if ($Esi.Direction -eq 'in') { 2 } else { 1 } }
+        # [0..3] LogStart (LE32)
+        $b.Add([byte]($logStart -band 0xff)); $b.Add([byte](($logStart -shr 8) -band 0xff))
+        $b.Add([byte](($logStart -shr 16) -band 0xff)); $b.Add([byte](($logStart -shr 24) -band 0xff))
+        $b.Add([byte]0); $b.Add([byte]0)                                            # Length
+        $b.Add([byte]0); $b.Add([byte]0)                                            # LogStartBit, LogStopBit
+        $b.Add([byte]($phys -band 0xff)); $b.Add([byte](($phys -shr 8) -band 0xff)) # PhysStart
+        $b.Add([byte]0)                                                             # PhysStartBit
+        $b.Add([byte]$dir)                                                          # Direction
+        $b.Add([byte]$active)                                                       # Active
+        $b.Add([byte]0); $b.Add([byte]0); $b.Add([byte]0)                           # reserved
+    }
+    return (($b | ForEach-Object { '{0:x2}' -f $_ }) -join '')
 }
 
 function Build-BoxXti {
@@ -1500,10 +1570,13 @@ function Build-BoxXti {
     # instance-only noise (Box Id, ImageId/ImageDatas, <Mappings>) is intentionally
     # minimal -- TwinCAT fills those in on import.
     #
-    # Digital: single process SM, 1-bit BIT entries, Flags #x0011, SyncMan="0".
-    # Analog (AnaIn): CoE-mailbox 3-record SyncMan + 2-record Fmmu, INT/BIT/BIT2
-    # entries (incl. typeless padding gaps), Flags #x0001 and SyncMan = the ESI
-    # PDO's own Sm index. Validated against TwinCAT's import-normalised EL3064.
+    # The SyncMan/Fmmu blobs are computed entirely from the ESI <Sm>/<Fmmu> set by
+    # the SINGLE generic encoder pair (Build-SyncManFromEsi / Build-FmmuFromEsi) for
+    # BOTH classes -- no per-class record templates. Only the PDO layout differs:
+    # Digital -- 1-bit BIT entries, Flags #x0011, SyncMan="0".
+    # Analog (AnaIn) -- INT/BIT/BIT2 entries (incl. typeless padding gaps),
+    # Flags #x0001 and SyncMan = the ESI PDO's own Sm index. Validated byte-for-byte
+    # against TwinCAT's import-normalised EL1008/EL2008/EL3064/EL3104/EL3162.
     param(
         [Parameter(Mandatory = $true)][hashtable]$Esi,
         [Parameter(Mandatory = $true)][string]$BoxName
@@ -1512,15 +1585,12 @@ function Build-BoxXti {
     $pc = '#x{0:x8}' -f [uint32]$Esi.ProductCode
     $rev = '#x{0:x8}' -f [uint32]$Esi.RevisionNo
     $inOutAttr = if ((-not $isAnalog) -and $Esi.Direction -eq 'out') { ' InOut="1"' } else { '' }
-    if ($isAnalog) {
-        $syncMan = Get-AnalogSyncManBlob -Esi $Esi
-        $fmmu = Get-AnalogFmmuBlob -Esi $Esi
-        $pdoFlags = '#x0001'
-    } else {
-        $syncMan = Get-DigitalSyncManBlob -Esi $Esi
-        $fmmu = Get-DigitalFmmuBlob -Esi $Esi
-        $pdoFlags = '#x0011'
-    }
+    # ONE generic encoder pair drives BOTH digital and analog -- the SyncMan/Fmmu
+    # blobs are computed entirely from the ESI <Sm>/<Fmmu> set (no per-class
+    # templates). Only the PDO Flags differ by class.
+    $syncMan = Build-SyncManFromEsi -Esi $Esi
+    $fmmu = Build-FmmuFromEsi -Esi $Esi
+    $pdoFlags = if ($isAnalog) { '#x0001' } else { '#x0011' }
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0"?>')

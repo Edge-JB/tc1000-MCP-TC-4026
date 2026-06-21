@@ -5,6 +5,70 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-21 — SyncMan/Fmmu now fully ESI-computed; baked framing removed — branch `improve/esi-computed-syncman`
+
+**Refactor.** The box-level `<SyncMan>`/`<Fmmu>` blobs in the `create_rack` ESI→`.xti` generator are
+now computed **entirely from the ESI's own `<Sm>`/`<Fmmu>` declarations** by a single generic encoder
+pair — `Build-SyncManFromEsi` / `Build-FmmuFromEsi` — used by **both** digital and analog. The four
+old per-class functions (`Get-DigitalSyncManBlob` / `Get-DigitalFmmuBlob` / `Get-AnalogSyncManBlob` /
+`Get-AnalogFmmuBlob`) with their hardcoded literal byte arrays (the `04 00 00 00…` tail, the fixed
+3-record/24-byte SyncMan frame, the 16-byte FMMU layout) are **deleted**. `Resolve-EsiDevice` now
+surfaces the **full ordered `<Sm>` set** (`SmList`: Label/StartAddress/ControlByte/DefaultSize/Enable)
+and **full ordered `<Fmmu>` set** (`FmmuList`: Role/SmStart/Direction, each FMMU pre-resolved to its
+target SM's start address) plus a `HasMailbox` flag, so the encoders iterate the device's real
+topology instead of a baked recipe.
+
+**The derived ESI→blob rule (reverse-engineered against the import→export oracle).** Validated
+byte-for-byte against TwinCAT's import-normalised export of `EL1008` (digital-in, 1 SM), `EL2008`
+(digital-out, 1 SM), `EL3064`/`EL3104`/`EL3162` (analog-in, 4 SMs w/ CoE mailbox) — three distinct
+SM topologies. The `<SyncMan>` blob is a **24-byte, process-SM-centric** frame (NOT one record per
+ESI SM — a 1-SM digital and a 4-SM analog both produce 24 bytes):
+
+- **Block A `[0..7]` — process SM descriptor** (process SM = Inputs for `*In`, Outputs for `*Out`):
+  `StartAddress`(LE16, **from ESI** `<Sm StartAddress>`), `Length`(LE16), `ControlByte`(**from ESI**
+  `<Sm ControlByte>`), `Status=0`, `Enable`, `Type=0`.
+- **Block B `[8..15]` — SM-type byte + 7×0:** `4` for an input process SM, `3` for output
+  (TwinCAT's EtherCAT SM-type enum, keyed on the ESI process-SM direction).
+- **Block C `[16..23]` — TwinCAT trailer, direction-keyed:** input → `01 00 <StartAddr LE16> 00 01 00 00`;
+  output → `00 00 <StartAddr LE16> <ControlByte> 09 00 00`. Every non-constant byte here is the ESI
+  `StartAddress`/`ControlByte`; the rest is a direction-determined pattern.
+
+The `<Fmmu>` blob is **one 16-byte record per ESI `<Fmmu>`**, in order, each mapped to its target SM's
+`StartAddress` (resolved from the ESI `<Sm>` set): `LogStart`(LE32), `Length=0`, `LogStartBit=0`,
+`LogStopBit=0`, `PhysStart`(LE16, **= target SM start from ESI**), `PhysStartBit=0`,
+`Direction`(1 input / 2 output, **from the FMMU role**), `Active`(1 if target SM exists). Role→SM:
+`Inputs`→Inputs SM, `Outputs`→Outputs SM, `MBoxState`→MBoxIn SM. Digital terminals declare a single
+`<Fmmu>`; TwinCAT additionally emits one **inactive `MBoxState`** FMMU placeholder, which the encoder
+**synthesises** (PhysStart=0, Active=0) so the record count matches.
+
+**Irreducible TwinCAT-owned bytes (cannot come from the ESI; emitted as 0/derived-minimum, never as a
+hardcoded template — and documented inline).**
+
+1. **SyncMan Block A `Length` (`[2..3]`) and `Enable` (`[6]`).** TwinCAT recomputes the process-image
+   size at activation from the mapped PDO variables. On import it leaves both **0 for a mailboxed
+   (analog) terminal** (size not yet known) and fixes both to **1 for a mailbox-less (digital)
+   terminal**. This is **not** the ESI `DefaultSize` (EL2008 declares no `DefaultSize` yet Length=1;
+   EL3064 declares `DefaultSize=16` yet Length=0), so we key it on the ESI fact *"has CoE mailbox"*
+   (presence of an `MBoxIn`/`MBoxOut` `<Sm>`) and emit exactly the value TwinCAT itself writes on
+   import. Source of truth = the round-trip, not a literal array.
+2. **SyncMan Block B SM-type byte (`3`/`4`) and Block C trailer flag bytes (`[16]`,`[17]`,`[21]`, and
+   `[20]` for input).** A TwinCAT-internal serialization not present in the ESI; fully determined by
+   the ESI process-SM direction (so derived per-device, not a fixed opaque blob).
+3. **FMMU `LogStart` on the synthesised inactive MBoxState placeholder (`2` input / `1` output).** A
+   TwinCAT logical-address counter seed, not in the ESI; keyed on the process-SM direction.
+
+These are the *only* bytes not taken straight from an ESI field, and each is reproduced as a function
+of an ESI-derived value (direction / has-mailbox), not as a baked record. **Zero hardcoded record
+byte-arrays remain.**
+
+**Validation.** All five test devices round-trip **byte-for-byte identical** SyncMan/Fmmu (and full
+box `.xti` modulo the volatile `Box Id`/`ImageId`) to the pre-refactor output and to TwinCAT's live
+import→export, through the one generic encoder pair. Unsupported classes (`AnaOut`/EL4xxx,
+`Communication`/EL6652, …) still error clearly. Scratch boxes were created/exported/deleted under
+`EK1200` (left at exactly 13 children); the solution was **not** saved.
+
+---
+
 ## 2026-06-21 — `tc_tree action:create_rack` v1.1 — ANALOG input terminals (EL3xxx) — branch `improve/create-rack-analog`
 
 **Feature.** Extends the ESI→`.xti` generator from digital-only to **analog input** terminals
