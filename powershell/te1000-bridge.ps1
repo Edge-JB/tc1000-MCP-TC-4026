@@ -1273,6 +1273,196 @@ function Get-ChildTreeItemByName {
     throw "Child '$ChildName' was not found under '$((Normalize-ScalarValue (Get-SafeValue { [string]$ParentItem.PathName })))'"
 }
 
+function Get-VariableLinksFromXml {
+    # Variable links are NOT serialized in a box/device's ProduceXml as <Mappings>/<Link>
+    # (that shape only exists in the on-disk .xti written by the project saver). Live, a
+    # LINKED LEAF VARIABLE carries its links inside its own ProduceXml under
+    # <VarDef><LinkedWith>: InnerText is the full ^-path of the other endpoint. PLC-side
+    # endpoints also carry attributes (offsA/offsB/size/removeLink); IO-side carry a bare
+    # element. Group/box nodes do NOT embed their descendants' variable XML, so to answer
+    # "what is this box linked to?" the caller must walk descendants and collect each leaf's
+    # <LinkedWith>. This helper parses one item's own ProduceXml and returns its <LinkedWith>
+    # endpoints (the queried item is varA, each LinkedWith target is varB).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$TreeItem
+    )
+
+    $ownerPath = Normalize-ScalarValue (Get-SafeValue { [string]$TreeItem.PathName })
+
+    $xmlText = $null
+    try {
+        $xmlText = $TreeItem.ProduceXml()
+    } catch {
+        $xmlText = $null
+    }
+    if ([string]::IsNullOrEmpty($xmlText)) {
+        return @()
+    }
+
+    $links = @()
+    try {
+        [xml]$doc = $xmlText
+        foreach ($node in $doc.SelectNodes('//LinkedWith')) {
+            $varB = [string]$node.InnerText
+            if ([string]::IsNullOrWhiteSpace($varB)) {
+                continue
+            }
+            $entry = @{
+                varA = $ownerPath
+                varB = $varB
+            }
+            $offsA = Get-SafeValue { [string]$node.GetAttribute('offsA') }
+            $offsB = Get-SafeValue { [string]$node.GetAttribute('offsB') }
+            $size = Get-SafeValue { [string]$node.GetAttribute('size') }
+            if (-not [string]::IsNullOrWhiteSpace($offsA)) { $entry.offsA = $offsA }
+            if (-not [string]::IsNullOrWhiteSpace($offsB)) { $entry.offsB = $offsB }
+            if (-not [string]::IsNullOrWhiteSpace($size)) { $entry.size = $size }
+            $links += $entry
+        }
+    } catch {
+        return @()
+    }
+
+    return $links
+}
+
+function Get-VariableSubItemNames {
+    # Names of addressable sub-items a box/group node carries that are NOT in its standard
+    # Child()/ChildCount collection but ARE resolvable as "<path>^<name>": IO terminals expose
+    # their PDO channels as <RxPdo>/<TxPdo>/<Pdo> <Name> in the box XML, and Festo-style carriers
+    # expose <Slot><Module><Name>. Used to walk descendants when collecting links on a box.
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$Xml
+    )
+
+    $names = @()
+    if ([string]::IsNullOrEmpty($Xml)) {
+        return $names
+    }
+    try {
+        [xml]$doc = $Xml
+        foreach ($nameNode in $doc.SelectNodes('//RxPdo/Name | //TxPdo/Name | //Slot/Module/Name')) {
+            $n = [string]$nameNode.InnerText
+            if (-not [string]::IsNullOrWhiteSpace($n)) {
+                $names += $n
+            }
+        }
+    } catch {
+        return @()
+    }
+    return $names
+}
+
+function Get-VariableLinksRecursive {
+    # Walk the queried item and its descendants collecting every leaf's <LinkedWith>. A leaf
+    # variable answers directly from its own XML; a box/group is walked into via both standard
+    # Child() children AND addressable PDO-channel / slot-module sub-items (Get-VariableSubItemNames).
+    # Bounded by MaxNodes/MaxDepth so a whole-device query cannot run away. Every COM/XML call
+    # is guarded; a failure on one node is skipped rather than thrown.
+    param(
+        [Parameter(Mandatory = $true)]
+        $SysManager,
+
+        [Parameter(Mandatory = $true)]
+        [object]$TreeItem,
+
+        [int]$Depth = 0,
+
+        [int]$MaxDepth = 8,
+
+        [System.Collections.Generic.HashSet[string]]$Seen,
+
+        [ref]$Budget
+    )
+
+    if ($null -eq $Seen) {
+        $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    }
+
+    $links = @()
+    if ($Depth -gt $MaxDepth) {
+        return $links
+    }
+    if ($null -ne $Budget -and $Budget.Value -le 0) {
+        return $links
+    }
+
+    $path = Normalize-ScalarValue (Get-SafeValue { [string]$TreeItem.PathName })
+    if (-not [string]::IsNullOrWhiteSpace($path)) {
+        if ($Seen.Contains($path)) {
+            return $links
+        }
+        [void]$Seen.Add($path)
+    }
+    if ($null -ne $Budget) {
+        $Budget.Value = $Budget.Value - 1
+    }
+
+    $ownXml = $null
+    try {
+        $ownXml = $TreeItem.ProduceXml()
+    } catch {
+        $ownXml = $null
+    }
+
+    # Direct links on this node (only present when it is itself a linked leaf variable).
+    if (-not [string]::IsNullOrEmpty($ownXml)) {
+        try {
+            [xml]$doc = $ownXml
+            foreach ($node in $doc.SelectNodes('//LinkedWith')) {
+                $varB = [string]$node.InnerText
+                if ([string]::IsNullOrWhiteSpace($varB)) {
+                    continue
+                }
+                $entry = @{
+                    varA = $path
+                    varB = $varB
+                }
+                $offsA = Get-SafeValue { [string]$node.GetAttribute('offsA') }
+                $offsB = Get-SafeValue { [string]$node.GetAttribute('offsB') }
+                $size = Get-SafeValue { [string]$node.GetAttribute('size') }
+                if (-not [string]::IsNullOrWhiteSpace($offsA)) { $entry.offsA = $offsA }
+                if (-not [string]::IsNullOrWhiteSpace($offsB)) { $entry.offsB = $offsB }
+                if (-not [string]::IsNullOrWhiteSpace($size)) { $entry.size = $size }
+                $links += $entry
+            }
+        } catch {
+        }
+    }
+
+    # Recurse into standard children.
+    $childNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $count = Get-TreeItemChildCount -TreeItem $TreeItem
+    for ($i = 1; $i -le $count; $i++) {
+        if ($null -ne $Budget -and $Budget.Value -le 0) { break }
+        $child = (Get-TreeItemChild -TreeItem $TreeItem -Index $i).Value
+        if ($null -eq $child) { continue }
+        $cn = Normalize-ScalarValue (Get-SafeValue { [string]$child.Name })
+        if (-not [string]::IsNullOrWhiteSpace($cn)) { [void]$childNames.Add($cn) }
+        $links += Get-VariableLinksRecursive -SysManager $SysManager -TreeItem $child -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen -Budget $Budget
+    }
+
+    # Recurse into addressable PDO-channel / slot-module sub-items not already covered.
+    if (-not [string]::IsNullOrWhiteSpace($path)) {
+        foreach ($subName in (Get-VariableSubItemNames -Xml $ownXml)) {
+            if ($null -ne $Budget -and $Budget.Value -le 0) { break }
+            if ($childNames.Contains($subName)) { continue }
+            $subItem = $null
+            try {
+                $subItem = (Get-TreeItem -SysManager $SysManager -TreePath ("$path^" + $subName)).Value
+            } catch {
+                $subItem = $null
+            }
+            if ($null -eq $subItem) { continue }
+            $links += Get-VariableLinksRecursive -SysManager $SysManager -TreeItem $subItem -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen -Budget $Budget
+        }
+    }
+
+    return $links
+}
+
 $payload = Get-Payload
 $progId = if ($payload.progId) { [string]$payload.progId } else { 'TcXaeShell.DTE.17.0' }
 $mode = if ($payload.mode) { [string]$payload.mode } else { 'active' }
@@ -2251,6 +2441,48 @@ try {
                     succeeded = $succeeded
                     failed = $failed
                     results = $results
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_variable_links' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            # A linked leaf variable lists its links directly in its own ProduceXml under
+            # <VarDef><LinkedWith>. If the queried path is itself such a leaf, that's all we
+            # need. Otherwise (a box/terminal/group) its own Xml carries no <LinkedWith>, so
+            # walk descendants and collect each leaf's links (bounded recursion).
+            $directLinks = @()
+            try {
+                $directLinks = @(Get-VariableLinksFromXml -TreeItem $item)
+            } catch {
+                $directLinks = @()
+            }
+
+            $links = $directLinks
+            if (@($links).Count -eq 0) {
+                try {
+                    $budget = [ref]2000
+                    $links = @(Get-VariableLinksRecursive -SysManager $sysManager -TreeItem $item -Budget $budget)
+                } catch {
+                    $links = @()
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    count = @($links).Count
+                    links = @($links)
                 }
             }
             exit 0

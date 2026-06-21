@@ -5,6 +5,30 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-20 — Link read-back (`tc_link links`) added to close the verify loop for bulk linking — branch `improve/batch-ops`
+
+`tc_link` could link/unlink/resolve but had no way to ask "what is X currently linked
+to?", so bulk linking had no read-back to verify against (the gap `exists_batch`/
+`get_batch` already close for tree edits). Added a `links` action (bridge verb
+`twincat_get_variable_links`) that, given an item path, reports its current variable
+links as `{ path, count, links:[{ varA, varB, offsA?, offsB?, size? }] }`.
+
+XML source: variable links are NOT serialized in a box/device `ProduceXml()` — the
+on-disk `.xti` `<Mappings><OwnerA><OwnerB><Link VarA VarB/>` shape is written only by
+the project saver, and confirmed (read-only, via the live `tc_tree get_xml`) absent
+from both the EtherCAT *device* and *box* level live ProduceXml. Live, each **linked
+leaf variable** instead carries its links in its own ProduceXml under
+`<VarDef><LinkedWith>` (InnerText = the other endpoint's `^`-path; PLC-side endpoints
+also carry `offsA`/`offsB`/`size`/`removeLink` attributes), and it's bidirectional.
+So the verb reads a leaf's `<LinkedWith>` directly; for a box/terminal/group (which
+carries no `<LinkedWith>` of its own) it walks descendants — standard `Child()` plus
+addressable PDO-channel / slot-module sub-items — collecting each leaf's links, with
+bounded recursion and `Get-SafeValue`/guarded `[xml]` parsing (parse failure →
+`count:0, links:[]`, never throws). Verified against `EL2008 Channel 1 Output` ↔
+`GvSys.R01.N09.Ch1`.
+
+---
+
 ## 2026-06-20 — Fixed `twincat_list_children` ProduceXml-on-every-call regression — branch `improve/batch-ops`
 
 The CPX-AP/Festo sub-module augmentation added to `twincat_list_children` called

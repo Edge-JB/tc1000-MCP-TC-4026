@@ -443,9 +443,9 @@ server.registerTool(
 server.registerTool(
   "tc_link",
   {
-    description: "Variable links (producer↔consumer); dot-form PLC subfields auto-resolve to XAE ^ subitem form. BATCH-FIRST: for more than one link use link_batch/unlink_batch — N ops in ONE DTE attach with a verbose per-entry roll-up (incl. resolved paths), instead of an attach per link. Actions, grouped single / batch: LINK — link (a=source, b=destination) / link_batch (links:[{a,b}]); UNLINK — unlink (a, optional b; a alone removes all its links) / unlink_batch (links:[{a,b?}]); resolve (report valid path forms for a).",
+    description: "Variable links (producer↔consumer); dot-form PLC subfields auto-resolve to XAE ^ subitem form. BATCH-FIRST: for more than one link use link_batch/unlink_batch — N ops in ONE DTE attach with a verbose per-entry roll-up (incl. resolved paths), instead of an attach per link. Actions, grouped single / batch: LINK — link (a=source, b=destination) / link_batch (links:[{a,b}]); UNLINK — unlink (a, optional b; a alone removes all its links) / unlink_batch (links:[{a,b?}]); resolve (report valid path forms for a); links (a=item path; reports that item's current variable links — closes the discover→act→verify loop).",
     inputSchema: {
-      action: z.enum(["link", "unlink", "resolve", "link_batch", "unlink_batch"]),
+      action: z.enum(["link", "unlink", "resolve", "link_batch", "unlink_batch", "links"]),
       a: z.string(),
       b: z.string().optional(),
       autoResolve: z.boolean().default(true),
@@ -465,6 +465,10 @@ server.registerTool(
     if (action === "unlink_batch") {
       need({ links }, ["links"], action);
       return textResult(await bridgeCall("twincat_unlink_variables_batch", { links }));
+    }
+    if (action === "links") {
+      need({ a }, ["a"], action);
+      return textResult(await bridgeCall("twincat_get_variable_links", { path: a }));
     }
     return textResult(await bridgeCall("twincat_resolve_variable_path", { variablePath: a }));
   },

@@ -55,7 +55,7 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
     | Link variables | `tc_link link` | `tc_link link_batch` (links:[{a,b}]) |
     | Unlink variables | `tc_link unlink` | `tc_link unlink_batch` (links:[{a,b?}]) |
 
-    No batch form (inherently single / read-all): `children`, `get_xml`, `import`, `export`, `focus`, `tc_link resolve`.
+    No batch form (inherently single / read-all): `children`, `get_xml`, `import`, `export`, `focus`, `tc_link resolve`, `tc_link links`.
   - `set_xml` returns a compact `{ treePath }` by default; pass `returnXml:true` to also echo the produced XML (with the embedded `TreeImageData16x14` bitmap stripped).
   - `get_xml` returns the full raw `ProduceXml()` blob by default (~15k tokens for an EtherCAT box). Pass `summary:true` for a compact `{ treePath, summary }` instead — `summary` carries the item identity (`name`, `pathName`, `itemType`, `subType`, `childCount`) plus a `modules` array of the slot/module names parsed from `//Slot/Module/Name`. Use it to inspect an item before editing, or to cheaply discover an EtherCAT coupler's sub-modules, without paying for the PDO/CoE payload.
   - **Renaming tree items:** `tc_tree action:rename path:<treePath> newName:<name>` renames an existing item (e.g. an EtherCAT box/terminal) and keeps IO links intact, returning a compact `{ treePath, newName, newPath }`. Do **not** use `set_xml`/`newName` probing for this.
@@ -114,7 +114,7 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
       ]
     ```
   - `children` returns the standard child tree items (each tagged `kind:"child"`) **and** any addressable coupler sub-modules that live in the box's `ProduceXml()` `<Slot><Module>` collection (CPX-AP / Festo AP modules — IO-Link masters, valve terminals, DI/DO blocks) but are not in the standard `ChildCount`/`Child()` collection. Those are tagged `kind:"module"` and are resolvable by their full `^`-path. `childCount` equals the total number of entries returned (standard children + modules). The module scan is fully defensive — a malformed box or unresolvable module never breaks a normal `children` call.
-- `tc_link` — link / unlink / resolve / link_batch / unlink_batch
+- `tc_link` — link / unlink / resolve / link_batch / unlink_batch / links
   - **Batch link/unlink:** `tc_link action:link_batch links:[{a,b},...]` links many variable pairs (and `action:unlink_batch links:[{a,b?},...]` unlinks them — `b` optional, `a` alone removes all of `a`'s links) in a single process / DTE attach. Pairs run **sequentially in the given order** and one failure never aborts the rest. Returns a verbose per-entry roll-up `{ count, succeeded, failed, results }`; each `link_batch` `results[]` entry is `{ a, b, resolvedA, resolvedB, ok }` (the resolved `^`-path forms each side was actually linked through), or `{ a, b, ok:false, error }` on failure. Example:
 
     ```
@@ -125,6 +125,14 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
         { a:"TIPC^Cabsort Lite^Cabsort Lite Instance^PlcTask Outputs^MAIN.bRun",
           b:"TIID^Device 2 (EtherCAT)^Term 2^Channel 1^Output" }
       ]
+    ```
+  - **Read current links (verify):** `tc_link action:links a:<item path>` reports what an item is currently linked to — closing the discover→act→**verify** loop for linking the way `exists_batch`/`get_batch` do for tree edits. Returns a compact `{ path, count, links:[{ varA, varB, offsA?, offsB?, size? }] }`, where `varA` is the queried (or owning) variable and `varB` the path it links to. **Format/level:** links are NOT in a box/device `ProduceXml()` (the on-disk `.xti` `<Mappings>/<Link>` shape isn't emitted live); instead each **linked leaf variable** carries its links in its own `ProduceXml()` under `<VarDef><LinkedWith>` (InnerText = the other endpoint's `^`-path; PLC-side endpoints also carry `offsA`/`offsB`/`size` attributes). So querying a **leaf variable** returns its `<LinkedWith>` endpoints directly; querying a **box/terminal/group** (which carries no `<LinkedWith>` of its own) walks descendant variables — standard `Child()` children plus addressable PDO-channel / slot-module sub-items — and collects each leaf's links (bounded recursion, defensively guarded; on parse failure returns `count:0, links:[]`). Example:
+
+    ```
+    tc_link action:links
+      a:"TIID^Device 2 (EtherCAT)^R01.Main.N01 (EK1200)^R01.Main.N09 (EL2008)^Channel 1^Output"
+    # -> { path, count:1, links:[{ varA:"...^Channel 1^Output",
+    #        varB:"TIPC^Cabsort Lite^Cabsort Lite Instance^PlcTask Outputs^GvSys.R01.N09.Ch1" }] }
     ```
 - `tc_system` — get_netid / set_netid / errors / rescan_plc / scan_io_boxes
 - `nc` — tasks / axes / axis
