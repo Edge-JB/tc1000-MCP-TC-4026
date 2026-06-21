@@ -89,10 +89,22 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
         { parent:"TIID^Device 2 (EtherCAT)", name:"Box 8", subType:9099 }
       ]
     ```
-  - **Batch delete:** `tc_tree action:delete_batch deletes:[{parent,name},...]` tears down many child nodes in a single process / DTE attach (one attach). Each entry needs `parent` (the `^`-path of the parent) and `name`. Because each entry addresses its child by **name** under a freshly-looked-up parent, deletes are order-independent; they run sequentially in the given order and one failure never aborts the rest. An entry missing/blank `parent`/`name` is recorded as `{ parent, name, ok:false, error:'entry needs parent, name' }` and skipped. Returns a compact roll-up `{ count, succeeded, failed, results }` where each entry is `{ parent, name, ok }` (plus `error` on failure). Example:
+  - **Batch delete (guarded):** `tc_tree action:delete_batch deletes:[{parent,name},...]` tears down many child nodes in a single process / DTE attach (one attach). Each entry needs `parent` (the `^`-path of the parent) and `name`. Because each entry addresses its child by **name** under a freshly-looked-up parent, deletes are order-independent; they run sequentially in the given order and one failure never aborts the rest. An entry missing/blank `parent`/`name` is recorded as `{ parent, name, ok:false, error:'entry needs parent, name' }` and skipped. Returns a compact roll-up `{ count, succeeded, failed, results }` where each entry is `{ parent, name, ok }` (plus `error` on failure).
+
+    Because it's the only destructive batch op, `delete_batch` is **guarded** — a bare call is blocked. You must pass exactly one of:
+    - `dryRun:true` — **previews** without deleting anything. For each entry it resolves the parent and reports whether the named child currently exists, returning `{ mode:"dryRun", count, present, missing, results:[{ parent, name, exists }] }`. Nothing is ever deleted in this mode.
+    - `confirm:"ALLOW_TWINCAT_DELETE"` — actually performs the deletes (the normal roll-up above).
 
     ```
-    tc_tree action:delete_batch
+    # preview first
+    tc_tree action:delete_batch dryRun:true
+      deletes:[
+        { parent:"TIID^Device 2 (EtherCAT)", name:"Box 7" },
+        { parent:"TIID^Device 2 (EtherCAT)", name:"Box 8" }
+      ]
+
+    # then commit
+    tc_tree action:delete_batch confirm:"ALLOW_TWINCAT_DELETE"
       deletes:[
         { parent:"TIID^Device 2 (EtherCAT)", name:"Box 7" },
         { parent:"TIID^Device 2 (EtherCAT)", name:"Box 8" }
@@ -114,8 +126,9 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
       ]
     ```
   - `children` returns the standard child tree items (each tagged `kind:"child"`) **and** any addressable coupler sub-modules that live in the box's `ProduceXml()` `<Slot><Module>` collection (CPX-AP / Festo AP modules — IO-Link masters, valve terminals, DI/DO blocks) but are not in the standard `ChildCount`/`Child()` collection. Those are tagged `kind:"module"` and are resolvable by their full `^`-path. `childCount` equals the total number of entries returned (standard children + modules). The module scan is fully defensive — a malformed box or unresolvable module never breaks a normal `children` call.
+  - **Save once after a batch (`save:true`):** the mutating `*_batch` verbs — `set_xml_batch`, `rename_batch`, `create_batch`, `delete_batch` (real-delete path only; ignored under `dryRun`) — accept an optional `save:true` that saves the solution **once after the batch completes**, so you don't need a separate `xae save_all` round-trip. When `save:true` is requested the roll-up gains a `saved` boolean (`true` on success, `false` if the save threw — a save failure never fails the batch, which has already run). The field is omitted entirely when `save` wasn't requested.
 - `tc_link` — link / unlink / resolve / link_batch / unlink_batch / links
-  - **Batch link/unlink:** `tc_link action:link_batch links:[{a,b},...]` links many variable pairs (and `action:unlink_batch links:[{a,b?},...]` unlinks them — `b` optional, `a` alone removes all of `a`'s links) in a single process / DTE attach. Pairs run **sequentially in the given order** and one failure never aborts the rest. Returns a verbose per-entry roll-up `{ count, succeeded, failed, results }`; each `link_batch` `results[]` entry is `{ a, b, resolvedA, resolvedB, ok }` (the resolved `^`-path forms each side was actually linked through), or `{ a, b, ok:false, error }` on failure. Example:
+  - **Batch link/unlink:** `tc_link action:link_batch links:[{a,b},...]` links many variable pairs (and `action:unlink_batch links:[{a,b?},...]` unlinks them — `b` optional, `a` alone removes all of `a`'s links) in a single process / DTE attach. Pairs run **sequentially in the given order** and one failure never aborts the rest. Returns a verbose per-entry roll-up `{ count, succeeded, failed, results }`; each `link_batch` `results[]` entry is `{ a, b, resolvedA, resolvedB, ok }` (the resolved `^`-path forms each side was actually linked through), or `{ a, b, ok:false, error }` on failure. Both `link_batch` and `unlink_batch` accept an optional `save:true` to save the solution **once after the batch** (adds a `saved` boolean to the roll-up; a save failure never fails the batch). Example:
 
     ```
     tc_link action:link_batch

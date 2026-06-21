@@ -600,6 +600,13 @@ function Get-SolutionInfo($Dte) {
     }
 }
 
+# Save the whole solution once (same mechanism as the xae_save_all action).
+# Used by the opt-in save:true on mutating batch ops so the caller doesn't have
+# to make a separate xae save_all round-trip after a bulk mutation.
+function Save-Solution($Dte) {
+    $Dte.ExecuteCommand('File.SaveAll')
+}
+
 function Wait-ForSolutionOpen($Dte, [string]$ExpectedPath) {
     return Invoke-WithRetry -Attempts 60 -DelayMs 500 -ScriptBlock {
         $info = Get-SolutionInfo -Dte $Dte
@@ -2111,6 +2118,10 @@ try {
             if ($null -eq $renames -or @($renames).Count -eq 0) {
                 throw 'renames is required'
             }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
 
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
@@ -2172,15 +2183,22 @@ try {
                 }
             }
 
+            $data = @{
+                parent = $basePath
+                count = @($renames).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
             Write-JsonResult @{
                 ok = $true
-                data = @{
-                    parent = $basePath
-                    count = @($renames).Count
-                    succeeded = $succeeded
-                    failed = $failed
-                    results = $results
-                }
+                data = $data
             }
             exit 0
         }
@@ -2194,6 +2212,10 @@ try {
             $returnXml = $false
             if ($payload.PSObject.Properties.Name -contains 'returnXml') {
                 $returnXml = [bool]$payload.returnXml
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
             }
 
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
@@ -2244,14 +2266,21 @@ try {
                 }
             }
 
+            $data = @{
+                count = @($items).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
             Write-JsonResult @{
                 ok = $true
-                data = @{
-                    count = @($items).Count
-                    succeeded = $succeeded
-                    failed = $failed
-                    results = $results
-                }
+                data = $data
             }
             exit 0
         }
@@ -2287,6 +2316,10 @@ try {
             $autoResolve = $true
             if ($payload.PSObject.Properties.Name -contains 'autoResolve') {
                 $autoResolve = [bool]$payload.autoResolve
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
             }
 
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
@@ -2338,14 +2371,21 @@ try {
                 }
             }
 
+            $data = @{
+                count = @($links).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
             Write-JsonResult @{
                 ok = $true
-                data = @{
-                    count = @($links).Count
-                    succeeded = $succeeded
-                    failed = $failed
-                    results = $results
-                }
+                data = $data
             }
             exit 0
         }
@@ -2381,6 +2421,10 @@ try {
             $links = $payload.links
             if ($null -eq $links -or @($links).Count -eq 0) {
                 throw 'links is required'
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
             }
 
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
@@ -2434,14 +2478,21 @@ try {
                 }
             }
 
+            $data = @{
+                count = @($links).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
             Write-JsonResult @{
                 ok = $true
-                data = @{
-                    count = @($links).Count
-                    succeeded = $succeeded
-                    failed = $failed
-                    results = $results
-                }
+                data = $data
             }
             exit 0
         }
@@ -2542,6 +2593,10 @@ try {
             if ($null -eq $creates -or @($creates).Count -eq 0) {
                 throw 'creates is required'
             }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
 
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
@@ -2597,14 +2652,21 @@ try {
                 }
             }
 
+            $data = @{
+                count = @($creates).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
             Write-JsonResult @{
                 ok = $true
-                data = @{
-                    count = @($creates).Count
-                    succeeded = $succeeded
-                    failed = $failed
-                    results = $results
-                }
+                data = $data
             }
             exit 0
         }
@@ -2614,9 +2676,69 @@ try {
             if ($null -eq $deletes -or @($deletes).Count -eq 0) {
                 throw 'deletes is required'
             }
+            $dryRun = $false
+            if ($payload.PSObject.Properties.Name -contains 'dryRun') {
+                $dryRun = [bool]$payload.dryRun
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
 
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
+
+            if ($dryRun) {
+                # Preview only — never deletes anything. For each entry, resolve the
+                # parent and report whether the named child currently exists.
+                $results = @()
+                $present = 0
+                $missing = 0
+                foreach ($entry in $deletes) {
+                    $entryParent = $null
+                    if ($entry.PSObject.Properties.Name -contains 'parent') {
+                        $entryParent = [string]$entry.parent
+                    }
+                    $entryName = $null
+                    if ($entry.PSObject.Properties.Name -contains 'name') {
+                        $entryName = [string]$entry.name
+                    }
+
+                    $exists = $false
+                    if (-not [string]::IsNullOrWhiteSpace($entryParent) -and -not [string]::IsNullOrWhiteSpace($entryName)) {
+                        try {
+                            $parent = (Get-TreeItem -SysManager $sysManager -TreePath $entryParent).Value
+                            try {
+                                [void](Get-ChildTreeItemByName -ParentItem $parent -ChildName $entryName)
+                                $exists = $true
+                            } catch {
+                                $exists = $false
+                            }
+                        } catch {
+                            $exists = $false
+                        }
+                    }
+
+                    if ($exists) { $present++ } else { $missing++ }
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        exists = $exists
+                    }
+                }
+
+                Write-JsonResult @{
+                    ok = $true
+                    data = @{
+                        mode = 'dryRun'
+                        count = @($deletes).Count
+                        present = $present
+                        missing = $missing
+                        results = $results
+                    }
+                }
+                exit 0
+            }
 
             $results = @()
             $succeeded = 0
@@ -2663,14 +2785,21 @@ try {
                 }
             }
 
+            $data = @{
+                count = @($deletes).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
             Write-JsonResult @{
                 ok = $true
-                data = @{
-                    count = @($deletes).Count
-                    succeeded = $succeeded
-                    failed = $failed
-                    results = $results
-                }
+                data = $data
             }
             exit 0
         }
@@ -2822,7 +2951,7 @@ try {
 
         'xae_save_all' {
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
-            $dte.ExecuteCommand('File.SaveAll')
+            Save-Solution -Dte $dte
 
             Write-JsonResult @{
                 ok = $true

@@ -5,6 +5,30 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-20 — `delete_batch` guarded (dryRun/confirm) + opt-in `save:true` on mutating batch ops — branch `improve/batch-ops`
+
+Two safety/convenience improvements to the batch surface:
+
+- **`delete_batch` guard.** It was the only destructive op with no confirm gate (every
+  other — activate, restart, xae_command, plc logout — already required a token). A bare
+  `delete_batch` now throws and must be re-run with either `dryRun:true` (preview only —
+  resolves each parent and reports whether the named child exists, returning
+  `{ mode:"dryRun", count, present, missing, results:[{ parent, name, exists }] }`, never
+  deleting) or `confirm:"ALLOW_TWINCAT_DELETE"` (performs the deletes). The single `delete`
+  action is left unguarded (scope was the batch). Bridge verb `twincat_delete_children`
+  honors `dryRun` (no-op preview path) ahead of the existing real-delete path.
+
+- **Opt-in `save:true` on mutating batch ops.** After a bulk mutation the caller previously
+  had to make a separate `xae save_all` round-trip. The mutating batch verbs —
+  `rename_batch`, `set_xml_batch`, `create_batch`, `delete_batch` (real path), `link_batch`,
+  `unlink_batch` — now take an optional `save:true` that saves the solution **once after the
+  batch** via a small `Save-Solution($Dte)` helper (factored from the existing `xae_save_all`
+  mechanism — `$dte.ExecuteCommand('File.SaveAll')` — so there's one save path, not a new one).
+  The roll-up gains `saved:true|false` only when save was requested; a save failure is caught
+  and reported as `saved:false` without failing the already-completed batch.
+
+---
+
 ## 2026-06-20 — Link read-back (`tc_link links`) added to close the verify loop for bulk linking — branch `improve/batch-ops`
 
 `tc_link` could link/unlink/resolve but had no way to ask "what is X currently linked

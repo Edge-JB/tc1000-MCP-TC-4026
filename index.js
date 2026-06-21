@@ -21,6 +21,7 @@ const ACTIVATE_CONFIRMATION = "ALLOW_TWINCAT_ACTIVATE";
 const RESTART_CONFIRMATION = "ALLOW_TWINCAT_RESTART";
 const XAE_COMMAND_CONFIRMATION = "ALLOW_XAE_COMMAND_EXEC";
 const PLC_LOGOUT_CONFIRMATION = "ALLOW_PLC_LOGOUT";
+const DELETE_CONFIRMATION = "ALLOW_TWINCAT_DELETE";
 
 // --- Modal-dialog watchdog -------------------------------------------------
 // A bridge COM call into XAE blocks until any modal dialog it raises is
@@ -371,7 +372,7 @@ server.registerTool(
 server.registerTool(
   "tc_tree",
   {
-    description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml raw XML; summary:true for a compact identity + slot-module list instead of the full blob); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); DELETE — delete / delete_batch (deletes:[{parent,name}]). No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
+    description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml raw XML; summary:true for a compact identity + slot-module list instead of the full blob); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); DELETE — delete / delete_batch (deletes:[{parent,name}], GUARDED: pass dryRun:true to preview which children exist without deleting, or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete). Mutating *_batch verbs (set_xml_batch, rename_batch, create_batch, delete_batch) accept optional save:true to save the solution once after the batch. No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
     inputSchema: {
       action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "create_batch", "delete", "delete_batch", "import", "export", "focus"]),
       path: z.string(),
@@ -390,6 +391,9 @@ server.registerTool(
       file: z.string().optional(),
       reconnect: z.boolean().default(true),
       newName: z.string().optional(),
+      confirm: z.string().optional(),
+      dryRun: z.boolean().optional(),
+      save: z.boolean().optional(),
     },
   },
   async (p) => {
@@ -410,25 +414,28 @@ server.registerTool(
         return textResult(await bridgeCall("twincat_set_tree_item_xml", { ...t, xml: p.xml, returnXml: p.returnXml === true }));
       case "set_xml_batch":
         need(p, ["items"], p.action);
-        return textResult(await bridgeCall("twincat_set_tree_item_xml_batch", { items: p.items, returnXml: p.returnXml === true }));
+        return textResult(await bridgeCall("twincat_set_tree_item_xml_batch", { items: p.items, returnXml: p.returnXml === true, save: p.save === true }));
       case "rename":
         need(p, ["newName"], p.action);
         return textResult(await bridgeCall("twincat_rename_tree_item", { treePath: p.path, newName: p.newName }));
       case "rename_batch":
         need(p, ["renames"], p.action);
-        return textResult(await bridgeCall("twincat_rename_tree_items", { basePath: p.path, renames: p.renames }));
+        return textResult(await bridgeCall("twincat_rename_tree_items", { basePath: p.path, renames: p.renames, save: p.save === true }));
       case "create":
         need(p, ["name", "subType"], p.action);
         return textResult(await bridgeCall("twincat_create_child", { parentPath: p.path, childName: p.name, subType: p.subType, beforeChildName: p.before, createInfo: p.createInfo }));
       case "create_batch":
         need(p, ["creates"], p.action);
-        return textResult(await bridgeCall("twincat_create_children", { creates: p.creates }));
+        return textResult(await bridgeCall("twincat_create_children", { creates: p.creates, save: p.save === true }));
       case "delete":
         need(p, ["name"], p.action);
         return textResult(await bridgeCall("twincat_delete_child", { parentPath: p.path, childName: p.name }));
       case "delete_batch":
         need(p, ["deletes"], p.action);
-        return textResult(await bridgeCall("twincat_delete_children", { deletes: p.deletes }));
+        if (p.dryRun !== true && p.confirm !== DELETE_CONFIRMATION) {
+          throw new Error('Blocked. delete_batch removes ' + p.deletes.length + ' nodes. Re-run with dryRun:true to preview what would be deleted, or confirm="' + DELETE_CONFIRMATION + '" to actually delete.');
+        }
+        return textResult(await bridgeCall("twincat_delete_children", { deletes: p.deletes, dryRun: p.dryRun === true, save: p.save === true }));
       case "import":
         need(p, ["file"], p.action);
         return textResult(await bridgeCall("twincat_import_child", { parentPath: p.path, filePath: p.file, beforeChildName: p.before, reconnect: p.reconnect, importAsName: p.newName }));
@@ -443,16 +450,17 @@ server.registerTool(
 server.registerTool(
   "tc_link",
   {
-    description: "Variable links (producer↔consumer); dot-form PLC subfields auto-resolve to XAE ^ subitem form. BATCH-FIRST: for more than one link use link_batch/unlink_batch — N ops in ONE DTE attach with a verbose per-entry roll-up (incl. resolved paths), instead of an attach per link. Actions, grouped single / batch: LINK — link (a=source, b=destination) / link_batch (links:[{a,b}]); UNLINK — unlink (a, optional b; a alone removes all its links) / unlink_batch (links:[{a,b?}]); resolve (report valid path forms for a); links (a=item path; reports that item's current variable links — closes the discover→act→verify loop).",
+    description: "Variable links (producer↔consumer); dot-form PLC subfields auto-resolve to XAE ^ subitem form. BATCH-FIRST: for more than one link use link_batch/unlink_batch — N ops in ONE DTE attach with a verbose per-entry roll-up (incl. resolved paths), instead of an attach per link. Actions, grouped single / batch: LINK — link (a=source, b=destination) / link_batch (links:[{a,b}]); UNLINK — unlink (a, optional b; a alone removes all its links) / unlink_batch (links:[{a,b?}]); resolve (report valid path forms for a); links (a=item path; reports that item's current variable links — closes the discover→act→verify loop). The mutating batch verbs (link_batch, unlink_batch) accept optional save:true to save the solution once after the batch.",
     inputSchema: {
       action: z.enum(["link", "unlink", "resolve", "link_batch", "unlink_batch", "links"]),
       a: z.string(),
       b: z.string().optional(),
       autoResolve: z.boolean().default(true),
       links: z.array(z.object({ a: z.string(), b: z.string().optional() })).optional(),
+      save: z.boolean().optional(),
     },
   },
-  async ({ action, a, b, autoResolve, links }) => {
+  async ({ action, a, b, autoResolve, links, save }) => {
     if (action === "link") {
       need({ b }, ["b"], action);
       return textResult(await bridgeCall("twincat_link_variables", { producer: a, consumer: b, autoResolve }));
@@ -460,11 +468,11 @@ server.registerTool(
     if (action === "unlink") return textResult(await bridgeCall("twincat_unlink_variables", { variableA: a, variableB: b }));
     if (action === "link_batch") {
       need({ links }, ["links"], action);
-      return textResult(await bridgeCall("twincat_link_variables_batch", { links, autoResolve }));
+      return textResult(await bridgeCall("twincat_link_variables_batch", { links, autoResolve, save: save === true }));
     }
     if (action === "unlink_batch") {
       need({ links }, ["links"], action);
-      return textResult(await bridgeCall("twincat_unlink_variables_batch", { links }));
+      return textResult(await bridgeCall("twincat_unlink_variables_batch", { links, save: save === true }));
     }
     if (action === "links") {
       need({ a }, ["a"], action);
