@@ -41,7 +41,7 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
 - `xae` — status / open_solution / save_all / active_document / selected_items / error_list / clear_error_list / list_commands
 - `xae_build` — clean / build / rebuild
 - `xae_command` — raw DTE command (guarded)
-- `tc_tree` — get / children / exists / exists_batch / get_batch / get_xml / set_xml / set_xml_batch / rename / rename_batch / create / delete / import / export / focus
+- `tc_tree` — get / children / exists / exists_batch / get_batch / get_xml / set_xml / set_xml_batch / rename / rename_batch / create / create_batch / delete / delete_batch / import / export / focus
   - `set_xml` returns a compact `{ treePath }` by default; pass `returnXml:true` to also echo the produced XML (with the embedded `TreeImageData16x14` bitmap stripped).
   - **Renaming tree items:** `tc_tree action:rename path:<treePath> newName:<name>` renames an existing item (e.g. an EtherCAT box/terminal) and keeps IO links intact, returning a compact `{ treePath, newName, newPath }`. Do **not** use `set_xml`/`newName` probing for this.
   - **Batch rename:** `tc_tree action:rename_batch path:<basePath> renames:[{name,newName},...]` renames many items under one parent in a single process / DTE attach. Each entry uses `name` (joined to `path` as `"<basePath>^<name>"`) or an explicit `path` (used as-is), plus `newName`. Renames run **sequentially in the given order** and one failure never aborts the rest. Returns a compact roll-up `{ parent, count, succeeded, failed, results }` where each `results[]` entry is `{ name, newName, ok }` (plus `error` on failure) — no per-item XML or path. Example:
@@ -63,6 +63,24 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
           xml:"<TreeItem>...</TreeItem>" },
         { path:"TIID^Device 2 (EtherCAT)^Box 1^Term 6^Channel 1^PAI Settings",
           xml:"<TreeItem>...</TreeItem>" }
+      ]
+    ```
+  - **Batch create:** `tc_tree action:create_batch creates:[{parent,name,subType,before?,createInfo?},...]` scaffolds many child nodes in a single process / DTE attach (one attach). Each entry needs `parent` (the `^`-path of the parent), `name`, and a numeric `subType` (plus optional `before` sibling name and `createInfo`). Children are created **sequentially in the given order** and one failure never aborts the rest. An entry missing/blank `parent`/`name`/`subType` is recorded as `{ parent, name, ok:false, error:'entry needs parent, name, subType' }` and skipped. Returns a compact roll-up `{ count, succeeded, failed, results }` where each successful entry is `{ parent, ok:true, child }` (`child` = the `Convert-TreeItem` shape) and a failure is `{ parent, name, ok:false, error }`. Example:
+
+    ```
+    tc_tree action:create_batch
+      creates:[
+        { parent:"TIID^Device 2 (EtherCAT)", name:"Box 7", subType:9099 },
+        { parent:"TIID^Device 2 (EtherCAT)", name:"Box 8", subType:9099 }
+      ]
+    ```
+  - **Batch delete:** `tc_tree action:delete_batch deletes:[{parent,name},...]` tears down many child nodes in a single process / DTE attach (one attach). Each entry needs `parent` (the `^`-path of the parent) and `name`. Because each entry addresses its child by **name** under a freshly-looked-up parent, deletes are order-independent; they run sequentially in the given order and one failure never aborts the rest. An entry missing/blank `parent`/`name` is recorded as `{ parent, name, ok:false, error:'entry needs parent, name' }` and skipped. Returns a compact roll-up `{ count, succeeded, failed, results }` where each entry is `{ parent, name, ok }` (plus `error` on failure). Example:
+
+    ```
+    tc_tree action:delete_batch
+      deletes:[
+        { parent:"TIID^Device 2 (EtherCAT)", name:"Box 7" },
+        { parent:"TIID^Device 2 (EtherCAT)", name:"Box 8" }
       ]
     ```
   - **Batch read/verify:** `tc_tree action:exists_batch paths:[...]` checks existence for many `^`-paths, and `action:get_batch paths:[...]` looks up their identity (name / pathName / itemType / childCount), each in a **single** process / DTE attach — ideal for verifying many paths after a bulk rename / link / create. Paths run **sequentially in the given order** and a bad path never aborts the rest. `exists_batch` returns `{ count, found, missing, results }` where each entry is `{ path, exists }` (plus `error` if the check threw); `get_batch` returns `{ count, succeeded, failed, results }` where each found entry is the `Convert-TreeItem` shape (`name`, `pathName`, `itemType`, `subType`, `childCount`) plus `path` + `ok:true`, and a miss is `{ path, ok:false, error }`. Examples:

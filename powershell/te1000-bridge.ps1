@@ -2249,6 +2249,144 @@ try {
             exit 0
         }
 
+        'twincat_create_children' {
+            $creates = $payload.creates
+            if ($null -eq $creates -or @($creates).Count -eq 0) {
+                throw 'creates is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+
+            foreach ($entry in $creates) {
+                $entryParent = $null
+                if ($entry.PSObject.Properties.Name -contains 'parent') {
+                    $entryParent = [string]$entry.parent
+                }
+                $entryName = $null
+                if ($entry.PSObject.Properties.Name -contains 'name') {
+                    $entryName = [string]$entry.name
+                }
+                $entrySubType = $null
+                if ($entry.PSObject.Properties.Name -contains 'subType') {
+                    $entrySubType = $entry.subType
+                }
+                $entryBefore = if ($entry.PSObject.Properties.Name -contains 'before' -and $entry.before) { [string]$entry.before } else { '' }
+                $entryCreateInfo = if ($entry.PSObject.Properties.Name -contains 'createInfo' -and -not [string]::IsNullOrWhiteSpace([string]$entry.createInfo)) { [string]$entry.createInfo } else { $null }
+
+                if ([string]::IsNullOrWhiteSpace($entryParent) -or [string]::IsNullOrWhiteSpace($entryName) -or $null -eq $entrySubType) {
+                    $failed++
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        ok = $false
+                        error = 'entry needs parent, name, subType'
+                    }
+                    continue
+                }
+
+                try {
+                    $parent = (Get-TreeItem -SysManager $sysManager -TreePath $entryParent).Value
+                    $child = $parent.CreateChild($entryName, [int]$entrySubType, $entryBefore, $entryCreateInfo)
+                    $succeeded++
+                    $results += @{
+                        parent = $entryParent
+                        ok = $true
+                        child = Convert-TreeItem -TreeItem $child
+                    }
+                } catch {
+                    $failed++
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        ok = $false
+                        error = [string]$_.Exception.Message
+                    }
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($creates).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'twincat_delete_children' {
+            $deletes = $payload.deletes
+            if ($null -eq $deletes -or @($deletes).Count -eq 0) {
+                throw 'deletes is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+
+            foreach ($entry in $deletes) {
+                $entryParent = $null
+                if ($entry.PSObject.Properties.Name -contains 'parent') {
+                    $entryParent = [string]$entry.parent
+                }
+                $entryName = $null
+                if ($entry.PSObject.Properties.Name -contains 'name') {
+                    $entryName = [string]$entry.name
+                }
+
+                if ([string]::IsNullOrWhiteSpace($entryParent) -or [string]::IsNullOrWhiteSpace($entryName)) {
+                    $failed++
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        ok = $false
+                        error = 'entry needs parent, name'
+                    }
+                    continue
+                }
+
+                try {
+                    $parent = (Get-TreeItem -SysManager $sysManager -TreePath $entryParent).Value
+                    $parent.DeleteChild($entryName)
+                    $succeeded++
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        ok = $true
+                    }
+                } catch {
+                    $failed++
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        ok = $false
+                        error = [string]$_.Exception.Message
+                    }
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($deletes).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
         'twincat_import_child' {
             $parentPath = [string]$payload.parentPath
             $filePath = [string]$payload.filePath

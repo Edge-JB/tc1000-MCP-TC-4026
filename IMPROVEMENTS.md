@@ -5,6 +5,29 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-20 — Added `tc_tree action:create_batch` / `delete_batch` (scaffold / teardown N child nodes in one attach) — branch `improve/batch-ops`
+
+Building out (or tearing down) a set of tree children — e.g. several EtherCAT boxes
+or CPX modules — done one at a time is N `tc_tree action:create` / `action:delete`
+calls, each spawning its own PowerShell process and `Get-Dte` / `Get-SysManager`
+DTE attach.
+
+`create_batch` (`creates:[{parent,name,subType,before?,createInfo?}]`) and
+`delete_batch` (`deletes:[{parent,name}]`) collapse that to **one** tool-call /
+process / DTE attach: attach once, then process each entry sequentially in array
+order with continue-on-error (one failure never aborts the rest). Each entry mirrors
+the single `twincat_create_child` / `twincat_delete_child` semantics — `create_batch`
+looks up the parent via `Get-TreeItem`, calls `parent.CreateChild(name, subType,
+before, createInfo)` and returns the shared `Convert-TreeItem` shape; `delete_batch`
+calls `parent.DeleteChild(name)`. Because every entry addresses items by **name**
+under a freshly-looked-up parent, delete is order-independent even though deleting a
+child shifts sibling indices — no index bookkeeping needed. Both return the same
+compact `{ count, succeeded, failed, results }` roll-up used by the other batch
+verbs (`succeeded`/`failed` counters; `ok` reserved for the envelope + per-entry
+status).
+
+---
+
 ## 2026-06-20 — Added `tc_tree action:exists_batch` / `get_batch` (one attach for N read/verify checks) — branch `improve/batch-ops`
 
 After a bulk rename / link / create it's common to want to confirm that a whole set

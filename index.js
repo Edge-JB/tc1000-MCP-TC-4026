@@ -371,9 +371,9 @@ server.registerTool(
 server.registerTool(
   "tc_tree",
   {
-    description: "TwinCAT tree items (paths use ^ separators, e.g. TIPC^MyPlc, TIID^Device 1 (EtherCAT)). Actions: get, children, exists, exists_batch (paths:[...]; one attach, compact roll-up of existence), get_batch (paths:[...]; one attach, compact roll-up of identity), get_xml (ProduceXml, returns raw XML), set_xml (ConsumeXml, modifies parameters; compact result by default, returnXml:true to echo produced XML), rename (newName; compact result, keeps IO links intact), rename_batch (renames:[{name|path,newName}]; sequential, one attach, compact roll-up), set_xml_batch (items:[{path,xml}]; sequential, one attach, compact roll-up), create (name+subType under path), delete (name under path), import (.xti file under path), export (name under path to file), focus (best-effort Solution Explorer focus).",
+    description: "TwinCAT tree items (paths use ^ separators, e.g. TIPC^MyPlc, TIID^Device 1 (EtherCAT)). Actions: get, children, exists, exists_batch (paths:[...]; one attach, compact roll-up of existence), get_batch (paths:[...]; one attach, compact roll-up of identity), get_xml (ProduceXml, returns raw XML), set_xml (ConsumeXml, modifies parameters; compact result by default, returnXml:true to echo produced XML), rename (newName; compact result, keeps IO links intact), rename_batch (renames:[{name|path,newName}]; sequential, one attach, compact roll-up), set_xml_batch (items:[{path,xml}]; sequential, one attach, compact roll-up), create (name+subType under path), create_batch (creates:[{parent,name,subType,before?,createInfo?}]; sequential, one attach, compact roll-up), delete (name under path), delete_batch (deletes:[{parent,name}]; sequential, one attach, compact roll-up), import (.xti file under path), export (name under path to file), focus (best-effort Solution Explorer focus).",
     inputSchema: {
-      action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "delete", "import", "export", "focus"]),
+      action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "create_batch", "delete", "delete_batch", "import", "export", "focus"]),
       path: z.string(),
       paths: z.array(z.string()).optional(),
       xml: z.string().optional(),
@@ -381,6 +381,8 @@ server.registerTool(
       name: z.string().optional(),
       renames: z.array(z.object({ name: z.string().optional(), path: z.string().optional(), newName: z.string() })).optional(),
       items: z.array(z.object({ path: z.string(), xml: z.string() })).optional(),
+      creates: z.array(z.object({ parent: z.string(), name: z.string(), subType: z.number().int(), before: z.string().optional(), createInfo: z.string().optional() })).optional(),
+      deletes: z.array(z.object({ parent: z.string(), name: z.string() })).optional(),
       subType: z.number().int().optional(),
       before: z.string().optional().describe("insert before this sibling"),
       createInfo: z.string().optional(),
@@ -417,9 +419,15 @@ server.registerTool(
       case "create":
         need(p, ["name", "subType"], p.action);
         return textResult(await bridgeCall("twincat_create_child", { parentPath: p.path, childName: p.name, subType: p.subType, beforeChildName: p.before, createInfo: p.createInfo }));
+      case "create_batch":
+        need(p, ["creates"], p.action);
+        return textResult(await bridgeCall("twincat_create_children", { creates: p.creates }));
       case "delete":
         need(p, ["name"], p.action);
         return textResult(await bridgeCall("twincat_delete_child", { parentPath: p.path, childName: p.name }));
+      case "delete_batch":
+        need(p, ["deletes"], p.action);
+        return textResult(await bridgeCall("twincat_delete_children", { deletes: p.deletes }));
       case "import":
         need(p, ["file"], p.action);
         return textResult(await bridgeCall("twincat_import_child", { parentPath: p.path, filePath: p.file, beforeChildName: p.before, reconnect: p.reconnect, importAsName: p.newName }));
