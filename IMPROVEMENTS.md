@@ -5,6 +5,23 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-20 — Added `tc_tree action:rename_batch` (one attach for N renames) — branch `improve/rename-batch`
+
+Renaming a group of items (e.g. every CPX-AP sub-module under a coupler) previously
+meant one `tc_tree action:rename` call per item — and each call spawns its own
+PowerShell process and does its own `Get-Dte` / `Get-SysManager` DTE attach. For a
+rack of modules that is N tool-calls × N process-spawns × N attaches, which is slow.
+
+`rename_batch` collapses that to **one** tool-call / process / DTE attach: it takes a
+parent `path` and a `renames:[{name|path,newName}]` array, attaches once, and renames
+each item sequentially in order (reusing the proven ConsumeXml `<ItemName>` mechanism —
+links stay intact). One failure never aborts the rest; it returns a compact roll-up
+`{ parent, count, succeeded, failed, results }`. The single `twincat_rename_tree_item`
+and the new `twincat_rename_tree_items` bridge verbs now share one `Rename-TreeItem`
+helper so there is a single rename implementation.
+
+---
+
 ## 2026-06-20 — `children` does not enumerate CPX-AP (Festo) sub-modules — they're undiscoverable by tree-walking
 
 ### What I was doing

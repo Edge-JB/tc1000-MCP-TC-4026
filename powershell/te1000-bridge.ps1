@@ -1046,6 +1046,33 @@ function Get-TreeItem($SysManager, [string]$TreePath) {
     return
 }
 
+function Rename-TreeItem($SysManager, [string]$TargetPath, [string]$NewName) {
+    if ([string]::IsNullOrWhiteSpace($NewName)) {
+        throw 'newName is required'
+    }
+    $item = (Get-TreeItem -SysManager $SysManager -TreePath $TargetPath).Value
+
+    $escapedName = $NewName.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    $xml = "<TreeItem><ItemName>$escapedName</ItemName></TreeItem>"
+
+    try {
+        $item.ConsumeXml($xml)
+    } catch {
+        $xmlError = $null
+        try {
+            $xmlError = $item.GetLastXmlError()
+        } catch {
+        }
+
+        if ($xmlError) {
+            throw "ConsumeXml failed: $xmlError"
+        }
+        throw
+    }
+
+    return (Normalize-ScalarValue (Get-SafeValue { [string]$item.PathName }))
+}
+
 function Convert-TreeItem {
     param(
         [Parameter(Mandatory = $true)]
@@ -1680,32 +1707,95 @@ try {
 
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
-            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
 
-            $escapedName = $newName.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
-            $xml = "<TreeItem><ItemName>$escapedName</ItemName></TreeItem>"
-
-            try {
-                $item.ConsumeXml($xml)
-            } catch {
-                $xmlError = $null
-                try {
-                    $xmlError = $item.GetLastXmlError()
-                } catch {
-                }
-
-                if ($xmlError) {
-                    throw "ConsumeXml failed: $xmlError"
-                }
-                throw
-            }
+            $newPath = Rename-TreeItem -SysManager $sysManager -TargetPath $treePath -NewName $newName
 
             Write-JsonResult @{
                 ok = $true
                 data = @{
                     treePath = $treePath
                     newName = $newName
-                    newPath = Normalize-ScalarValue (Get-SafeValue { [string]$item.PathName })
+                    newPath = $newPath
+                }
+            }
+            exit 0
+        }
+
+        'twincat_rename_tree_items' {
+            $basePath = [string]$payload.basePath
+            $renames = $payload.renames
+            if ($null -eq $renames -or @($renames).Count -eq 0) {
+                throw 'renames is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+
+            foreach ($entry in $renames) {
+                $entryName = $null
+                if ($entry.PSObject.Properties.Name -contains 'name') {
+                    $entryName = [string]$entry.name
+                }
+                $entryPath = $null
+                if ($entry.PSObject.Properties.Name -contains 'path') {
+                    $entryPath = [string]$entry.path
+                }
+                $entryNewName = $null
+                if ($entry.PSObject.Properties.Name -contains 'newName') {
+                    $entryNewName = [string]$entry.newName
+                }
+
+                if ([string]::IsNullOrWhiteSpace($entryName)) { $entryName = $null }
+
+                $targetPath = $null
+                if (-not [string]::IsNullOrWhiteSpace($entryPath)) {
+                    $targetPath = $entryPath
+                } elseif ($null -ne $entryName) {
+                    $targetPath = "$basePath^" + $entryName
+                }
+
+                if ($null -eq $targetPath) {
+                    $failed++
+                    $results += @{
+                        name = $entryName
+                        newName = $entryNewName
+                        ok = $false
+                        error = 'entry needs name or path'
+                    }
+                    continue
+                }
+
+                try {
+                    [void](Rename-TreeItem -SysManager $sysManager -TargetPath $targetPath -NewName $entryNewName)
+                    $succeeded++
+                    $results += @{
+                        name = $entryName
+                        newName = $entryNewName
+                        ok = $true
+                    }
+                } catch {
+                    $failed++
+                    $results += @{
+                        name = $entryName
+                        newName = $entryNewName
+                        ok = $false
+                        error = [string]$_.Exception.Message
+                    }
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parent = $basePath
+                    count = @($renames).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
                 }
             }
             exit 0
