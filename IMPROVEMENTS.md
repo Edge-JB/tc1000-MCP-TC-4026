@@ -5,6 +5,52 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-21 — `tc_tree` create ghost guard (validate the created child, fail loudly) — branch `improve/test-fixes`
+
+**Bug (found in live testing).** `tc_tree action:create` on the EtherCAT device with
+`subType:9099` returned **SUCCESS** but actually inserted a malformed, **blank-named "ghost"
+child under the wrong parent** (under the EK1200 coupler, not the requested device), ignoring the
+requested name. Root cause: `ITcSmTreeItem.CreateChild(name, subType, before, createInfo)` can
+silently produce an unaddressable child when the `subType`/`createInfo` is not valid for the
+parent (an EtherCAT box needs an ESI-based `createInfo`, not a bare `subType:9099`). The bridge
+verb `twincat_create_child` (and the batch `twincat_create_children`) returned
+`Convert-TreeItem $child` **without validating** the result, so the caller was told it succeeded
+while a blank-named node was left in the tree.
+
+**Fix (post-create validation + loud failure + best-effort cleanup).** Added a shared
+`Assert-WellFormedChild` helper (factored alongside `Rename-TreeItem` / `Set-TreeItemXml`) that,
+right after `CreateChild`, reads the child's `Name` / `PathName` defensively via `Get-SafeValue`
+and treats the create as **failed** if: the child is null, the name is null/empty/whitespace, the
+returned name ≠ the requested name, or the child's path ≠ `"<parent>^<name>"` (it landed
+unexpectedly). On failure it attempts best-effort cleanup (`$parent.DeleteChild($actualName)`,
+skipped when the name is blank since a blank name can't be addressed safely) and then **throws** a
+descriptive error (actual vs. requested name, path, subType, parent, and the hint that EtherCAT
+boxes typically require a proper `createInfo`).
+
+- `twincat_create_child` calls the helper before returning — a ghost now fails the tool call.
+- `twincat_create_children` calls it per entry inside the existing `try`; a malformed create
+  becomes that entry's `{ parent, name, ok:false, error }` (best-effort cleanup applied) and the
+  loop continues — a ghost is **never** rolled up as `ok:true`. Roll-up shape unchanged.
+
+`index.js`: no schema change; updated the `tc_tree` description to note that create now validates
+the result and errors clearly on a malformed/ghost result, and that EtherCAT boxes typically need
+an ESI-based `createInfo` (bare `subType:9099` produces a ghost).
+
+**Step-1 read-only finding.** Inspecting existing terminals (`get_xml` on `R01.Main.N07
+(EL1008)`) shows a real box reports the generic `ItemSubType` **9099** with its true identity in
+an `<EtherCAT><Slave><Info>` descriptor (VendorId / ProductCode / RevisionNo + `EsiFile`). So
+`9099` alone is insufficient — the ESI descriptor must come through `createInfo`. The exact
+correct `createInfo` payload for adding a box **could not be determined from read-only inspection
+alone** and needs live confirmation (scaffold a box once in the GUI and capture the descriptor)
+before it can be documented as a reusable recipe — not guessed here.
+
+**Not yet live-verified.** Static checks only (`node --check`, PowerShell `ParseFile`). The MCP
+server could not be reconnected during this change and creating anything live would spawn more
+ghosts, so the validation/cleanup path is **implemented + reasoned but pending live verification**
+after server reconnect.
+
+---
+
 ## 2026-06-21 — Three test-driven fixes (download guard, optional `tc_tree` path, `open_solution` discard) — branch `improve/test-fixes`
 
 Found during live testing of the v2 tool surface; all three are small and mechanical.

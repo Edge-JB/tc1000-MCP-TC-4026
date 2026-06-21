@@ -1080,6 +1080,57 @@ function Rename-TreeItem($SysManager, [string]$TargetPath, [string]$NewName) {
     return (Normalize-ScalarValue (Get-SafeValue { [string]$item.PathName }))
 }
 
+function Assert-WellFormedChild {
+    # Validates a child returned by ITcSmTreeItem.CreateChild(...) and, if it is
+    # malformed (a "ghost"), attempts best-effort cleanup and THROWS a descriptive
+    # error. A bad subType/createInfo can make CreateChild return SUCCESS while
+    # actually inserting a blank-named, unaddressable child under the wrong parent
+    # (observed: subType 9099 with no ESI createInfo on an EtherCAT device). Without
+    # this check the caller is told it succeeded.
+    #
+    # Returns nothing on success; the caller continues to use $Child.
+    param(
+        [Parameter(Mandatory = $true)] [object]$Parent,
+        [Parameter(Mandatory = $true)] [AllowNull()] [object]$Child,
+        [Parameter(Mandatory = $true)] [string]$RequestedName,
+        [Parameter(Mandatory = $true)] [int]$SubType,
+        [Parameter(Mandatory = $true)] [string]$ParentPath
+    )
+
+    # Read back identity defensively — a ghost can throw on property access.
+    $childActualName = Get-SafeValue { [string]$Child.Name }
+    $childPath = Get-SafeValue { [string]$Child.PathName }
+
+    $reason = $null
+    if ($null -eq $Child) {
+        $reason = 'CreateChild returned null'
+    } elseif ([string]::IsNullOrWhiteSpace([string]$childActualName)) {
+        $reason = 'returned child has a blank name'
+    } elseif (([string]$childActualName) -ne $RequestedName) {
+        $reason = "returned child name '$childActualName' does not match requested name '$RequestedName'"
+    } else {
+        # The child must live directly under the requested parent. A correct child's
+        # path is "<parentPath>^<name>"; anything else means it landed unexpectedly.
+        $expectedPath = "$ParentPath^$RequestedName"
+        if (-not [string]::IsNullOrWhiteSpace([string]$childPath) -and ([string]$childPath) -ne $expectedPath) {
+            $reason = "returned child path '$childPath' is not under requested parent (expected '$expectedPath')"
+        }
+    }
+
+    if ($null -eq $reason) {
+        return
+    }
+
+    # Best-effort cleanup: only delete by name when we actually have a non-blank
+    # name. If the name is blank we cannot safely address the stray child, so we
+    # do NOT guess — leave it for manual removal in the XAE GUI / close-without-save.
+    if (-not [string]::IsNullOrWhiteSpace([string]$childActualName)) {
+        try { $Parent.DeleteChild([string]$childActualName) } catch { }
+    }
+
+    throw "CreateChild produced a malformed child (name='$childActualName', path='$childPath') for requested name='$RequestedName', subType=$SubType under '$ParentPath' ($reason). This usually means the subType/createInfo is not valid for this parent (EtherCAT boxes typically require a proper createInfo). No usable child was created. If a stray blank-named child remains, remove it in the XAE GUI or via close-without-save."
+}
+
 function Set-TreeItemXml($SysManager, [string]$TargetPath, [string]$Xml) {
     $item = (Get-TreeItem -SysManager $SysManager -TreePath $TargetPath).Value
 
@@ -2560,6 +2611,10 @@ try {
             $parent = (Get-TreeItem -SysManager $sysManager -TreePath $parentPath).Value
             $child = $parent.CreateChild($childName, $subType, $beforeChildName, $createInfo)
 
+            # Validate the created child; on a malformed "ghost" this throws (with
+            # best-effort cleanup) instead of returning a false success.
+            Assert-WellFormedChild -Parent $parent -Child $child -RequestedName $childName -SubType $subType -ParentPath $parentPath
+
             Write-JsonResult @{
                 ok = $true
                 data = @{
@@ -2640,6 +2695,10 @@ try {
                 try {
                     $parent = (Get-TreeItem -SysManager $sysManager -TreePath $entryParent).Value
                     $child = $parent.CreateChild($entryName, [int]$entrySubType, $entryBefore, $entryCreateInfo)
+                    # Validate per entry; a malformed ghost throws (with best-effort
+                    # cleanup) and is recorded below as this entry's ok:false error,
+                    # while the loop continues — never reported as a success.
+                    Assert-WellFormedChild -Parent $parent -Child $child -RequestedName $entryName -SubType ([int]$entrySubType) -ParentPath $entryParent
                     $succeeded++
                     $results += @{
                         parent = $entryParent
