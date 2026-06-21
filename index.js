@@ -371,7 +371,7 @@ server.registerTool(
 server.registerTool(
   "tc_tree",
   {
-    description: "TwinCAT tree items (paths use ^ separators, e.g. TIPC^MyPlc, TIID^Device 1 (EtherCAT)). Actions: get, children, exists, exists_batch (paths:[...]; one attach, compact roll-up of existence), get_batch (paths:[...]; one attach, compact roll-up of identity), get_xml (ProduceXml, returns raw XML), set_xml (ConsumeXml, modifies parameters; compact result by default, returnXml:true to echo produced XML), rename (newName; compact result, keeps IO links intact), rename_batch (renames:[{name|path,newName}]; sequential, one attach, compact roll-up), set_xml_batch (items:[{path,xml}]; sequential, one attach, compact roll-up), create (name+subType under path), create_batch (creates:[{parent,name,subType,before?,createInfo?}]; sequential, one attach, compact roll-up), delete (name under path), delete_batch (deletes:[{parent,name}]; sequential, one attach, compact roll-up), import (.xti file under path), export (name under path to file), focus (best-effort Solution Explorer focus).",
+    description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml, raw); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); DELETE — delete / delete_batch (deletes:[{parent,name}]). No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
     inputSchema: {
       action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "create_batch", "delete", "delete_batch", "import", "export", "focus"]),
       path: z.string(),
@@ -442,7 +442,7 @@ server.registerTool(
 server.registerTool(
   "tc_link",
   {
-    description: "Variable links: link (a=source, b=destination), unlink (a, optional b; a alone removes all its links), resolve (report valid path forms for a), link_batch (links:[{a,b}]) and unlink_batch (links:[{a,b?}]) — sequential, one attach, verbose per-entry roll-up. Dot-form PLC subfields auto-resolve to XAE ^ subitem form.",
+    description: "Variable links (producer↔consumer); dot-form PLC subfields auto-resolve to XAE ^ subitem form. BATCH-FIRST: for more than one link use link_batch/unlink_batch — N ops in ONE DTE attach with a verbose per-entry roll-up (incl. resolved paths), instead of an attach per link. Actions, grouped single / batch: LINK — link (a=source, b=destination) / link_batch (links:[{a,b}]); UNLINK — unlink (a, optional b; a alone removes all its links) / unlink_batch (links:[{a,b?}]); resolve (report valid path forms for a).",
     inputSchema: {
       action: z.enum(["link", "unlink", "resolve", "link_batch", "unlink_batch"]),
       a: z.string(),

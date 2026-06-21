@@ -42,6 +42,20 @@ resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
 - `xae_build` — clean / build / rebuild
 - `xae_command` — raw DTE command (guarded)
 - `tc_tree` — get / children / exists / exists_batch / get_batch / get_xml / set_xml / set_xml_batch / rename / rename_batch / create / create_batch / delete / delete_batch / import / export / focus
+  - **Batch-first decision guide** — when a job touches more than one item, reach for the `*_batch` action. Each batch runs N operations in **one** DTE attach (vs. a process-spawn + attach per single call) and returns a compact `{ count, succeeded, failed, results:[{…, ok, error?}] }` roll-up with continue-on-error semantics.
+
+    | Job | One item | Many items |
+    |---|---|---|
+    | Look up identity | `get` | `get_batch` (paths:[…]) |
+    | Test a path exists | `exists` | `exists_batch` (paths:[…]) |
+    | Push params (ConsumeXml) | `set_xml` | `set_xml_batch` (items:[{path,xml}]) |
+    | Rename | `rename` | `rename_batch` (renames:[{name\|path,newName}]) |
+    | Create child node | `create` | `create_batch` (creates:[{parent,name,subType,…}]) |
+    | Delete child node | `delete` | `delete_batch` (deletes:[{parent,name}]) |
+    | Link variables | `tc_link link` | `tc_link link_batch` (links:[{a,b}]) |
+    | Unlink variables | `tc_link unlink` | `tc_link unlink_batch` (links:[{a,b?}]) |
+
+    No batch form (inherently single / read-all): `children`, `get_xml`, `import`, `export`, `focus`, `tc_link resolve`.
   - `set_xml` returns a compact `{ treePath }` by default; pass `returnXml:true` to also echo the produced XML (with the embedded `TreeImageData16x14` bitmap stripped).
   - **Renaming tree items:** `tc_tree action:rename path:<treePath> newName:<name>` renames an existing item (e.g. an EtherCAT box/terminal) and keeps IO links intact, returning a compact `{ treePath, newName, newPath }`. Do **not** use `set_xml`/`newName` probing for this.
   - **Batch rename:** `tc_tree action:rename_batch path:<basePath> renames:[{name,newName},...]` renames many items under one parent in a single process / DTE attach. Each entry uses `name` (joined to `path` as `"<basePath>^<name>"`) or an explicit `path` (used as-is), plus `newName`. Renames run **sequentially in the given order** and one failure never aborts the rest. Returns a compact roll-up `{ parent, count, succeeded, failed, results }` where each `results[]` entry is `{ name, newName, ok }` (plus `error` on failure) — no per-item XML or path. Example:
