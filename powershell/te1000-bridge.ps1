@@ -1586,6 +1586,556 @@ function Assert-NotSafetyPath {
     }
 }
 
+# =====================================================================
+# plc_pou code_engine: PURE text-manipulation helpers (no COM/XAE).
+# These take strings/arrays in and return strings/arrays/hashtables out,
+# so they are unit-testable standalone. All COM lives in Invoke-PlcTextRMW
+# and the dispatch verbs; these never touch the tree.
+# =====================================================================
+
+function Get-TextEol {
+    # PURE. Inspect the first line terminator; return CRLF or LF.
+    # Default CRLF when none present (TwinCAT default).
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) {
+        return @{ name = 'CRLF'; eol = "`r`n" }
+    }
+    $idx = $Text.IndexOf("`n")
+    if ($idx -lt 0) {
+        # No LF at all: maybe a lone CR (old Mac) or no terminator.
+        if ($Text.IndexOf("`r") -ge 0) { return @{ name = 'LF'; eol = "`r" } }
+        return @{ name = 'CRLF'; eol = "`r`n" }
+    }
+    if ($idx -gt 0 -and $Text[$idx - 1] -eq "`r") {
+        return @{ name = 'CRLF'; eol = "`r`n" }
+    }
+    return @{ name = 'LF'; eol = "`n" }
+}
+
+function Split-PlcLines {
+    # PURE. Split into lines WITHOUT terminators, on CRLF or lone LF/CR.
+    # Empty string => @() (lineCount 0). Returns a hashtable carrying the
+    # line array AND whether the original text ended with an EOL so a
+    # round-trip preserves trailing-newline semantics.
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) {
+        return @{ lines = @(); trailingEol = $false }
+    }
+    $trailing = ($Text -match "(`r`n|`n|`r)$")
+    # Normalize CRLF and lone CR to LF, then split on LF.
+    $norm = $Text -replace "`r`n", "`n"
+    $norm = $norm -replace "`r", "`n"
+    $parts = $norm -split "`n", -1
+    # If the text ended in an EOL the split yields a trailing empty element;
+    # drop it (we track trailingEol separately for fidelity).
+    if ($trailing -and @($parts).Count -ge 1) {
+        $parts = $parts[0..($parts.Count - 2)]
+    }
+    return @{ lines = @($parts); trailingEol = [bool]$trailing }
+}
+
+function Join-PlcLines {
+    # PURE. Re-join with the detected EOL, optionally re-adding a trailing EOL.
+    param(
+        [AllowNull()][string[]]$Lines,
+        [string]$Eol = "`r`n",
+        [bool]$TrailingEol = $true
+    )
+    if ($null -eq $Lines -or @($Lines).Count -eq 0) {
+        return ''
+    }
+    $joined = [string]::Join($Eol, $Lines)
+    if ($TrailingEol) { $joined = $joined + $Eol }
+    return $joined
+}
+
+function Get-LineSlice {
+    # PURE. 1-based inclusive slice with clamp. Returns the slice plus the
+    # clamped bounds and an outOfBounds flag (for reads — never throws).
+    param(
+        [AllowNull()][string[]]$Lines,
+        [int]$Start,
+        [int]$End
+    )
+    $count = if ($null -eq $Lines) { 0 } else { @($Lines).Count }
+    if ($count -eq 0) {
+        return @{ slice = @(); clampedStart = 0; clampedEnd = 0; outOfBounds = $true }
+    }
+    $oob = ($Start -lt 1) -or ($End -gt $count) -or ($Start -gt $End)
+    $cs = if ($Start -lt 1) { 1 } else { $Start }
+    $ce = if ($End -gt $count) { $count } else { $End }
+    if ($cs -gt $ce) {
+        return @{ slice = @(); clampedStart = $cs; clampedEnd = $ce; outOfBounds = $true }
+    }
+    $slice = @($Lines[($cs - 1)..($ce - 1)])
+    return @{ slice = $slice; clampedStart = $cs; clampedEnd = $ce; outOfBounds = [bool]$oob }
+}
+
+function Select-GrepLines {
+    # PURE. Regex match over lines + N context lines each side, de-duplicated
+    # and merged, 1-based line numbers. Empty array on no match (NOT an error).
+    # Throws a clear error on an invalid regex pattern.
+    param(
+        [AllowNull()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [int]$Context = 2
+    )
+    $count = if ($null -eq $Lines) { 0 } else { @($Lines).Count }
+    if ($count -eq 0) { return @() }
+    if ($Context -lt 0) { $Context = 0 }
+    $regex = $null
+    try {
+        $regex = [System.Text.RegularExpressions.Regex]::new($Pattern)
+    } catch {
+        throw "invalid grep pattern: $($_.Exception.Message)"
+    }
+    $keep = New-Object 'System.Collections.Generic.SortedSet[int]'
+    for ($i = 0; $i -lt $count; $i++) {
+        if ($regex.IsMatch($Lines[$i])) {
+            $lo = $i - $Context
+            $hi = $i + $Context
+            if ($lo -lt 0) { $lo = 0 }
+            if ($hi -gt ($count - 1)) { $hi = $count - 1 }
+            for ($j = $lo; $j -le $hi; $j++) { [void]$keep.Add($j) }
+        }
+    }
+    $out = @()
+    foreach ($idx in $keep) {
+        $out += @{ line = ($idx + 1); text = $Lines[$idx] }
+    }
+    return @($out)
+}
+
+function Get-StrippedToken {
+    # PURE helper for VAR-block scanning: return the first whitespace-delimited
+    # token of a line with line/block comment leaders ignored; '' for a line
+    # that is blank or starts with // or (*.
+    param([AllowNull()][string]$Line)
+    if ($null -eq $Line) { return '' }
+    $t = $Line.Trim()
+    if ($t -eq '') { return '' }
+    if ($t.StartsWith('//')) { return '' }
+    if ($t.StartsWith('(*')) { return '' }
+    # Cut an inline trailing comment before tokenizing.
+    $ci = $t.IndexOf('//')
+    if ($ci -ge 0) { $t = $t.Substring(0, $ci).Trim() }
+    $bi = $t.IndexOf('(*')
+    if ($bi -ge 0) { $t = $t.Substring(0, $bi).Trim() }
+    if ($t -eq '') { return '' }
+    $parts = $t -split '\s+'
+    return $parts[0]
+}
+
+function Find-VarBlock {
+    # PURE. Locate the chosen VAR-block (1-based occurrence) and its END_VAR.
+    # Matches on the first token of a line (case-insensitive), tolerant of
+    # CONSTANT/PERSISTENT/RETAIN modifiers and trailing comments; ignores lines
+    # that start with // or (*. No nesting in IEC VAR blocks, so the first
+    # END_VAR after a start line closes it. Returns
+    # {found, startLine, endVarLine, indent} (1-based lines).
+    param(
+        [AllowNull()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][string]$BlockKeyword,
+        [int]$Occurrence = 1
+    )
+    $count = if ($null -eq $Lines) { 0 } else { @($Lines).Count }
+    if ($count -eq 0) { return @{ found = $false } }
+    if ($Occurrence -lt 1) { $Occurrence = 1 }
+    # Normalize the requested keyword: collapse spaces (e.g. "VAR PERSISTENT").
+    $wantTokens = @(($BlockKeyword.Trim() -split '\s+') | Where-Object { $_ -ne '' })
+    $wantHead = $wantTokens[0].ToUpperInvariant()
+    $varKeywords = @('VAR','VAR_GLOBAL','VAR_INPUT','VAR_OUTPUT','VAR_IN_OUT','VAR_STAT','VAR_TEMP','VAR_INST','VAR_CONFIG','VAR_EXTERNAL')
+    $found = 0
+    $i = 0
+    while ($i -lt $count) {
+        $tok = (Get-StrippedToken -Line $Lines[$i]).ToUpperInvariant()
+        if ($tok -eq $wantHead -and ($varKeywords -contains $tok)) {
+            # This is a VAR-block opener matching the requested head keyword.
+            $found++
+            if ($found -eq $Occurrence) {
+                $startLine = $i + 1
+                $indent = ''
+                $m = [System.Text.RegularExpressions.Regex]::Match($Lines[$i], '^(\s*)')
+                if ($m.Success) { $indent = $m.Groups[1].Value }
+                # Walk forward to the matching END_VAR.
+                for ($k = $i + 1; $k -lt $count; $k++) {
+                    $et = (Get-StrippedToken -Line $Lines[$k]).ToUpperInvariant()
+                    if ($et -eq 'END_VAR') {
+                        return @{ found = $true; startLine = $startLine; endVarLine = ($k + 1); indent = $indent }
+                    }
+                }
+                # Opener with no END_VAR (malformed) — report not found cleanly.
+                return @{ found = $false }
+            }
+            # Skip to this block's END_VAR before continuing the outer scan.
+            for ($k = $i + 1; $k -lt $count; $k++) {
+                $et = (Get-StrippedToken -Line $Lines[$k]).ToUpperInvariant()
+                if ($et -eq 'END_VAR') { $i = $k; break }
+            }
+        }
+        $i++
+    }
+    return @{ found = $false }
+}
+
+function Get-DeclOutline {
+    # PURE. Parse the leading POU header + every VAR.../END_VAR pair.
+    # Returns {header:{keyword,name,extends,implements,returnType}, varBlocks:[...]}.
+    param([AllowNull()][string[]]$Lines)
+    $count = if ($null -eq $Lines) { 0 } else { @($Lines).Count }
+    $header = @{ keyword = $null; name = $null; extends = $null; implements = $null; returnType = $null }
+    $varKeywords = @('VAR','VAR_GLOBAL','VAR_INPUT','VAR_OUTPUT','VAR_IN_OUT','VAR_STAT','VAR_TEMP','VAR_INST','VAR_CONFIG','VAR_EXTERNAL')
+    $headerKeywords = @('FUNCTION_BLOCK','FUNCTION','PROGRAM','INTERFACE','TYPE','STRUCT','UNION','VAR_GLOBAL')
+
+    # Find the header line (first non-blank, non-comment line whose first token is a header keyword).
+    for ($i = 0; $i -lt $count; $i++) {
+        $tok = (Get-StrippedToken -Line $Lines[$i]).ToUpperInvariant()
+        if ($tok -eq '') { continue }
+        if ($headerKeywords -contains $tok) {
+            $line = $Lines[$i]
+            # Strip trailing comment for parsing.
+            $clean = $line
+            $ci = $clean.IndexOf('//'); if ($ci -ge 0) { $clean = $clean.Substring(0, $ci) }
+            $clean = $clean.Trim()
+            $header.keyword = $tok
+            # EXTENDS
+            $em = [System.Text.RegularExpressions.Regex]::Match($clean, '(?i)\bEXTENDS\s+([A-Za-z_][A-Za-z0-9_\.]*)')
+            if ($em.Success) { $header.extends = $em.Groups[1].Value }
+            # IMPLEMENTS (comma list)
+            $im = [System.Text.RegularExpressions.Regex]::Match($clean, '(?i)\bIMPLEMENTS\s+(.+)$')
+            if ($im.Success) {
+                $impl = $im.Groups[1].Value
+                # cut off at EXTENDS if it followed
+                $impl = ($impl -replace '(?i)\bEXTENDS\b.*$', '').Trim()
+                $header.implements = $impl
+            }
+            # name = the token right after the keyword
+            $nm = [System.Text.RegularExpressions.Regex]::Match($clean, '(?i)^' + [System.Text.RegularExpressions.Regex]::Escape($Lines[$i].Trim().Split(' ')[0]) + '\s+([A-Za-z_][A-Za-z0-9_]*)')
+            if ($nm.Success) { $header.name = $nm.Groups[1].Value }
+            # FUNCTION / METHOD-style return type ": TYPE"
+            $rm = [System.Text.RegularExpressions.Regex]::Match($clean, ':\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*$')
+            if ($rm.Success -and ($tok -eq 'FUNCTION')) { $header.returnType = $rm.Groups[1].Value }
+            break
+        }
+        if ($varKeywords -contains $tok) { break } # a GVL may open straight into VAR_GLOBAL
+    }
+
+    # Enumerate VAR blocks.
+    $blocks = @()
+    $i = 0
+    while ($i -lt $count) {
+        $tok = (Get-StrippedToken -Line $Lines[$i]).ToUpperInvariant()
+        if ($varKeywords -contains $tok) {
+            $startLine = $i + 1
+            # kind = full opener keyword phrase incl. modifiers (e.g. "VAR_GLOBAL CONSTANT").
+            $opener = $Lines[$i].Trim()
+            $oc = $opener.IndexOf('//'); if ($oc -ge 0) { $opener = $opener.Substring(0, $oc).Trim() }
+            $ob = $opener.IndexOf('(*'); if ($ob -ge 0) { $opener = $opener.Substring(0, $ob).Trim() }
+            $kind = $opener
+            # find END_VAR
+            $endLine = $null
+            $varCount = 0
+            for ($k = $i + 1; $k -lt $count; $k++) {
+                $et = (Get-StrippedToken -Line $Lines[$k]).ToUpperInvariant()
+                if ($et -eq 'END_VAR') { $endLine = $k + 1; break }
+                # count declaration lines: non-blank, non-comment lines containing ':'
+                $body = (Get-StrippedToken -Line $Lines[$k])
+                if ($body -ne '' -and $Lines[$k] -match ':') { $varCount++ }
+            }
+            if ($null -ne $endLine) {
+                $blocks += @{ kind = $kind; startLine = $startLine; endLine = $endLine; varCount = $varCount }
+                $i = $endLine - 1
+            }
+        }
+        $i++
+    }
+    return @{ header = $header; varBlocks = @($blocks) }
+}
+
+function Apply-Replace {
+    # PURE. Literal (non-regex) count + replace-all with an expected count gate.
+    # Returns {newText, count, ok, error}. ok=false (no change) when count==0
+    # or count != expectCount. Mirrors the Edit tool's anchored-unique semantics.
+    param(
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Find,
+        [Parameter(Mandatory = $true)][string]$ReplaceWith,
+        [int]$ExpectCount = 1
+    )
+    if ([string]::IsNullOrEmpty($Find)) {
+        return @{ newText = $Text; count = 0; ok = $false; error = 'find must be a non-empty string' }
+    }
+    $hay = if ($null -eq $Text) { '' } else { $Text }
+    # Count literal occurrences (ordinal).
+    $count = 0
+    $pos = 0
+    while ($true) {
+        $idx = $hay.IndexOf($Find, $pos, [System.StringComparison]::Ordinal)
+        if ($idx -lt 0) { break }
+        $count++
+        $pos = $idx + $Find.Length
+    }
+    if ($count -eq 0) {
+        return @{ newText = $hay; count = 0; ok = $false; error = "find not present in target (no change written)" }
+    }
+    if ($count -ne $ExpectCount) {
+        return @{ newText = $hay; count = $count; ok = $false; error = "expected $ExpectCount occurrence(s), found $count (no change written)" }
+    }
+    $newText = $hay.Replace($Find, $ReplaceWith)
+    return @{ newText = $newText; count = $count; ok = $true; error = $null }
+}
+
+function Get-ChangedSnippet {
+    # PURE. Given the NEW line array + the changed region (1-based inclusive),
+    # return {changedRange:{start,end}, snippet:[{line,text}]} for the new region
+    # +/- 2 context lines. The compact 'only the changed region' payload.
+    param(
+        [AllowNull()][string[]]$NewLines,
+        [int]$Start,
+        [int]$End,
+        [int]$Context = 2
+    )
+    $count = if ($null -eq $NewLines) { 0 } else { @($NewLines).Count }
+    if ($count -eq 0) {
+        return @{ changedRange = @{ start = 0; end = 0 }; snippet = @() }
+    }
+    if ($Start -lt 1) { $Start = 1 }
+    if ($End -gt $count) { $End = $count }
+    if ($End -lt $Start) { $End = $Start }
+    $lo = $Start - $Context; if ($lo -lt 1) { $lo = 1 }
+    $hi = $End + $Context; if ($hi -gt $count) { $hi = $count }
+    $snippet = @()
+    for ($i = $lo; $i -le $hi; $i++) {
+        $snippet += @{ line = $i; text = $NewLines[$i - 1] }
+    }
+    return @{ changedRange = @{ start = $Start; end = $End }; snippet = @($snippet) }
+}
+
+function Get-FirstDivergentLine {
+    # PURE. 1-based index of the first line that differs between two arrays
+    # (or the first extra line if one is longer). $null if identical.
+    param([AllowNull()][string[]]$OldLines, [AllowNull()][string[]]$NewLines)
+    $o = @($OldLines); $n = @($NewLines)
+    $max = [Math]::Max($o.Count, $n.Count)
+    for ($i = 0; $i -lt $max; $i++) {
+        $ov = if ($i -lt $o.Count) { $o[$i] } else { $null }
+        $nv = if ($i -lt $n.Count) { $n[$i] } else { $null }
+        if ($ov -ne $nv) { return ($i + 1) }
+    }
+    return $null
+}
+
+function Get-LastDivergentLine {
+    # PURE. 1-based index (in the NEW array) of the last line that differs,
+    # scanning from the end. $null if identical.
+    param([AllowNull()][string[]]$OldLines, [AllowNull()][string[]]$NewLines)
+    $o = @($OldLines); $n = @($NewLines)
+    $oi = $o.Count - 1
+    $ni = $n.Count - 1
+    while ($oi -ge 0 -and $ni -ge 0 -and $o[$oi] -eq $n[$ni]) { $oi--; $ni-- }
+    if ($ni -lt 0 -and $oi -lt 0) { return $null }
+    if ($ni -lt 0) { return 1 }
+    return ($ni + 1)
+}
+
+function Get-PlcTargetParam {
+    # Read the optional 'target' param (decl|impl) with a default; validate.
+    param([Parameter(Mandatory = $true)]$Payload, [string]$Default = 'decl')
+    if ($Payload.PSObject.Properties.Name -contains 'target' -and -not [string]::IsNullOrWhiteSpace([string]$Payload.target)) {
+        $t = ([string]$Payload.target).ToLowerInvariant()
+        if ($t -ne 'decl' -and $t -ne 'impl') { throw "target must be 'decl' or 'impl'" }
+        return $t
+    }
+    return $Default
+}
+
+function Get-PlcTextReadResult {
+    # Build the get_decl / get_impl return shape from a raw text blob and the
+    # request payload (range XOR grep). PURE apart from reading $Payload props.
+    param(
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory = $true)]$Payload,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $eolInfo = Get-TextEol -Text $Text
+    $split = Split-PlcLines -Text $Text
+    $lines = @($split.lines)
+    $lineCount = $lines.Count
+
+    $hasRange = ($Payload.PSObject.Properties.Name -contains 'range') -and ($null -ne $Payload.range)
+    $hasGrep = ($Payload.PSObject.Properties.Name -contains 'grep') -and ($null -ne $Payload.grep)
+    if ($hasRange -and $hasGrep) {
+        throw 'range and grep are mutually exclusive'
+    }
+
+    $data = @{ path = $Path; lineCount = $lineCount; eol = $eolInfo.name }
+
+    if ($hasGrep) {
+        $pattern = [string]$Payload.grep.pattern
+        if ([string]::IsNullOrEmpty($pattern)) { throw 'grep.pattern is required' }
+        $ctx = if ($null -ne $Payload.grep.context) { [int]$Payload.grep.context } else { 2 }
+        $data.matches = @(Select-GrepLines -Lines $lines -Pattern $pattern -Context $ctx)
+        return $data
+    }
+
+    if ($hasRange) {
+        $start = [int]$Payload.range.start
+        $end = [int]$Payload.range.end
+        $sl = Get-LineSlice -Lines $lines -Start $start -End $end
+        $data.text = Join-PlcLines -Lines @($sl.slice) -Eol $eolInfo.eol -TrailingEol $false
+        if ($sl.outOfBounds) { $data.truncated = $true }
+        return $data
+    }
+
+    # No range, no grep: full text (back-compat) plus lineCount.
+    $data.text = $Text
+    return $data
+}
+
+function Get-PlcLanguageName {
+    # PURE. Map IECLANGUAGETYPES int -> name. 0 NONE/1 ST/2 IL/3 SFC/4 FBD/5 CFC/6 LD.
+    param([AllowNull()]$Language)
+    switch ([int]$Language) {
+        0 { return 'NONE' }
+        1 { return 'ST' }
+        2 { return 'IL' }
+        3 { return 'SFC' }
+        4 { return 'FBD' }
+        5 { return 'CFC' }
+        6 { return 'LD' }
+        default { return 'UNKNOWN' }
+    }
+}
+
+function Test-PlcGraphicalLanguage {
+    # PURE. Graphical languages where ImplementationText is not authoritative.
+    # Allowlist textual languages (ST=1, IL=2); refuse everything NOT in {1,2}
+    # when a language is actually known (per the caveat: prefer allowlisting
+    # text over denylisting 3-6 in case a build returns usable text for a type).
+    param([AllowNull()]$Language)
+    if ($null -eq $Language) { return $false }
+    $l = [int]$Language
+    return -not ($l -eq 1 -or $l -eq 2)
+}
+
+function Refuse-GraphicalText {
+    # Throw the standard refusal for a surgical impl write on a graphical language.
+    param([string]$Path, [AllowNull()]$Language)
+    $name = Get-PlcLanguageName -Language $Language
+    throw "Refused surgical text edit on $($Path): implementation language is $name; ImplementationText is not authoritative for graphical languages. Use set_impl implXml (whole-XML round-trip) instead."
+}
+
+function Invoke-PlcTextRMW {
+    # THE read-modify-write wrapper. ALL COM lives here; the $Mutator is pure
+    # string logic (param($text,$eol,$lines) -> new text string).
+    #   - resolves the tree item via Get-TreeItem
+    #   - Assert-NotSafetyPath
+    #   - Ensure-TcPlcPouHelper (else throw the standard 'typed PLC cast' message)
+    #   - target='impl': read language; if graphical (not ST/IL) throw Refuse-GraphicalText
+    #   - read via GetDeclaration / GetImplementation
+    #   - detect EOL (Get-TextEol), split (Split-PlcLines)
+    #   - run $Mutator to get new text
+    #   - write back via SetDeclaration / SetImplementationText
+    # Returns @{ newText; eol; eolName; trailingEol; oldLineCount; newLineCount; language? }.
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('decl','impl')][string]$Target,
+        [Parameter(Mandatory = $true)][scriptblock]$Mutator
+    )
+    Assert-NotSafetyPath -Path $Path
+    $item = (Get-TreeItem -SysManager $SysManager -TreePath $Path).Value
+    if (-not (Ensure-TcPlcPouHelper)) {
+        throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+    }
+    $language = $null
+    if ($Target -eq 'impl') {
+        try { $language = [Te1000PlcPouHelper]::GetImplementationLanguage($item) } catch { $language = $null }
+        if (Test-PlcGraphicalLanguage -Language $language) {
+            Refuse-GraphicalText -Path $Path -Language $language
+        }
+        $text = [Te1000PlcPouHelper]::GetImplementation($item)
+    } else {
+        $text = [Te1000PlcPouHelper]::GetDeclaration($item)
+    }
+    $eolInfo = Get-TextEol -Text $text
+    $split = Split-PlcLines -Text $text
+    $oldLines = @($split.lines)
+    $newText = & $Mutator $text $eolInfo.eol $oldLines
+    if ($null -eq $newText) { $newText = '' }
+    if ($Target -eq 'impl') {
+        [Te1000PlcPouHelper]::SetImplementationText($item, [string]$newText)
+    } else {
+        [Te1000PlcPouHelper]::SetDeclaration($item, [string]$newText)
+    }
+    $newSplit = Split-PlcLines -Text ([string]$newText)
+    return @{
+        newText = [string]$newText
+        eol = $eolInfo.eol
+        eolName = $eolInfo.name
+        trailingEol = $split.trailingEol
+        oldLineCount = @($oldLines).Count
+        newLineCount = @($newSplit.lines).Count
+        newLines = @($newSplit.lines)
+        language = $language
+    }
+}
+
+function Save-IfRequested {
+    # Save the solution once if the payload requested it (save:true).
+    param([Parameter(Mandatory = $true)]$Payload, [Parameter(Mandatory = $true)]$Dte)
+    if ($Payload.PSObject.Properties.Name -contains 'save' -and [bool]$Payload.save) {
+        Save-Solution -Dte $Dte
+    }
+}
+
+function Add-ValidateResult {
+    # OPTIONAL post-write build-check. When the payload sets validate:true, run
+    # CheckAllObjects on the nested IEC project (reusing the check_objects
+    # resolution: the first PLC under TIPC, then its '<name> Project' instance
+    # node). Surfaces {validated:bool}. Default off (no key added) to stay fast.
+    param(
+        [Parameter(Mandatory = $true)]$Payload,
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)][hashtable]$Data
+    )
+    if (-not (($Payload.PSObject.Properties.Name -contains 'validate') -and [bool]$Payload.validate)) {
+        return
+    }
+    try {
+        $tipc = $SysManager.LookupTreeItem('TIPC')
+        if ([int]$tipc.ChildCount -lt 1) { $Data.validated = $false; return }
+        $plcPath = "TIPC^$([string]$tipc.Child(1).Name)"
+        $root = (Get-TreeItem -SysManager $SysManager -TreePath $plcPath).Value
+        if (-not (Ensure-TcPlcProjectHelper)) { $Data.validated = $false; return }
+        $rootName = Normalize-ScalarValue (Get-SafeValue { [string]$root.Name })
+        $candidatePaths = New-Object System.Collections.ArrayList
+        if (-not [string]::IsNullOrWhiteSpace($rootName)) { [void]$candidatePaths.Add("$plcPath^$rootName Project") }
+        $childCount = Get-TreeItemChildCount -TreeItem $root
+        for ($ci = 1; $ci -le $childCount; $ci++) {
+            $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $root -Index $ci).Value })
+            if ($null -ne $childNode) {
+                $cn = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+                if (-not [string]::IsNullOrWhiteSpace($cn)) {
+                    $cp = "$plcPath^$cn"
+                    if (-not $candidatePaths.Contains($cp)) { [void]$candidatePaths.Add($cp) }
+                }
+            }
+        }
+        if (-not $candidatePaths.Contains($plcPath)) { [void]$candidatePaths.Add($plcPath) }
+        foreach ($candPath in $candidatePaths) {
+            try {
+                $node = (Get-TreeItem -SysManager $SysManager -TreePath $candPath).Value
+                $Data.validated = [bool]([Te1000PlcProjectHelper]::CheckAll($node))
+                return
+            } catch { }
+        }
+        $Data.validated = $false
+    } catch {
+        $Data.validated = $false
+    }
+}
+
 function New-PlcPouVInfo {
     # Build the VARIANT vInfo argument for ITcSmTreeItem.CreateChild per PLC sub-type
     # (infosys 242732427). Multi-element cases MUST be a typed [object[]] / [string[]]
@@ -4895,6 +5445,7 @@ try {
         'plc_pou_get_decl' {
             $path = [string]$payload.path
             if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            Assert-NotSafetyPath -Path $path
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
             $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
@@ -4903,37 +5454,339 @@ try {
             }
             $declText = [Te1000PlcPouHelper]::GetDeclaration($item)
 
-            Write-JsonResult @{
-                ok = $true
-                data = @{
-                    path = $path
-                    declText = $declText
-                }
-            }
+            $data = Get-PlcTextReadResult -Text $declText -Payload $payload -Path $path
+            Write-JsonResult @{ ok = $true; data = $data }
             exit 0
         }
 
         'plc_pou_get_impl' {
             $path = [string]$payload.path
             if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            Assert-NotSafetyPath -Path $path
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
             $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
             if (-not (Ensure-TcPlcPouHelper)) {
                 throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
             }
-            $implText = [Te1000PlcPouHelper]::GetImplementation($item)
             $language = $null
             try { $language = [Te1000PlcPouHelper]::GetImplementationLanguage($item) } catch { }
+
+            if (Test-PlcGraphicalLanguage -Language $language) {
+                # Graphical: ImplementationText is empty/meaningless. Report it and
+                # treat range/grep as harmless no-ops.
+                Write-JsonResult @{
+                    ok = $true
+                    data = @{
+                        path = $path
+                        language = $language
+                        lineCount = 0
+                        graphical = $true
+                        hint = 'use get_document for implXml'
+                    }
+                }
+                exit 0
+            }
+
+            $implText = [Te1000PlcPouHelper]::GetImplementation($item)
+            $data = Get-PlcTextReadResult -Text $implText -Payload $payload -Path $path
+            $data.language = $language
+            Write-JsonResult @{ ok = $true; data = $data }
+            exit 0
+        }
+
+        'plc_pou_outline' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            Assert-NotSafetyPath -Path $path
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $declText = [Te1000PlcPouHelper]::GetDeclaration($item)
+            $declSplit = Split-PlcLines -Text $declText
+            $declLines = @($declSplit.lines)
+            $outline = Get-DeclOutline -Lines $declLines
+
+            $implLineCount = $null
+            $language = $null
+            try { $language = [Te1000PlcPouHelper]::GetImplementationLanguage($item) } catch { }
+            if (-not (Test-PlcGraphicalLanguage -Language $language)) {
+                try {
+                    $implText = [Te1000PlcPouHelper]::GetImplementation($item)
+                    $implSplit = Split-PlcLines -Text $implText
+                    $implLineCount = @($implSplit.lines).Count
+                } catch { $implLineCount = $null }
+            } else {
+                $implLineCount = 0
+            }
+
+            # objectKind from tree ItemType (code objects: FB 604 / Program 602 / Interface 618 etc.)
+            $objectKind = Normalize-ScalarValue (Get-SafeValue { [int]$item.ItemType })
+
+            # Enumerate child code items (methods/properties/actions/transitions).
+            $children = @()
+            $childCount = Get-TreeItemChildCount -TreeItem $item
+            for ($ci = 1; $ci -le $childCount; $ci++) {
+                $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $item -Index $ci).Value })
+                if ($null -eq $childNode) { continue }
+                $cn = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+                if ([string]::IsNullOrWhiteSpace($cn)) { continue }
+                $cSub = $null
+                try { $cSub = $childNode.SubType } catch { try { $cSub = $childNode.ItemSubType } catch { $cSub = $null } }
+                $kind = switch ([int]$cSub) {
+                    608 { 'action' }
+                    609 { 'method' }
+                    611 { 'property' }
+                    616 { 'transition' }
+                    default { 'child' }
+                }
+                $cLang = $null
+                try { $cLang = [Te1000PlcPouHelper]::GetImplementationLanguage($childNode) } catch { }
+                $children += @{ name = $cn; kind = $kind; subType = $cSub; language = $cLang }
+            }
 
             Write-JsonResult @{
                 ok = $true
                 data = @{
                     path = $path
-                    language = $language
-                    implText = $implText
+                    objectKind = $objectKind
+                    header = $outline.header
+                    declLineCount = @($declLines).Count
+                    implLineCount = $implLineCount
+                    varBlocks = $outline.varBlocks
+                    children = @($children)
                 }
             }
+            exit 0
+        }
+
+        'plc_pou_replace' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.find) { throw 'find is required' }
+            if ($null -eq $payload.replaceWith) { throw 'replaceWith is required' }
+            $target = Get-PlcTargetParam -Payload $payload -Default 'decl'
+            $find = [string]$payload.find
+            $replaceWith = [string]$payload.replaceWith
+            $expectCount = if ($null -ne $payload.expectCount) { [int]$payload.expectCount } else { 1 }
+            $resultRef = @{}
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $rmw = Invoke-PlcTextRMW -SysManager $sysManager -Path $path -Target $target -Mutator {
+                param($text, $eol, $lines)
+                $ar = Apply-Replace -Text $text -Find $find -ReplaceWith $replaceWith -ExpectCount $expectCount
+                if (-not $ar.ok) { throw $ar.error }
+                $resultRef.replaced = $ar.count
+                # Compute changed region for the snippet: locate the first replacement.
+                $oldSplit = Split-PlcLines -Text $text
+                $newSplit = Split-PlcLines -Text $ar.newText
+                $resultRef.firstChanged = Get-FirstDivergentLine -OldLines @($oldSplit.lines) -NewLines @($newSplit.lines)
+                $resultRef.lastChanged = Get-LastDivergentLine -OldLines @($oldSplit.lines) -NewLines @($newSplit.lines)
+                return $ar.newText
+            }
+            $startL = if ($null -ne $resultRef.firstChanged) { [int]$resultRef.firstChanged } else { 1 }
+            $endL = if ($null -ne $resultRef.lastChanged) { [int]$resultRef.lastChanged } else { $startL }
+            $snip = Get-ChangedSnippet -NewLines @($rmw.newLines) -Start $startL -End $endL
+            Save-IfRequested -Payload $payload -Dte $dte
+            $data = @{
+                path = $path
+                target = $target
+                replaced = $resultRef.replaced
+                lineCount = $rmw.newLineCount
+                eol = $rmw.eolName
+                changedRange = $snip.changedRange
+                snippet = $snip.snippet
+            }
+            Add-ValidateResult -Payload $payload -SysManager $sysManager -Data $data
+            Write-JsonResult @{ ok = $true; data = $data }
+            exit 0
+        }
+
+        'plc_pou_replace_lines' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.start) { throw 'start is required' }
+            if ($null -eq $payload.end) { throw 'end is required' }
+            if ($null -eq $payload.text) { throw 'text is required' }
+            $target = Get-PlcTargetParam -Payload $payload -Default 'decl'
+            $startReq = [int]$payload.start
+            $endReq = [int]$payload.end
+            $newText = [string]$payload.text
+            $newEndRef = @{}
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $rmw = Invoke-PlcTextRMW -SysManager $sysManager -Path $path -Target $target -Mutator {
+                param($text, $eol, $lines)
+                $count = @($lines).Count
+                if ($startReq -lt 1 -or $endReq -gt $count -or $startReq -gt $endReq) {
+                    throw "replace_lines range [$startReq..$endReq] is out of bounds for lineCount $count (no change written)"
+                }
+                $repSplit = Split-PlcLines -Text $newText
+                $repLines = @($repSplit.lines)
+                $before = if ($startReq -gt 1) { @($lines[0..($startReq - 2)]) } else { @() }
+                $after = if ($endReq -lt $count) { @($lines[$endReq..($count - 1)]) } else { @() }
+                $merged = @($before) + @($repLines) + @($after)
+                $newEndRef.start = $startReq
+                $newEndRef.newEnd = $startReq + @($repLines).Count - 1
+                if ($newEndRef.newEnd -lt $startReq) { $newEndRef.newEnd = $startReq }
+                return Join-PlcLines -Lines $merged -Eol $eol -TrailingEol $true
+            }
+            $snip = Get-ChangedSnippet -NewLines @($rmw.newLines) -Start ([int]$newEndRef.start) -End ([int]$newEndRef.newEnd)
+            Save-IfRequested -Payload $payload -Dte $dte
+            $data = @{
+                path = $path
+                target = $target
+                lineCount = $rmw.newLineCount
+                eol = $rmw.eolName
+                changedRange = $snip.changedRange
+                snippet = $snip.snippet
+            }
+            Add-ValidateResult -Payload $payload -SysManager $sysManager -Data $data
+            Write-JsonResult @{ ok = $true; data = $data }
+            exit 0
+        }
+
+        'plc_pou_insert' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.text) { throw 'text is required' }
+            $target = Get-PlcTargetParam -Payload $payload -Default 'decl'
+            $hasAt = ($payload.PSObject.Properties.Name -contains 'at') -and ($null -ne $payload.at)
+            $hasAfter = ($payload.PSObject.Properties.Name -contains 'after') -and ($null -ne $payload.after)
+            $hasBefore = ($payload.PSObject.Properties.Name -contains 'before') -and ($null -ne $payload.before)
+            $supplied = @($hasAt, $hasAfter, $hasBefore) | Where-Object { $_ } | Measure-Object
+            if ($supplied.Count -ne 1) {
+                throw 'insert requires exactly one of at / after / before'
+            }
+            $insText = [string]$payload.text
+            $regionRef = @{}
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $rmw = Invoke-PlcTextRMW -SysManager $sysManager -Path $path -Target $target -Mutator {
+                param($text, $eol, $lines)
+                $count = @($lines).Count
+                # Compute 1-based "insert before this index" position.
+                if ($hasAfter) { $pos = [int]$payload.after + 1 }
+                elseif ($hasBefore) { $pos = [int]$payload.before }
+                else { $pos = [int]$payload.at }
+                if ($pos -lt 1 -or $pos -gt ($count + 1)) {
+                    throw "insert position $pos is out of bounds for lineCount $count (valid 1..$($count + 1)) (no change written)"
+                }
+                $insSplit = Split-PlcLines -Text $insText
+                $insLines = @($insSplit.lines)
+                $before = if ($pos -gt 1) { @($lines[0..($pos - 2)]) } else { @() }
+                $after = if ($pos -le $count) { @($lines[($pos - 1)..($count - 1)]) } else { @() }
+                $merged = @($before) + @($insLines) + @($after)
+                $regionRef.start = $pos
+                $regionRef.end = $pos + @($insLines).Count - 1
+                if ($regionRef.end -lt $pos) { $regionRef.end = $pos }
+                return Join-PlcLines -Lines $merged -Eol $eol -TrailingEol $true
+            }
+            $snip = Get-ChangedSnippet -NewLines @($rmw.newLines) -Start ([int]$regionRef.start) -End ([int]$regionRef.end)
+            Save-IfRequested -Payload $payload -Dte $dte
+            $data = @{
+                path = $path
+                target = $target
+                lineCount = $rmw.newLineCount
+                eol = $rmw.eolName
+                changedRange = $snip.changedRange
+                snippet = $snip.snippet
+            }
+            Add-ValidateResult -Payload $payload -SysManager $sysManager -Data $data
+            Write-JsonResult @{ ok = $true; data = $data }
+            exit 0
+        }
+
+        'plc_pou_insert_in_var_block' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace([string]$payload.block)) { throw 'block is required' }
+            if ($null -eq $payload.text) { throw 'text is required' }
+            $target = Get-PlcTargetParam -Payload $payload -Default 'decl'
+            $block = [string]$payload.block
+            $insText = [string]$payload.text
+            $occurrence = if ($null -ne $payload.occurrence) { [int]$payload.occurrence } else { 1 }
+            $regionRef = @{}
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $rmw = Invoke-PlcTextRMW -SysManager $sysManager -Path $path -Target $target -Mutator {
+                param($text, $eol, $lines)
+                $count = @($lines).Count
+                $vb = Find-VarBlock -Lines $lines -BlockKeyword $block -Occurrence $occurrence
+                if (-not $vb.found) {
+                    throw "no $block block found in $path (occurrence $occurrence)"
+                }
+                $endVarLine = [int]$vb.endVarLine
+                # Indentation-match: one indent step deeper than the block opener (best-effort).
+                $indent = [string]$vb.indent + '    '
+                $insSplit = Split-PlcLines -Text $insText
+                $insLines = @($insSplit.lines | ForEach-Object {
+                    if ([string]::IsNullOrWhiteSpace($_)) { $_ } else { $indent + $_.TrimStart() }
+                })
+                $insertPos = $endVarLine  # insert BEFORE END_VAR (1-based "before this index")
+                $before = if ($insertPos -gt 1) { @($lines[0..($insertPos - 2)]) } else { @() }
+                $after = @($lines[($insertPos - 1)..($count - 1)])
+                $merged = @($before) + @($insLines) + @($after)
+                $regionRef.start = $insertPos
+                $regionRef.end = $insertPos + @($insLines).Count - 1
+                if ($regionRef.end -lt $insertPos) { $regionRef.end = $insertPos }
+                return Join-PlcLines -Lines $merged -Eol $eol -TrailingEol $true
+            }
+            $snip = Get-ChangedSnippet -NewLines @($rmw.newLines) -Start ([int]$regionRef.start) -End ([int]$regionRef.end)
+            Save-IfRequested -Payload $payload -Dte $dte
+            $data = @{
+                path = $path
+                target = 'decl'
+                block = $block
+                lineCount = $rmw.newLineCount
+                eol = $rmw.eolName
+                changedRange = $snip.changedRange
+                snippet = $snip.snippet
+            }
+            Add-ValidateResult -Payload $payload -SysManager $sysManager -Data $data
+            Write-JsonResult @{ ok = $true; data = $data }
+            exit 0
+        }
+
+        'plc_pou_append' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.text) { throw 'text is required' }
+            $target = Get-PlcTargetParam -Payload $payload -Default 'impl'
+            $appText = [string]$payload.text
+            $regionRef = @{}
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $rmw = Invoke-PlcTextRMW -SysManager $sysManager -Path $path -Target $target -Mutator {
+                param($text, $eol, $lines)
+                $oldCount = @($lines).Count
+                $appSplit = Split-PlcLines -Text $appText
+                $appLines = @($appSplit.lines)
+                if ($oldCount -eq 0) {
+                    $regionRef.start = 1
+                    $regionRef.end = [Math]::Max(1, @($appLines).Count)
+                    return Join-PlcLines -Lines $appLines -Eol $eol -TrailingEol $appSplit.trailingEol
+                }
+                $merged = @($lines) + @($appLines)
+                $regionRef.start = $oldCount + 1
+                $regionRef.end = @($merged).Count
+                return Join-PlcLines -Lines $merged -Eol $eol -TrailingEol $appSplit.trailingEol
+            }
+            $snip = Get-ChangedSnippet -NewLines @($rmw.newLines) -Start ([int]$regionRef.start) -End ([int]$regionRef.end)
+            Save-IfRequested -Payload $payload -Dte $dte
+            $data = @{
+                path = $path
+                target = $target
+                lineCount = $rmw.newLineCount
+                eol = $rmw.eolName
+                changedRange = $snip.changedRange
+                snippet = $snip.snippet
+            }
+            Add-ValidateResult -Payload $payload -SysManager $sysManager -Data $data
+            Write-JsonResult @{ ok = $true; data = $data }
             exit 0
         }
 

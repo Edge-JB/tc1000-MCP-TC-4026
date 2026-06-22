@@ -803,14 +803,17 @@ server.registerTool(
       "PLC object authoring + code edit on the open solution (OFFLINE engineering only — no activate/download/online; edits land in-memory and reach the cell only via a later guarded plc_download + twincat_restart_runtime). Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy. " +
       "CREATE — create / create_batch (parent, name, subType, language?, returnType?, extends?, implements?, declText?, before?): CreateChild sub-types 602 Program, 603 Function (returnType required), 604 FunctionBlock, 605 Enum, 606 Struct, 607 Union, 608 Action, 609 Method, 611 Property (returnType required), 615 GVL, 616 Transition, 618 Interface, 619 Visualization, 623 Alias, 629 ParameterList, 631 UML. language IECLANGUAGETYPES 0 NONE/1 ST/2 IL/3 SFC/4 FBD/5 CFC/6 LD (default 1). extends/implements for FB 604 / Program 602 derivation (618 uses extends as its base); declText seeds DUT/GVL decl. For code POUs prefer set_decl after create. " +
       "TEMPLATE — import_template (parent, paths[]) imports POU template file(s) (CreateChild sub-type 58). " +
-      "READ — get_decl / get_impl / get_document (path). WRITE — set_decl / set_decl_batch (path, declText); set_impl / set_impl_batch (path, exactly one of implText|implXml — implXml is TwinCAT object XML, round-trip only, for graphical languages); set_document (path, documentXml). " +
+      "READ — get_decl / get_impl / get_document (path). get_decl/get_impl take an optional range {start,end} (1-based inclusive line slice, clamped) OR grep {pattern, context?} (regex over lines + context each side); mutually exclusive; default returns full text. Both always report lineCount; get_impl also returns language (graphical 3-6 -> lineCount:0 + {graphical,hint}). outline (path) returns structure WITHOUT full text: header + varBlocks + child code items. " +
+      "WRITE — set_decl / set_decl_batch (path, declText); set_impl / set_impl_batch (path, exactly one of implText|implXml — implXml is TwinCAT object XML, round-trip only, for graphical languages); set_document (path, documentXml). " +
+      "SURGICAL TEXT EDIT (read-modify-write, returns ONLY the changed region +/-2 ctx, never the whole blob; target decl|impl, CRLF/LF preserved; refuses graphical impl): replace (find literal substring, replaceWith, expectCount? default 1 — fails without writing on 0 or count mismatch); replace_lines (start, end, text — 1-based inclusive span, OOB throws); insert (exactly one of at|after|before, text); insert_in_var_block (block e.g. VAR_INPUT, text, occurrence? — inserts before that block's END_VAR); append (text — default target impl). All surgical writes accept validate:true to run CheckAllObjects after (default off). " +
       "BUILD-CHECK — check_objects (plcPath?, default first PLC under TIPC) runs CheckAllObjects on the nested IEC project (no download). Mutating batch verbs (create_batch, set_decl_batch, set_impl_batch) accept save:true to save the solution once after the batch.",
     inputSchema: {
       action: z.enum([
         "create", "create_batch", "import_template",
-        "get_decl", "get_impl", "get_document",
+        "get_decl", "get_impl", "get_document", "outline",
         "set_decl", "set_decl_batch", "set_impl", "set_impl_batch", "set_document",
         "check_objects",
+        "replace", "replace_lines", "insert", "insert_in_var_block", "append",
       ]),
       parent: z.string().optional(),
       name: z.string().optional(),
@@ -820,7 +823,7 @@ server.registerTool(
       extends: z.string().optional(),
       implements: z.string().optional(),
       declText: z.string().optional(),
-      before: z.string().optional().describe("insert before this sibling"),
+      before: z.union([z.string(), z.number().int()]).optional().describe("create: sibling name to insert before (string). insert: 1-based line to insert before (int, alias of at)"),
       paths: z.array(z.string()).optional(),
       path: z.string().optional(),
       implText: z.string().optional(),
@@ -845,6 +848,20 @@ server.registerTool(
         implXml: z.string().optional(),
       })).optional(),
       save: z.boolean().optional(),
+      range: z.object({ start: z.number().int(), end: z.number().int() }).optional().describe("get_decl/get_impl: 1-based inclusive line slice; mutually exclusive with grep"),
+      grep: z.object({ pattern: z.string(), context: z.number().int().optional() }).optional().describe("get_decl/get_impl: regex over lines + context each side (default 2); mutually exclusive with range"),
+      target: z.enum(["decl", "impl"]).optional().describe("surgical edit target; default decl (append defaults impl)"),
+      find: z.string().optional().describe("replace: exact literal substring (NOT regex)"),
+      replaceWith: z.string().optional(),
+      expectCount: z.number().int().optional().describe("replace: required occurrence count (default 1)"),
+      start: z.number().int().optional().describe("replace_lines: 1-based inclusive first line"),
+      end: z.number().int().optional().describe("replace_lines: 1-based inclusive last line"),
+      at: z.number().int().optional().describe("insert before this 1-based line (lineCount+1 appends)"),
+      after: z.number().int().optional().describe("insert after this 1-based line"),
+      block: z.string().optional().describe("insert_in_var_block: VAR-block keyword e.g. VAR_INPUT"),
+      occurrence: z.number().int().optional().describe("insert_in_var_block: which matching block (1-based, default 1)"),
+      text: z.string().optional().describe("replacement / insert / append text"),
+      validate: z.boolean().optional().describe("surgical writes: run CheckAllObjects after the edit (default off)"),
     },
   },
   async (p) => {
@@ -864,10 +881,15 @@ server.registerTool(
         return textResult(await bridgeCall("plc_pou_import_template", { parent: p.parent, paths: p.paths, save: p.save === true }));
       case "get_decl":
         need(p, ["path"], p.action);
-        return textResult(await bridgeCall("plc_pou_get_decl", { path: p.path }));
+        if (p.range && p.grep) throw new Error("get_decl: range and grep are mutually exclusive.");
+        return textResult(await bridgeCall("plc_pou_get_decl", { path: p.path, range: p.range, grep: p.grep }));
       case "get_impl":
         need(p, ["path"], p.action);
-        return textResult(await bridgeCall("plc_pou_get_impl", { path: p.path }));
+        if (p.range && p.grep) throw new Error("get_impl: range and grep are mutually exclusive.");
+        return textResult(await bridgeCall("plc_pou_get_impl", { path: p.path, range: p.range, grep: p.grep }));
+      case "outline":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("plc_pou_outline", { path: p.path }));
       case "get_document":
         need(p, ["path"], p.action);
         return textResult(await bridgeCall("plc_pou_get_document", { path: p.path }));
@@ -892,6 +914,39 @@ server.registerTool(
         return textResult(await bridgeCall("plc_pou_set_document", { path: p.path, documentXml: p.documentXml }));
       case "check_objects":
         return textResult(await bridgeCall("plc_pou_check_objects", { plcPath: p.plcPath }));
+      case "replace":
+        need(p, ["path", "find", "replaceWith"], p.action);
+        return textResult(await bridgeCall("plc_pou_replace", {
+          path: p.path, target: p.target, find: p.find, replaceWith: p.replaceWith,
+          expectCount: p.expectCount, validate: p.validate === true, save: p.save === true,
+        }));
+      case "replace_lines":
+        need(p, ["path", "start", "end", "text"], p.action);
+        return textResult(await bridgeCall("plc_pou_replace_lines", {
+          path: p.path, target: p.target, start: p.start, end: p.end, text: p.text,
+          validate: p.validate === true, save: p.save === true,
+        }));
+      case "insert": {
+        need(p, ["path", "text"], p.action);
+        const supplied = [p.at, p.after, p.before].filter((x) => x !== undefined && x !== null).length;
+        if (supplied !== 1) throw new Error("insert requires exactly one of at / after / before.");
+        return textResult(await bridgeCall("plc_pou_insert", {
+          path: p.path, target: p.target, at: p.at, after: p.after, before: p.before, text: p.text,
+          validate: p.validate === true, save: p.save === true,
+        }));
+      }
+      case "insert_in_var_block":
+        need(p, ["path", "block", "text"], p.action);
+        return textResult(await bridgeCall("plc_pou_insert_in_var_block", {
+          path: p.path, target: p.target, block: p.block, text: p.text, occurrence: p.occurrence,
+          validate: p.validate === true, save: p.save === true,
+        }));
+      case "append":
+        need(p, ["path", "text"], p.action);
+        return textResult(await bridgeCall("plc_pou_append", {
+          path: p.path, target: p.target, text: p.text,
+          validate: p.validate === true, save: p.save === true,
+        }));
     }
   },
 );
