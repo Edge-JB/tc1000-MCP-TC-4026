@@ -806,6 +806,8 @@ server.registerTool(
       "READ — get_decl / get_impl / get_document (path). get_decl/get_impl take an optional range {start,end} (1-based inclusive line slice, clamped) OR grep {pattern, context?} (regex over lines + context each side); mutually exclusive; default returns full text. Both always report lineCount; get_impl also returns language (graphical 3-6 -> lineCount:0 + {graphical,hint}). outline (path) returns structure WITHOUT full text: header + varBlocks + child code items. " +
       "WRITE — set_decl / set_decl_batch (path, declText); set_impl / set_impl_batch (path, exactly one of implText|implXml — implXml is TwinCAT object XML, round-trip only, for graphical languages); set_document (path, documentXml). " +
       "SURGICAL TEXT EDIT (read-modify-write, returns ONLY the changed region +/-2 ctx, never the whole blob; target decl|impl, CRLF/LF preserved; refuses graphical impl): replace (find literal substring, replaceWith, expectCount? default 1 — fails without writing on 0 or count mismatch); replace_lines (start, end, text — 1-based inclusive span, OOB throws); insert (exactly one of at|after|before, text); insert_in_var_block (block e.g. VAR_INPUT, text, occurrence? — inserts before that block's END_VAR); append (text — default target impl). All surgical writes accept validate:true to run CheckAllObjects after (default off). " +
+      "DISCOVER — tree (plcPath?, path? subtree root, depth?, typeFilter?) does a read-only recursive Child() walk of the IEC project and returns {plcPath,projectPath,rootPath,count,tree:[{path,name,type,itemType,subType?,childCount,children?,truncated?}]} (type is a normalized label: Program/FB/Function/FunctionBlock/Struct/Enum/Union/Alias/GVL/Interface/Method/Property/Action/Transition/Visualization/ParameterList/UML/Folder/Project/Task/Unknown; depth 1 = direct children only; typeFilter is a comma list of type labels to KEEP, ancestors retained as scaffolding). find (plcPath?, path?, name? substring or /regex/, typeFilter?; at least one of name/typeFilter) returns a FLAT {plcPath,projectPath,count,matches:[{path,name,type,itemType,subType?,childCount}]} so a caller can resolve a ^ path from a name without the whole nested blob. " +
+      "DELETE — delete (path OR parent+name) GUARDED offline delete of one PLC object via parent.DeleteChild; pass dryRun:true to preview {wouldDelete,target} or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete; verifies the child exists first, refuses TISC. " +
       "BUILD-CHECK — check_objects (plcPath?, default first PLC under TIPC) runs CheckAllObjects on the nested IEC project (no download). Mutating batch verbs (create_batch, set_decl_batch, set_impl_batch) accept save:true to save the solution once after the batch.",
     inputSchema: {
       action: z.enum([
@@ -814,6 +816,7 @@ server.registerTool(
         "set_decl", "set_decl_batch", "set_impl", "set_impl_batch", "set_document",
         "check_objects",
         "replace", "replace_lines", "insert", "insert_in_var_block", "append",
+        "tree", "find", "delete",
       ]),
       parent: z.string().optional(),
       name: z.string().optional(),
@@ -862,6 +865,10 @@ server.registerTool(
       occurrence: z.number().int().optional().describe("insert_in_var_block: which matching block (1-based, default 1)"),
       text: z.string().optional().describe("replacement / insert / append text"),
       validate: z.boolean().optional().describe("surgical writes: run CheckAllObjects after the edit (default off)"),
+      depth: z.number().int().positive().optional().describe("tree: max recursion depth (1 = direct children only); default unlimited"),
+      typeFilter: z.string().optional().describe("tree/find: comma list of normalized type labels to keep/match (case-insensitive), e.g. 'FB,Method,Struct'"),
+      dryRun: z.boolean().optional().describe("delete: preview the target without deleting"),
+      confirm: z.string().optional().describe("delete: must equal ALLOW_TWINCAT_DELETE to actually delete"),
     },
   },
   async (p) => {
@@ -947,6 +954,28 @@ server.registerTool(
           path: p.path, target: p.target, text: p.text,
           validate: p.validate === true, save: p.save === true,
         }));
+      case "tree":
+        return textResult(await bridgeCall("plc_pou_tree", {
+          plcPath: p.plcPath, path: p.path, depth: p.depth, typeFilter: p.typeFilter,
+        }));
+      case "find":
+        if ((p.name === undefined || p.name === "") && (p.typeFilter === undefined || p.typeFilter === "")) {
+          throw new Error("find requires at least one of name / typeFilter.");
+        }
+        return textResult(await bridgeCall("plc_pou_find", {
+          plcPath: p.plcPath, path: p.path, name: p.name, typeFilter: p.typeFilter,
+        }));
+      case "delete": {
+        const hasPath = p.path !== undefined && p.path !== "";
+        const hasPair = (p.parent !== undefined && p.parent !== "") && (p.name !== undefined && p.name !== "");
+        if (!hasPath && !hasPair) throw new Error("delete requires either path, or parent and name.");
+        if (p.dryRun !== true && p.confirm !== DELETE_CONFIRMATION) {
+          throw new Error('Blocked. delete removes a PLC object. Re-run with dryRun:true to preview, or confirm="' + DELETE_CONFIRMATION + '" to actually delete.');
+        }
+        return textResult(await bridgeCall("plc_pou_delete", {
+          path: p.path, parent: p.parent, name: p.name, dryRun: p.dryRun === true,
+        }));
+      }
     }
   },
 );

@@ -2025,6 +2025,281 @@ function Refuse-GraphicalText {
     throw "Refused surgical text edit on $($Path): implementation language is $name; ImplementationText is not authoritative for graphical languages. Use set_impl implXml (whole-XML round-trip) instead."
 }
 
+# =====================================================================
+# plc_pou list/find/delete: IEC project tree-walk helpers.
+# Get-PlcObjectTypeName is PURE (int/string in, label out) and unit-testable
+# with no COM. Get-PlcProjectNodePath and Invoke-PlcTreeWalk do touch COM.
+# =====================================================================
+
+function Get-PlcObjectTypeName {
+    # PURE. Map a tree node's identity (ItemType + optional ItemSubType /
+    # ItemSubTypeName / Name) to a normalized type label. No COM. Logic order:
+    #   1. name heuristics for non-IEC scaffolding the walk crosses
+    #   2. ItemType (TwinCAT AI section 16.6)
+    #   3. ItemSubType against the CreateChild sub-types (section 16.5)
+    #   4. fall back to ItemSubTypeName string if present
+    #   5. Unknown
+    param(
+        [AllowNull()]$ItemType,
+        [AllowNull()]$ItemSubType,
+        [AllowNull()][string]$ItemSubTypeName,
+        [AllowNull()][string]$Name,
+        [int]$ChildCount = 0,
+        [bool]$HasDecl = $false
+    )
+    $nm = if ($null -eq $Name) { '' } else { [string]$Name }
+    $it = if ($null -eq $ItemType) { -1 } else { [int]$ItemType }
+    $st = if ($null -eq $ItemSubType) { -1 } else { [int]$ItemSubType }
+
+    # (1) name heuristics for scaffolding nodes the walk crosses.
+    if ($nm -match '\sProject$') { return 'Project' }
+    $folderNames = @('References','POUs','DUTs','GVLs','VISUs','FBs','PRGs')
+    if (($folderNames -contains $nm) -and ($ChildCount -gt 0) -and (-not $HasDecl)) {
+        return 'Folder'
+    }
+
+    # (2) ItemType (section 16.6).
+    switch ($it) {
+        9   { return 'Project' }   # IECPRJ
+        600 { return 'App' }       # PLCAPP
+        621 { return 'Task' }      # PLCTASK
+        8   { return 'Folder' }    # VARGRP
+        default { }
+    }
+
+    # (3) ItemSubType against CreateChild sub-types (section 16.5).
+    switch ($st) {
+        602 { return 'Program' }
+        603 { return 'Function' }
+        604 { return 'FunctionBlock' }
+        605 { return 'Enum' }
+        606 { return 'Struct' }
+        607 { return 'Union' }
+        608 { return 'Action' }
+        609 { return 'Method' }
+        611 { return 'Property' }
+        615 { return 'GVL' }
+        616 { return 'Transition' }
+        618 { return 'Interface' }
+        619 { return 'Visualization' }
+        623 { return 'Alias' }
+        629 { return 'ParameterList' }
+        631 { return 'UML' }
+        default { }
+    }
+
+    # (4) fall back to the ItemSubTypeName string when present.
+    if (-not [string]::IsNullOrWhiteSpace($ItemSubTypeName)) {
+        return ([string]$ItemSubTypeName).Trim()
+    }
+
+    return 'Unknown'
+}
+
+function Get-PlcProjectNodePath {
+    # Resolve the nested IEC PROJECT node path ('<plcPath>^<rootName> Project'
+    # or the right child) using the EXACT candidate-paths probe pattern lifted
+    # from plc_pou_check_objects: Resolve-PlcRootPath for the root, build ordered
+    # candidate ^paths, LookupTreeItem a FRESH RCW per candidate, return the first
+    # that resolves. Returns @{ plcPath; projectPath }. NOT pure (needs SysManager).
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [AllowNull()][string]$PlcPath
+    )
+    $plcPath = Resolve-PlcRootPath -SysManager $SysManager -Path $PlcPath
+    Assert-NotSafetyPath -Path $plcPath
+    $root = (Get-TreeItem -SysManager $SysManager -TreePath $plcPath).Value
+    $rootName = Normalize-ScalarValue (Get-SafeValue { [string]$root.Name })
+
+    $candidatePaths = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace($rootName)) {
+        [void]$candidatePaths.Add("$plcPath^$rootName Project")
+    }
+    $childCount = Get-TreeItemChildCount -TreeItem $root
+    for ($ci = 1; $ci -le $childCount; $ci++) {
+        $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $root -Index $ci).Value })
+        if ($null -ne $childNode) {
+            $cn = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+            if (-not [string]::IsNullOrWhiteSpace($cn)) {
+                $cp = "$plcPath^$cn"
+                if (-not $candidatePaths.Contains($cp)) { [void]$candidatePaths.Add($cp) }
+            }
+        }
+    }
+    if (-not $candidatePaths.Contains($plcPath)) { [void]$candidatePaths.Add($plcPath) }
+
+    $lastErr = $null
+    foreach ($candPath in $candidatePaths) {
+        try {
+            $node = (Get-TreeItem -SysManager $SysManager -TreePath $candPath).Value
+            # Prefer the node whose name ends in ' Project' (the IEC project node);
+            # accept any resolvable node as a fallback for older layouts.
+            $nn = Normalize-ScalarValue (Get-SafeValue { [string]$node.Name })
+            if (($nn -match '\sProject$') -or ($candPath -eq $candidatePaths[$candidatePaths.Count - 1])) {
+                return @{ plcPath = $plcPath; projectPath = $candPath }
+            }
+            # Remember the first resolvable candidate in case none look like a project.
+            if ($null -eq $lastErr) { $firstResolvable = $candPath }
+        } catch {
+            $lastErr = $_.Exception.Message
+        }
+    }
+    if ($firstResolvable) {
+        return @{ plcPath = $plcPath; projectPath = $firstResolvable }
+    }
+    throw "could not resolve the IEC project node under '$plcPath'. Last error: $lastErr"
+}
+
+function Invoke-PlcTreeWalk {
+    # Recursive Child() walker over the IEC project tree. Emits one hashtable per
+    # node: {path,name,type,itemType,subType,childCount,children?,truncated?}.
+    # NO ProduceXml -- POU methods/props/actions/transitions are real Child()
+    # children. Pruning by TypeFilter / flat-vs-nested are post-processing passes
+    # on the nested result (see the dispatch verbs), so this walk feeds both
+    # tree and find. Depth 1 = direct children only; MaxDepth 0 = unlimited.
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)]$Node,
+        [Parameter(Mandatory = $true)][string]$BasePath,
+        [int]$Depth = 1,
+        [int]$MaxDepth = 0
+    )
+    $info = Convert-TreeItem -TreeItem $Node
+    $subTypeName = Normalize-ScalarValue (Get-SafeValue { [string]$Node.ItemSubTypeName })
+    $childCount = [int]$info.childCount
+    $type = Get-PlcObjectTypeName -ItemType $info.itemType -ItemSubType $info.subType `
+        -ItemSubTypeName $subTypeName -Name $info.name -ChildCount $childCount
+
+    $node = @{
+        path = $BasePath
+        name = $info.name
+        type = $type
+        itemType = $info.itemType
+        subType = $info.subType
+        childCount = $childCount
+    }
+    if (-not [string]::IsNullOrWhiteSpace($subTypeName)) { $node.subTypeName = $subTypeName }
+
+    if ($childCount -gt 0) {
+        if (($MaxDepth -gt 0) -and ($Depth -ge $MaxDepth)) {
+            # Stopped by depth but children remain.
+            $node.truncated = $true
+        } else {
+            $children = @()
+            for ($i = 1; $i -le $childCount; $i++) {
+                $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $Node -Index $i).Value })
+                if ($null -eq $childNode) { continue }
+                $childName = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+                if ([string]::IsNullOrWhiteSpace($childName)) { continue }
+                $childPath = "$BasePath^$childName"
+                $children += Invoke-PlcTreeWalk -SysManager $SysManager -Node $childNode `
+                    -BasePath $childPath -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            }
+            if (@($children).Count -gt 0) { $node.children = @($children) }
+        }
+    }
+    return $node
+}
+
+function ConvertTo-NormalizedTypeSet {
+    # PURE. Parse a 'FB,Method,Struct' comma list into a lower-cased hashset for
+    # case-insensitive membership tests. Returns $null when no filter supplied.
+    param([AllowNull()][string]$TypeFilter)
+    if ([string]::IsNullOrWhiteSpace($TypeFilter)) { return $null }
+    $set = @{}
+    foreach ($t in ($TypeFilter -split ',')) {
+        $tt = $t.Trim().ToLowerInvariant()
+        if ($tt -ne '') { $set[$tt] = $true }
+    }
+    if ($set.Count -eq 0) { return $null }
+    return $set
+}
+
+function Test-NodeNameMatch {
+    # PURE. Match a node name against a substring or /regex/ pattern (case-insensitive).
+    param([AllowNull()][string]$Name, [AllowNull()][string]$Pattern)
+    if ([string]::IsNullOrWhiteSpace($Pattern)) { return $true }
+    $nm = if ($null -eq $Name) { '' } else { [string]$Name }
+    if ($Pattern.Length -ge 2 -and $Pattern.StartsWith('/') -and $Pattern.EndsWith('/')) {
+        $rx = $Pattern.Substring(1, $Pattern.Length - 2)
+        try {
+            return [System.Text.RegularExpressions.Regex]::IsMatch($nm, $rx, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        } catch {
+            throw "invalid name regex: $($_.Exception.Message)"
+        }
+    }
+    return ($nm.ToLowerInvariant().Contains($Pattern.ToLowerInvariant()))
+}
+
+function Select-FlatTreeMatches {
+    # PURE. Flatten the nested walk result and keep nodes matching name and/or
+    # typeFilter. Returns a flat array of {path,name,type,itemType,subType,
+    # subTypeName?,childCount} (no children key). At least one of name/typeSet
+    # is expected (enforced by the caller). $TypeSet is a hashtable or $null.
+    param(
+        [AllowNull()]$NestedRoot,
+        [AllowNull()][string]$NamePattern,
+        [AllowNull()]$TypeSet
+    )
+    $out = @()
+    if ($null -eq $NestedRoot) { return @($out) }
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($NestedRoot)
+    while ($stack.Count -gt 0) {
+        $n = $stack.Pop()
+        $nameOk = Test-NodeNameMatch -Name $n.name -Pattern $NamePattern
+        $typeOk = $true
+        if ($null -ne $TypeSet) {
+            $typeOk = $TypeSet.ContainsKey(([string]$n.type).ToLowerInvariant())
+        }
+        if ($nameOk -and $typeOk) {
+            $flat = @{
+                path = $n.path; name = $n.name; type = $n.type
+                itemType = $n.itemType; subType = $n.subType; childCount = $n.childCount
+            }
+            if ($n.ContainsKey('subTypeName')) { $flat.subTypeName = $n.subTypeName }
+            $out += $flat
+        }
+        if ($n.ContainsKey('children') -and $null -ne $n.children) {
+            foreach ($c in @($n.children)) { $stack.Push($c) }
+        }
+    }
+    return @($out)
+}
+
+function Select-PrunedTree {
+    # PURE. Filter the nested tree by a normalized type set, KEEPING ancestor
+    # nodes of any kept node so the tree stays connected (scaffolding retained).
+    # Returns the pruned node (with rebuilt children) or $null if nothing under
+    # it (including itself) matched. $TypeSet is a hashtable (non-null caller).
+    param([AllowNull()]$Node, [Parameter(Mandatory = $true)]$TypeSet)
+    if ($null -eq $Node) { return $null }
+    $selfKept = $TypeSet.ContainsKey(([string]$Node.type).ToLowerInvariant())
+    $keptChildren = @()
+    if ($Node.ContainsKey('children') -and $null -ne $Node.children) {
+        foreach ($c in @($Node.children)) {
+            $pc = Select-PrunedTree -Node $c -TypeSet $TypeSet
+            if ($null -ne $pc) { $keptChildren += $pc }
+        }
+    }
+    if ((-not $selfKept) -and (@($keptChildren).Count -eq 0)) { return $null }
+    $copy = @{}
+    foreach ($k in $Node.Keys) { if ($k -ne 'children') { $copy[$k] = $Node[$k] } }
+    if (@($keptChildren).Count -gt 0) { $copy.children = @($keptChildren) }
+    return $copy
+}
+
+function Measure-TreeNodeCount {
+    # PURE. Count total emitted nodes in a nested tree (for the 'count' field).
+    param([AllowNull()]$Node)
+    if ($null -eq $Node) { return 0 }
+    $n = 1
+    if ($Node.ContainsKey('children') -and $null -ne $Node.children) {
+        foreach ($c in @($Node.children)) { $n += Measure-TreeNodeCount -Node $c }
+    }
+    return $n
+}
+
 function Invoke-PlcTextRMW {
     # THE read-modify-write wrapper. ALL COM lives here; the $Mutator is pure
     # string logic (param($text,$eol,$lines) -> new text string).
@@ -6063,6 +6338,152 @@ try {
                     plcPath = $plcPath
                     instancePath = $instancePath
                     allObjectsValid = [bool]$valid
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_tree' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcProjectNodePath -SysManager $sysManager -PlcPath ([string]$payload.plcPath)
+            $plcPath = $resolved.plcPath
+            $projectPath = $resolved.projectPath
+
+            # Optional subtree root: must be inside the resolved PLC project; TISC rejected.
+            $startPath = if (-not [string]::IsNullOrWhiteSpace([string]$payload.path)) { [string]$payload.path } else { $projectPath }
+            Assert-NotSafetyPath -Path $startPath
+
+            $maxDepth = 0
+            if ($payload.PSObject.Properties.Name -contains 'depth' -and $null -ne $payload.depth) {
+                $maxDepth = [int]$payload.depth
+                if ($maxDepth -lt 1) { $maxDepth = 1 }
+            }
+
+            $startNode = (Get-TreeItem -SysManager $sysManager -TreePath $startPath).Value
+            $root = Invoke-PlcTreeWalk -SysManager $sysManager -Node $startNode -BasePath $startPath -Depth 1 -MaxDepth $maxDepth
+
+            $typeSet = ConvertTo-NormalizedTypeSet -TypeFilter ([string]$payload.typeFilter)
+            if ($null -ne $typeSet) {
+                $root = Select-PrunedTree -Node $root -TypeSet $typeSet
+            }
+
+            $treeArr = if ($null -eq $root) { @() } else { @($root) }
+            $count = 0
+            foreach ($t in $treeArr) { $count += Measure-TreeNodeCount -Node $t }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    plcPath = $plcPath
+                    projectPath = $projectPath
+                    rootPath = $startPath
+                    count = $count
+                    tree = @($treeArr)
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_find' {
+            $namePattern = [string]$payload.name
+            $typeFilter = [string]$payload.typeFilter
+            if ([string]::IsNullOrWhiteSpace($namePattern) -and [string]::IsNullOrWhiteSpace($typeFilter)) {
+                throw 'find requires at least one of name / typeFilter'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcProjectNodePath -SysManager $sysManager -PlcPath ([string]$payload.plcPath)
+            $plcPath = $resolved.plcPath
+            $projectPath = $resolved.projectPath
+
+            $startPath = if (-not [string]::IsNullOrWhiteSpace([string]$payload.path)) { [string]$payload.path } else { $projectPath }
+            Assert-NotSafetyPath -Path $startPath
+
+            $startNode = (Get-TreeItem -SysManager $sysManager -TreePath $startPath).Value
+            $root = Invoke-PlcTreeWalk -SysManager $sysManager -Node $startNode -BasePath $startPath -Depth 1 -MaxDepth 0
+
+            $typeSet = ConvertTo-NormalizedTypeSet -TypeFilter $typeFilter
+            $matches = Select-FlatTreeMatches -NestedRoot $root -NamePattern $namePattern -TypeSet $typeSet
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    plcPath = $plcPath
+                    projectPath = $projectPath
+                    count = @($matches).Count
+                    matches = @($matches)
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_delete' {
+            # Resolve parent + child name from either 'path' or 'parent'+'name'.
+            $parentPath = [string]$payload.parent
+            $childName = [string]$payload.name
+            if (-not [string]::IsNullOrWhiteSpace([string]$payload.path) -and ([string]::IsNullOrWhiteSpace($parentPath) -or [string]::IsNullOrWhiteSpace($childName))) {
+                $full = [string]$payload.path
+                $idx = $full.LastIndexOf('^')
+                if ($idx -lt 1) { throw "path '$full' has no parent segment (expected a '^'-separated path)" }
+                $parentPath = $full.Substring(0, $idx)
+                $childName = $full.Substring($idx + 1)
+            }
+            if ([string]::IsNullOrWhiteSpace($parentPath) -or [string]::IsNullOrWhiteSpace($childName)) {
+                throw 'delete requires either path, or parent and name'
+            }
+            Assert-NotSafetyPath -Path $parentPath
+
+            $dryRun = $false
+            if ($payload.PSObject.Properties.Name -contains 'dryRun') { $dryRun = [bool]$payload.dryRun }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $parent = (Get-TreeItem -SysManager $sysManager -TreePath $parentPath).Value
+
+            # Verify the child exists before deleting (scan parent children by name).
+            $childItem = $null
+            $childCount = Get-TreeItemChildCount -TreeItem $parent
+            for ($i = 1; $i -le $childCount; $i++) {
+                $c = (Get-SafeValue { (Get-TreeItemChild -TreeItem $parent -Index $i).Value })
+                if ($null -eq $c) { continue }
+                $cn = Normalize-ScalarValue (Get-SafeValue { [string]$c.Name })
+                if ($cn -eq $childName) { $childItem = $c; break }
+            }
+            if ($null -eq $childItem) {
+                throw "child '$childName' not found under '$parentPath' (nothing deleted)"
+            }
+
+            $cInfo = Convert-TreeItem -TreeItem $childItem
+            $cSubTypeName = Normalize-ScalarValue (Get-SafeValue { [string]$childItem.ItemSubTypeName })
+            $cType = Get-PlcObjectTypeName -ItemType $cInfo.itemType -ItemSubType $cInfo.subType `
+                -ItemSubTypeName $cSubTypeName -Name $cInfo.name -ChildCount ([int]$cInfo.childCount)
+
+            if ($dryRun) {
+                Write-JsonResult @{
+                    ok = $true
+                    data = @{
+                        wouldDelete = $true
+                        target = @{
+                            path = "$parentPath^$childName"
+                            name = $childName
+                            type = $cType
+                            childCount = [int]$cInfo.childCount
+                        }
+                    }
+                }
+                exit 0
+            }
+
+            $parent.DeleteChild($childName)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parent = $parentPath
+                    name = $childName
+                    deleted = $true
+                    type = $cType
                 }
             }
             exit 0
