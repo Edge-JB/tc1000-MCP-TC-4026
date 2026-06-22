@@ -849,6 +849,179 @@ public static class Te1000PlcProjectHelper {
     return $null -ne ('Te1000PlcProjectHelper' -as [type])
 }
 
+function Ensure-TcPlcPouHelper {
+    # ITcPlcPou / ITcPlcDeclaration / ITcPlcImplementation / ITcPlcIECProject2 are
+    # vtable (IUnknown) interfaces; PowerShell cannot QI a __ComObject to them
+    # ([Interface]$obj is not a CLR QI in PS), so the declaration/implementation/
+    # document accessors are done in a compiled C# helper, exactly as
+    # Te1000PlcProjectHelper does for ITcPlcProject. Requires TCatSysManagerLib.dll
+    # and the interfaces registered in the 64-bit registry view for marshaling.
+    if ('Te1000PlcPouHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
+public static class Te1000PlcPouHelper {
+    public static string GetDeclaration(object o) {
+        return ((ITcPlcDeclaration)o).DeclarationText;
+    }
+    public static void SetDeclaration(object o, string s) {
+        ((ITcPlcDeclaration)o).DeclarationText = s;
+    }
+    public static string GetImplementation(object o) {
+        return ((ITcPlcImplementation)o).ImplementationText;
+    }
+    public static int GetImplementationLanguage(object o) {
+        return (int)((ITcPlcImplementation)o).Language;
+    }
+    public static void SetImplementationText(object o, string s) {
+        ((ITcPlcImplementation)o).ImplementationText = s;
+    }
+    public static void SetImplementationXml(object o, string s) {
+        ((ITcPlcImplementation)o).ImplementationXml = s;
+    }
+    public static string GetImplementationXml(object o) {
+        return ((ITcPlcImplementation)o).ImplementationXml;
+    }
+    public static string GetDocumentXml(object o) {
+        return ((ITcPlcPou)o).DocumentXml;
+    }
+    public static void SetDocumentXml(object o, string s) {
+        ((ITcPlcPou)o).DocumentXml = s;
+    }
+    public static bool CheckAllObjects(object o) {
+        return ((ITcPlcIECProject2)o).CheckAllObjects();
+    }
+}
+'@
+    return $null -ne ('Te1000PlcPouHelper' -as [type])
+}
+
+function Assert-NotSafetyPath {
+    # Project policy: nothing in this toolchain may write toward the EL6910 safety
+    # system. The safety project lives under the TISC root, so reject any parent /
+    # target tree path that addresses it so plc_pou can never author safety objects.
+    param([Parameter(Mandatory = $true)][AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    if ($Path -match '^\s*TISC(\^|$)') {
+        throw "Refused: '$Path' targets the TISC safety project. plc_pou must not author toward the safety system (project policy: nothing writes toward safety)."
+    }
+}
+
+function New-PlcPouVInfo {
+    # Build the VARIANT vInfo argument for ITcSmTreeItem.CreateChild per PLC sub-type
+    # (infosys 242732427). Multi-element cases MUST be a typed [object[]] / [string[]]
+    # so PowerShell marshals a SAFEARRAY-of-VARIANT (not a flattened pipeline).
+    #   603 Function / 611 Property => [object[]]{ langInt, returnType }   (returnType mandatory)
+    #   604 FunctionBlock / 602 Program => [object[]]{ langInt [,'Extends',ext][,'Implements',impl] }
+    #   608 Action / 609 Method / 616 Transition => [object[]]{ langInt }
+    #   618 Interface => extends string or $null (vInfo[0] = extend type)
+    #   605/606/607/615/623/629 (DUT/GVL/Alias/ParamList) => declText or $null
+    #   619 Visualization / 631 UML => $null
+    param(
+        [Parameter(Mandatory = $true)][int]$SubType,
+        [int]$Language = 1,
+        [AllowNull()][string]$ReturnType,
+        [AllowNull()][string]$Extends,
+        [AllowNull()][string]$Implements,
+        [AllowNull()][string]$DeclText
+    )
+
+    switch ($SubType) {
+        603 {
+            if ([string]::IsNullOrWhiteSpace($ReturnType)) {
+                throw 'returnType is required for Function (subType 603)'
+            }
+            Write-Output -NoEnumerate ([object[]]@($Language, [string]$ReturnType))
+            return
+        }
+        611 {
+            if ([string]::IsNullOrWhiteSpace($ReturnType)) {
+                throw 'returnType is required for Property (subType 611)'
+            }
+            Write-Output -NoEnumerate ([object[]]@($Language, [string]$ReturnType))
+            return
+        }
+        { $_ -eq 604 -or $_ -eq 602 } {
+            $info = New-Object System.Collections.Generic.List[object]
+            $info.Add($Language)
+            if (-not [string]::IsNullOrWhiteSpace($Extends)) {
+                $info.Add('Extends'); $info.Add([string]$Extends)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($Implements)) {
+                $info.Add('Implements'); $info.Add([string]$Implements)
+            }
+            Write-Output -NoEnumerate ([object[]]$info.ToArray())
+            return
+        }
+        { $_ -eq 608 -or $_ -eq 609 -or $_ -eq 616 } {
+            Write-Output -NoEnumerate ([object[]]@($Language))
+            return
+        }
+        618 {
+            if ([string]::IsNullOrWhiteSpace($Extends)) {
+                Write-Output -NoEnumerate $null
+            } else {
+                Write-Output -NoEnumerate ([string]$Extends)
+            }
+            return
+        }
+        { $_ -eq 605 -or $_ -eq 606 -or $_ -eq 607 -or $_ -eq 615 -or $_ -eq 623 -or $_ -eq 629 } {
+            if ([string]::IsNullOrWhiteSpace($DeclText)) {
+                Write-Output -NoEnumerate $null
+            } else {
+                Write-Output -NoEnumerate ([string]$DeclText)
+            }
+            return
+        }
+        default {
+            # 619 Visualization / 631 UML and any other code-less type: null vInfo.
+            Write-Output -NoEnumerate $null
+            return
+        }
+    }
+}
+
+function Invoke-PlcPouCreate {
+    # Shared CreateChild path used by both plc_pou_create and the batch verb.
+    # $Entry is a payload-shaped object with parent/name/subType[/language/returnType/extends/implements/declText/before].
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)]$Entry
+    )
+
+    $parent = [string]$Entry.parent
+    $name = [string]$Entry.name
+    if ([string]::IsNullOrWhiteSpace($parent)) { throw 'parent is required' }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+    if ($null -eq $Entry.subType) { throw 'subType is required' }
+    $subType = [int]$Entry.subType
+    Assert-NotSafetyPath -Path $parent
+
+    $language = 1
+    if ($null -ne $Entry.language) { $language = [int]$Entry.language }
+    $returnType = if ($null -ne $Entry.returnType) { [string]$Entry.returnType } else { $null }
+    $extends = if ($null -ne $Entry.extends) { [string]$Entry.extends } else { $null }
+    $implements = if ($null -ne $Entry.implements) { [string]$Entry.implements } else { $null }
+    $declText = if ($null -ne $Entry.declText) { [string]$Entry.declText } else { $null }
+    $before = if ($Entry.before) { [string]$Entry.before } else { '' }
+
+    $parentItem = (Get-TreeItem -SysManager $SysManager -TreePath $parent).Value
+    $vInfo = New-PlcPouVInfo -SubType $subType -Language $language -ReturnType $returnType -Extends $extends -Implements $implements -DeclText $declText
+
+    $child = $parentItem.CreateChild($name, $subType, $before, $vInfo)
+    Assert-WellFormedChild -Parent $parentItem -Child $child -RequestedName $name -SubType $subType -ParentPath $parent
+    return $child
+}
+
 function Expand-UIHierarchyChildren {
     param($Item)
 
@@ -3947,6 +4120,412 @@ try {
                     treePath = $treePath
                     file = $file
                     installed = $install
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_create' {
+            # Offline engineering edit: CreateChild a PLC object (POU/DUT/GVL/etc).
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $child = Invoke-PlcPouCreate -SysManager $sysManager -Entry $payload
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = [string]$payload.parent
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_create_batch' {
+            $creates = $payload.creates
+            if ($null -eq $creates -or @($creates).Count -lt 1) {
+                throw 'creates must be a non-empty array'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+            foreach ($entry in @($creates)) {
+                $p = if ($entry.parent) { [string]$entry.parent } else { '' }
+                $n = if ($entry.name) { [string]$entry.name } else { '' }
+                try {
+                    $child = Invoke-PlcPouCreate -SysManager $sysManager -Entry $entry
+                    $results += @{ parent = $p; name = $n; ok = $true; child = Convert-TreeItem -TreeItem $child }
+                    $succeeded++
+                } catch {
+                    $results += @{ parent = $p; name = $n; ok = $false; error = $_.Exception.Message }
+                    $failed++
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($creates).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_import_template' {
+            $parent = [string]$payload.parent
+            if ([string]::IsNullOrWhiteSpace($parent)) {
+                throw 'parent is required'
+            }
+            Assert-NotSafetyPath -Path $parent
+            $paths = @($payload.paths) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ }
+            if ($null -eq $paths -or @($paths).Count -lt 1) {
+                throw 'paths must be a non-empty array of POU-template file paths'
+            }
+            foreach ($pth in $paths) {
+                if (-not (Test-Path -LiteralPath $pth)) {
+                    throw "POU template file not found: $pth"
+                }
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $parentItem = (Get-TreeItem -SysManager $sysManager -TreePath $parent).Value
+
+            # Snapshot existing child names so we can report only the newly imported objects.
+            $before = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+            $countBefore = Get-TreeItemChildCount -TreeItem $parentItem
+            for ($i = 1; $i -le $countBefore; $i++) {
+                $c = (Get-TreeItemChild -TreeItem $parentItem -Index $i).Value
+                $cn = Normalize-ScalarValue (Get-SafeValue { [string]$c.Name })
+                if (-not [string]::IsNullOrWhiteSpace($cn)) { [void]$before.Add($cn) }
+            }
+
+            # subType 58 = POU template import; vInfo = single path string or [string[]].
+            $vInfo = if (@($paths).Count -eq 1) { [string]$paths[0] } else { [string[]]$paths }
+            $null = $parentItem.CreateChild($null, 58, '', $vInfo)
+
+            $imported = @()
+            $countAfter = Get-TreeItemChildCount -TreeItem $parentItem
+            for ($i = 1; $i -le $countAfter; $i++) {
+                $c = (Get-TreeItemChild -TreeItem $parentItem -Index $i).Value
+                $cn = Normalize-ScalarValue (Get-SafeValue { [string]$c.Name })
+                if (-not [string]::IsNullOrWhiteSpace($cn) -and -not $before.Contains($cn)) {
+                    $imported += $cn
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parent = $parent
+                    imported = @($imported)
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_get_decl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $declText = [Te1000PlcPouHelper]::GetDeclaration($item)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    declText = $declText
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_get_impl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $implText = [Te1000PlcPouHelper]::GetImplementation($item)
+            $language = $null
+            try { $language = [Te1000PlcPouHelper]::GetImplementationLanguage($item) } catch { }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    language = $language
+                    implText = $implText
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_get_document' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $documentXml = [Te1000PlcPouHelper]::GetDocumentXml($item)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    xml = $documentXml
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_decl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.declText) { throw 'declText is required' }
+            Assert-NotSafetyPath -Path $path
+            $declText = [string]$payload.declText
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            [Te1000PlcPouHelper]::SetDeclaration($item, $declText)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    set = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_decl_batch' {
+            $items = $payload.items
+            if ($null -eq $items -or @($items).Count -lt 1) {
+                throw 'items must be a non-empty array'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+            foreach ($entry in @($items)) {
+                $p = if ($entry.path) { [string]$entry.path } else { '' }
+                try {
+                    if ([string]::IsNullOrWhiteSpace($p)) { throw 'path is required' }
+                    if ($null -eq $entry.declText) { throw 'declText is required' }
+                    Assert-NotSafetyPath -Path $p
+                    $item = (Get-TreeItem -SysManager $sysManager -TreePath $p).Value
+                    [Te1000PlcPouHelper]::SetDeclaration($item, [string]$entry.declText)
+                    $results += @{ path = $p; ok = $true }
+                    $succeeded++
+                } catch {
+                    $results += @{ path = $p; ok = $false; error = $_.Exception.Message }
+                    $failed++
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($items).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_impl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            Assert-NotSafetyPath -Path $path
+            $hasText = $null -ne $payload.implText
+            $hasXml = $null -ne $payload.implXml
+            if (($hasText -and $hasXml) -or (-not $hasText -and -not $hasXml)) {
+                throw 'exactly one of implText / implXml is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $via = if ($hasText) { 'text' } else { 'xml' }
+            if ($hasText) {
+                [Te1000PlcPouHelper]::SetImplementationText($item, [string]$payload.implText)
+            } else {
+                [Te1000PlcPouHelper]::SetImplementationXml($item, [string]$payload.implXml)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    set = $true
+                    via = $via
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_impl_batch' {
+            $items = $payload.items
+            if ($null -eq $items -or @($items).Count -lt 1) {
+                throw 'items must be a non-empty array'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+            foreach ($entry in @($items)) {
+                $p = if ($entry.path) { [string]$entry.path } else { '' }
+                try {
+                    if ([string]::IsNullOrWhiteSpace($p)) { throw 'path is required' }
+                    $hasText = $null -ne $entry.implText
+                    $hasXml = $null -ne $entry.implXml
+                    if (($hasText -and $hasXml) -or (-not $hasText -and -not $hasXml)) {
+                        throw 'exactly one of implText / implXml is required'
+                    }
+                    Assert-NotSafetyPath -Path $p
+                    $item = (Get-TreeItem -SysManager $sysManager -TreePath $p).Value
+                    if ($hasText) {
+                        [Te1000PlcPouHelper]::SetImplementationText($item, [string]$entry.implText)
+                        $results += @{ path = $p; ok = $true; via = 'text' }
+                    } else {
+                        [Te1000PlcPouHelper]::SetImplementationXml($item, [string]$entry.implXml)
+                        $results += @{ path = $p; ok = $true; via = 'xml' }
+                    }
+                    $succeeded++
+                } catch {
+                    $results += @{ path = $p; ok = $false; error = $_.Exception.Message }
+                    $failed++
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($items).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_document' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.documentXml) { throw 'documentXml is required' }
+            Assert-NotSafetyPath -Path $path
+            $documentXml = [string]$payload.documentXml
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            [Te1000PlcPouHelper]::SetDocumentXml($item, $documentXml)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    set = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_check_objects' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $plcPath = [string]$payload.plcPath
+            if ([string]::IsNullOrWhiteSpace($plcPath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $plcPath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $root = (Get-TreeItem -SysManager $sysManager -TreePath $plcPath).Value
+            # The nested IEC project (project instance node) is the first child of the
+            # PLC root and is what implements ITcPlcIECProject2 / CheckAllObjects.
+            $node = $root
+            $instancePath = $plcPath
+            if ((Get-TreeItemChildCount -TreeItem $root) -ge 1) {
+                $childNode = (Get-TreeItemChild -TreeItem $root -Index 1).Value
+                if ($null -ne $childNode) {
+                    $node = $childNode
+                    $cn = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+                    if (-not [string]::IsNullOrWhiteSpace($cn)) { $instancePath = "$plcPath^$cn" }
+                }
+            }
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $valid = $null
+            try {
+                $valid = [Te1000PlcPouHelper]::CheckAllObjects($node)
+            } catch {
+                throw "node '$instancePath' does not implement ITcPlcIECProject2 (expected the nested IEC project instance under '$plcPath'): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    plcPath = $plcPath
+                    instancePath = $instancePath
+                    allObjectsValid = [bool]$valid
                 }
             }
             exit 0

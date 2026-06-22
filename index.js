@@ -681,6 +681,106 @@ server.registerTool(
 );
 
 server.registerTool(
+  "plc_pou",
+  {
+    description:
+      "PLC object authoring + code edit on the open solution (OFFLINE engineering only — no activate/download/online; edits land in-memory and reach the cell only via a later guarded plc_download + twincat_restart_runtime). Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy. " +
+      "CREATE — create / create_batch (parent, name, subType, language?, returnType?, extends?, implements?, declText?, before?): CreateChild sub-types 602 Program, 603 Function (returnType required), 604 FunctionBlock, 605 Enum, 606 Struct, 607 Union, 608 Action, 609 Method, 611 Property (returnType required), 615 GVL, 616 Transition, 618 Interface, 619 Visualization, 623 Alias, 629 ParameterList, 631 UML. language IECLANGUAGETYPES 0 NONE/1 ST/2 IL/3 SFC/4 FBD/5 CFC/6 LD (default 1). extends/implements for FB 604 / Program 602 derivation (618 uses extends as its base); declText seeds DUT/GVL decl. For code POUs prefer set_decl after create. " +
+      "TEMPLATE — import_template (parent, paths[]) imports POU template file(s) (CreateChild sub-type 58). " +
+      "READ — get_decl / get_impl / get_document (path). WRITE — set_decl / set_decl_batch (path, declText); set_impl / set_impl_batch (path, exactly one of implText|implXml — implXml is TwinCAT object XML, round-trip only, for graphical languages); set_document (path, documentXml). " +
+      "BUILD-CHECK — check_objects (plcPath?, default first PLC under TIPC) runs CheckAllObjects on the nested IEC project (no download). Mutating batch verbs (create_batch, set_decl_batch, set_impl_batch) accept save:true to save the solution once after the batch.",
+    inputSchema: {
+      action: z.enum([
+        "create", "create_batch", "import_template",
+        "get_decl", "get_impl", "get_document",
+        "set_decl", "set_decl_batch", "set_impl", "set_impl_batch", "set_document",
+        "check_objects",
+      ]),
+      parent: z.string().optional(),
+      name: z.string().optional(),
+      subType: z.number().int().optional(),
+      language: z.number().int().min(0).max(6).optional(),
+      returnType: z.string().optional(),
+      extends: z.string().optional(),
+      implements: z.string().optional(),
+      declText: z.string().optional(),
+      before: z.string().optional().describe("insert before this sibling"),
+      paths: z.array(z.string()).optional(),
+      path: z.string().optional(),
+      implText: z.string().optional(),
+      implXml: z.string().optional(),
+      documentXml: z.string().optional(),
+      plcPath: z.string().optional(),
+      creates: z.array(z.object({
+        parent: z.string(),
+        name: z.string(),
+        subType: z.number().int(),
+        language: z.number().int().min(0).max(6).optional(),
+        returnType: z.string().optional(),
+        extends: z.string().optional(),
+        implements: z.string().optional(),
+        declText: z.string().optional(),
+        before: z.string().optional(),
+      })).optional(),
+      items: z.array(z.object({
+        path: z.string(),
+        declText: z.string().optional(),
+        implText: z.string().optional(),
+        implXml: z.string().optional(),
+      })).optional(),
+      save: z.boolean().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "create":
+        need(p, ["parent", "name", "subType"], p.action);
+        return textResult(await bridgeCall("plc_pou_create", {
+          parent: p.parent, name: p.name, subType: p.subType, language: p.language,
+          returnType: p.returnType, extends: p.extends, implements: p.implements,
+          declText: p.declText, before: p.before,
+        }));
+      case "create_batch":
+        need(p, ["creates"], p.action);
+        return textResult(await bridgeCall("plc_pou_create_batch", { creates: p.creates, save: p.save === true }));
+      case "import_template":
+        need(p, ["parent", "paths"], p.action);
+        return textResult(await bridgeCall("plc_pou_import_template", { parent: p.parent, paths: p.paths, save: p.save === true }));
+      case "get_decl":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("plc_pou_get_decl", { path: p.path }));
+      case "get_impl":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("plc_pou_get_impl", { path: p.path }));
+      case "get_document":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("plc_pou_get_document", { path: p.path }));
+      case "set_decl":
+        need(p, ["path", "declText"], p.action);
+        return textResult(await bridgeCall("plc_pou_set_decl", { path: p.path, declText: p.declText }));
+      case "set_decl_batch":
+        need(p, ["items"], p.action);
+        return textResult(await bridgeCall("plc_pou_set_decl_batch", { items: p.items, save: p.save === true }));
+      case "set_impl": {
+        need(p, ["path"], p.action);
+        const hasText = p.implText !== undefined;
+        const hasXml = p.implXml !== undefined;
+        if (hasText === hasXml) throw new Error("set_impl requires exactly one of implText / implXml.");
+        return textResult(await bridgeCall("plc_pou_set_impl", { path: p.path, implText: p.implText, implXml: p.implXml }));
+      }
+      case "set_impl_batch":
+        need(p, ["items"], p.action);
+        return textResult(await bridgeCall("plc_pou_set_impl_batch", { items: p.items, save: p.save === true }));
+      case "set_document":
+        need(p, ["path", "documentXml"], p.action);
+        return textResult(await bridgeCall("plc_pou_set_document", { path: p.path, documentXml: p.documentXml }));
+      case "check_objects":
+        return textResult(await bridgeCall("plc_pou_check_objects", { plcPath: p.plcPath }));
+    }
+  },
+);
+
+server.registerTool(
   "twincat_activate_configuration",
   {
     description: `Activate the TwinCAT configuration on the target. Guarded: confirm="${ACTIVATE_CONFIRMATION}".`,
