@@ -27,6 +27,7 @@ const PLC_LIBRARY_REPO_CONFIRMATION = "ALLOW_PLC_LIBRARY_REPO";
 const ROUTE_WRITE_CONFIRMATION = "ALLOW_TWINCAT_ROUTE_WRITE";
 const MODULE_CONTEXT_CONFIRMATION = "ALLOW_TWINCAT_MODULE_CONTEXT";
 const CPP_PUBLISH_CONFIRMATION = "ALLOW_CPP_PUBLISH";
+const MEASUREMENT_RECORD_CONFIRMATION = "ALLOW_MEASUREMENT_RECORD";
 
 // --- Modal-dialog watchdog -------------------------------------------------
 // A bridge COM call into XAE blocks until any modal dialog it raises is
@@ -1338,6 +1339,97 @@ server.registerTool(
           throw new Error('Blocked. publish builds the C++ module for ALL platforms and exports deployable driver artifacts. Re-run with confirm="' + CPP_PUBLISH_CONFIRMATION + '" to proceed.');
         }
         return textResult(await bridgeCall("twincat_cpp_publish", { projectPath: p.projectPath, confirm: p.confirm }));
+    }
+  },
+);
+
+server.registerTool(
+  "tc_measurement",
+  {
+    description:
+      "Measurement (TE130X Scope View) projects + TwinCAT Analytics (TIAN) logger/stream config. Scope/Analytics PROJECTS are separate EnvDTE.Project nodes (AddFromTemplate), NOT System Manager tree nodes; TIAN logger/stream nodes ARE System Manager children (CreateChild/DeleteChild under TIAN). Requires the respective products installed (TwinCAT.Measurement.AutomationInterface.dll + templates for scope, Analytics templates for analytics) — if absent the action fails with a clear 'tooling not installed' message rather than a raw COM HRESULT. " +
+      "IMeasurementScope is a vtable interface reached via a compiled C# QI shim (a PowerShell cast cannot QI it). Actions: " +
+      "scope_create (name, template? = full .tcmproj path [default: first installed under TE130X-Scope-View\\Templates\\Projects], destination? = folder [default: solution dir]) — AddFromTemplate a new Scope project; " +
+      "scope_add_child (project, parentPath? = ^-path of names from scope root, name?, elementType? default 0) — CreateChild(out item,name,elementType); only elementType 0 is VERIFIED, non-zero values are EXPERIMENTAL; deep parentPath resolves by enumerating existing children by name; " +
+      "scope_rename (project, path, newName) — ChangeName on the element at path; " +
+      "scope_record (project, state 'start'|'stop') — StartRecord/StopRecord; GUARDED: state='start' performs LIVE data acquisition and requires confirm=\"" + MEASUREMENT_RECORD_CONFIRMATION + "\" (state='stop' needs no confirm); " +
+      "analytics_create (name, template? = full Analytics project template path [must resolve or pass explicitly], destination? = folder) — AddFromTemplate a new Analytics project (project creation ONLY; network/function wiring is UNVERIFIED and not implemented); " +
+      "logger_create (name, before?) — CreateChild a DataLogger (subType 1) under TIAN (config edit, no confirm); " +
+      "logger_delete (name, dryRun?, confirm) — DeleteChild under TIAN, GUARDED confirm=\"" + DELETE_CONFIRMATION + "\" (dryRun:true previews existence without deleting); " +
+      "stream_create (name, before?) — CreateChild a StreamHelper (subType 0) under TIAN (config edit, no confirm); " +
+      "stream_delete (name, dryRun?, confirm) — DeleteChild under TIAN, GUARDED confirm=\"" + DELETE_CONFIRMATION + "\"; the actual node name is '<name>_Obj1 (StreamHelper)' (the suffix is appended for you); " +
+      "node_get_xml (path, summary?) / node_set_xml (path, xml, returnXml?) — convenience aliases for ProduceXml/ConsumeXml SetParameter on a TIAN logger/stream node (e.g. 'TIAN^<loggerName>'); identical to tc_tree get_xml/set_xml. " +
+      "OMITTED as UNVERIFIED: Scope data-export (SaveSVD/ExportCSV/ExportTDMS/ExportBinary/ExportDAT), Scope-Server (ShowControl/CloseControl/Disconnect), LookUpChild, and all Scope/Analytics enums. Nothing here targets the safety system.",
+    inputSchema: {
+      action: z.enum([
+        "scope_create", "scope_add_child", "scope_rename", "scope_record",
+        "analytics_create",
+        "logger_create", "logger_delete", "stream_create", "stream_delete",
+        "node_get_xml", "node_set_xml",
+      ]),
+      name: z.string().optional(),
+      template: z.string().optional(),
+      destination: z.string().optional(),
+      project: z.string().optional(),
+      parentPath: z.string().optional().describe("^-path of names from the scope project root to the parent element"),
+      path: z.string().optional(),
+      newName: z.string().optional(),
+      elementType: z.number().int().optional().describe("CreateChild elementType; only 0 is verified"),
+      state: z.enum(["start", "stop"]).optional(),
+      before: z.string().optional().describe("insert before this sibling under TIAN"),
+      xml: z.string().optional(),
+      returnXml: z.boolean().optional(),
+      summary: z.boolean().optional(),
+      dryRun: z.boolean().optional(),
+      confirm: z.string().optional(),
+      mode: z.enum(["active", "activeOrCreate", "create"]).optional().describe("DTE attach mode; default active"),
+    },
+  },
+  async (p) => {
+    const base = { mode: p.mode };
+    switch (p.action) {
+      case "scope_create":
+        need(p, ["name"], p.action);
+        return textResult(await bridgeCall("measurement_scope_create", { ...base, name: p.name, template: p.template, destination: p.destination }));
+      case "scope_add_child":
+        need(p, ["project"], p.action);
+        return textResult(await bridgeCall("measurement_scope_add_child", { ...base, project: p.project, parentPath: p.parentPath, name: p.name, elementType: p.elementType === undefined ? 0 : p.elementType }));
+      case "scope_rename":
+        need(p, ["project", "path", "newName"], p.action);
+        return textResult(await bridgeCall("measurement_scope_rename", { ...base, project: p.project, path: p.path, newName: p.newName }));
+      case "scope_record":
+        need(p, ["project", "state"], p.action);
+        if (p.state === "start" && p.confirm !== MEASUREMENT_RECORD_CONFIRMATION) {
+          throw new Error('Blocked. scope_record state="start" performs live data acquisition against the running target. Re-run with confirm="' + MEASUREMENT_RECORD_CONFIRMATION + '" to proceed.');
+        }
+        return textResult(await bridgeCall("measurement_scope_record", { ...base, project: p.project, state: p.state }));
+      case "analytics_create":
+        need(p, ["name"], p.action);
+        return textResult(await bridgeCall("measurement_analytics_create", { ...base, name: p.name, template: p.template, destination: p.destination }));
+      case "logger_create":
+        need(p, ["name"], p.action);
+        return textResult(await bridgeCall("analytics_logger_create", { ...base, name: p.name, before: p.before }));
+      case "logger_delete":
+        need(p, ["name"], p.action);
+        if (p.dryRun !== true && p.confirm !== DELETE_CONFIRMATION) {
+          throw new Error('Blocked. logger_delete removes a TIAN DataLogger node. Re-run with dryRun:true to preview, or confirm="' + DELETE_CONFIRMATION + '" to delete.');
+        }
+        return textResult(await bridgeCall("analytics_logger_delete", { ...base, name: p.name, dryRun: p.dryRun === true }));
+      case "stream_create":
+        need(p, ["name"], p.action);
+        return textResult(await bridgeCall("analytics_stream_create", { ...base, name: p.name, before: p.before }));
+      case "stream_delete":
+        need(p, ["name"], p.action);
+        if (p.dryRun !== true && p.confirm !== DELETE_CONFIRMATION) {
+          throw new Error('Blocked. stream_delete removes a TIAN StreamHelper node. Re-run with dryRun:true to preview, or confirm="' + DELETE_CONFIRMATION + '" to delete.');
+        }
+        return textResult(await bridgeCall("analytics_stream_delete", { ...base, name: p.name, dryRun: p.dryRun === true }));
+      case "node_get_xml":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_get_tree_item_xml", { ...base, treePath: p.path, summary: p.summary === true }));
+      case "node_set_xml":
+        need(p, ["path", "xml"], p.action);
+        return textResult(await bridgeCall("twincat_set_tree_item_xml", { ...base, treePath: p.path, xml: p.xml, returnXml: p.returnXml === true }));
     }
   },
 );

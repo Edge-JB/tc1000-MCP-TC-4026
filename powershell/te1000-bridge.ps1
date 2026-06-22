@@ -849,6 +849,222 @@ public static class Te1000PlcProjectHelper {
     return $null -ne ('Te1000PlcProjectHelper' -as [type])
 }
 
+# --- tc_measurement helpers ------------------------------------------------
+# Resolve the TE130X Scope View Automation Interface assembly. The product may
+# not be installed (then this returns $null and the scope actions fail with a
+# clear 'tooling not installed' message rather than a raw COM HRESULT).
+function Get-MeasurementLibPath {
+    $name = 'TwinCAT.Measurement.AutomationInterface.dll'
+    $dirs = @(
+        'C:\TwinCAT\Functions\TE130X-Scope-View',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE130X-Scope-View',
+        'C:\Program Files\Beckhoff\TwinCAT\Functions\TE130X-Scope-View',
+        (Get-XaePublicAssembliesPath)
+    )
+    foreach ($dir in $dirs) {
+        if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir)) { continue }
+        $direct = Join-Path $dir $name
+        if (Test-Path -LiteralPath $direct) { return $direct }
+        $hit = Get-ChildItem -LiteralPath $dir -Filter $name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+# Resolve a Scope project template (.tcmproj). The leaf filename varies by
+# install/version, so probe the Templates\Projects dir rather than hardcode it.
+function Get-ScopeTemplatePath {
+    $dirs = @(
+        'C:\TwinCAT\Functions\TE130X-Scope-View\Templates\Projects',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\Templates\Projects',
+        'C:\Program Files\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\Templates\Projects'
+    )
+    foreach ($dir in $dirs) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $hit = Get-ChildItem -LiteralPath $dir -Filter '*.tcmproj' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+# Resolve a TwinCAT Analytics project template. The exact leaf filename is not
+# documented, so probe the known Analytics product template dirs.
+function Get-AnalyticsTemplatePath {
+    $roots = @(
+        'C:\TwinCAT\Functions\TE3500-Analytics-Workbench',
+        'C:\TwinCAT\Functions\TE3520-Analytics-Service-Tool',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE3500-Analytics-Workbench',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE3520-Analytics-Service-Tool'
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($pat in @('*.tcaproj', '*.tcanalyticsproj', '*.tsproj')) {
+            $hit = Get-ChildItem -LiteralPath $root -Filter $pat -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '[\\/]Templates[\\/]' } | Select-Object -First 1
+            if ($null -ne $hit) { return $hit.FullName }
+        }
+    }
+    return $null
+}
+
+# IMeasurementScope is a vtable (IUnknown-derived) interface; PowerShell cannot
+# QI a __ComObject to it ([Interface]$obj is not a CLR QI in PS), so the member
+# calls go through a compiled C# helper, exactly as Te1000PlcProjectHelper does
+# for ITcPlcProject. Because the exact interface namespace is not documented and
+# the TE130X product may be absent here, the shim discovers the IMeasurementScope
+# interface type by name from the loaded assembly via reflection and invokes its
+# members by name (CreateChild/ChangeName/StartRecord/StopRecord) — the VERIFIED
+# surface only. Returns $false if the assembly can't be loaded (callers then
+# throw a clear 'TE130X Scope automation assembly not found' error).
+# NOTE: SaveSVD/ExportCSV/LookUpChild are deliberately NOT exposed (UNVERIFIED).
+function Ensure-MeasurementScopeHelper {
+    if ('Te1000MeasurementHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-MeasurementLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    try {
+        $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    } catch {
+        return $false
+    }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Linq;
+using System.Reflection;
+public static class Te1000MeasurementHelper {
+    // Find the IMeasurementScope interface across all loaded assemblies.
+    static Type ScopeType() {
+        foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies()) {
+            Type t = null;
+            try { t = a.GetTypes().FirstOrDefault(x => x.IsInterface && x.Name == "IMeasurementScope"); }
+            catch { t = null; }
+            if (t != null) return t;
+        }
+        return null;
+    }
+    public static bool Is(object o) {
+        if (o == null) return false;
+        Type t = ScopeType();
+        return t != null && t.IsInstanceOfType(o);
+    }
+    // CreateChild(out object item, string name, int elementType) -> int rc.
+    public static int CreateChild(object scope, out object child, string name, int elementType) {
+        child = null;
+        Type t = ScopeType();
+        if (t == null) throw new InvalidOperationException("IMeasurementScope type not found");
+        MethodInfo m = t.GetMethod("CreateChild");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.CreateChild");
+        object[] args = new object[] { null, name == null ? "" : name, elementType };
+        object rc = m.Invoke(scope, args);
+        child = args[0];
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    public static int ChangeName(object el, string n) {
+        Type t = ScopeType();
+        MethodInfo m = t.GetMethod("ChangeName");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.ChangeName");
+        object rc = m.Invoke(el, new object[] { n });
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    public static int StartRecord(object s) {
+        Type t = ScopeType();
+        MethodInfo m = t.GetMethod("StartRecord");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.StartRecord");
+        object rc = m.Invoke(s, null);
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    public static int StopRecord(object s) {
+        Type t = ScopeType();
+        MethodInfo m = t.GetMethod("StopRecord");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.StopRecord");
+        object rc = m.Invoke(s, null);
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    // Enumerate a parent scope element's children (for name-walking parentPath).
+    // Tries common collection members; returns an empty array if none resolve.
+    public static object[] Children(object el) {
+        if (el == null) return new object[0];
+        Type t = el.GetType();
+        foreach (string p in new string[] { "Children", "ChildCollection", "Items" }) {
+            try {
+                PropertyInfo pi = t.GetProperty(p);
+                if (pi != null) {
+                    object col = pi.GetValue(el, null);
+                    if (col is System.Collections.IEnumerable) {
+                        return ((System.Collections.IEnumerable)col).Cast<object>().ToArray();
+                    }
+                }
+            } catch { }
+        }
+        return new object[0];
+    }
+    public static string NameOf(object el) {
+        if (el == null) return null;
+        try {
+            PropertyInfo pi = el.GetType().GetProperty("Name");
+            if (pi != null) { object v = pi.GetValue(el, null); return v == null ? null : v.ToString(); }
+        } catch { }
+        return null;
+    }
+}
+'@
+    return $null -ne ('Te1000MeasurementHelper' -as [type])
+}
+
+# Locate a Scope/Analytics EnvDTE.Project by Name in the open solution and return
+# its .Object (the IMeasurementScope-capable automation object). These projects
+# are SEPARATE EnvDTE.Project nodes, NOT System Manager tree items.
+function Get-ScopeProjectObject($Dte, [string]$ProjectName) {
+    if ([string]::IsNullOrWhiteSpace($ProjectName)) { throw 'project is required' }
+    $solution = $Dte.Solution
+    if ($null -eq $solution -or -not [bool]$solution.IsOpen) {
+        throw 'No solution is open'
+    }
+    $projects = $solution.Projects
+    if ($null -ne $projects) {
+        for ($i = 1; $i -le $projects.Count; $i++) {
+            $proj = $null
+            try { $proj = $projects.Item($i) } catch { continue }
+            if ($null -eq $proj) { continue }
+            $pname = Get-SafeValue { [string]$proj.Name }
+            if ($pname -eq $ProjectName) {
+                $obj = $null
+                try { $obj = $proj.Object } catch { }
+                if ($null -eq $obj) { throw "Scope project '$ProjectName' has no automation object (.Object is null)" }
+                return $obj
+            }
+        }
+    }
+    throw "Scope project not found in the open solution: $ProjectName"
+}
+
+# Walk a ^-separated parentPath of element names from a scope root object,
+# resolving each segment by enumerating the parent's children by name. Returns
+# the resolved parent object (the root itself when parentPath is empty).
+# NOTE: LookUpChild is UNVERIFIED; resolution is by enumeration only.
+function Resolve-ScopeElement($Root, [string]$ElementPath) {
+    $current = $Root
+    if ([string]::IsNullOrWhiteSpace($ElementPath)) { return $current }
+    $segments = $ElementPath -split '\^'
+    foreach ($seg in $segments) {
+        if ([string]::IsNullOrWhiteSpace($seg)) { continue }
+        $children = [Te1000MeasurementHelper]::Children($current)
+        $match = $null
+        foreach ($c in $children) {
+            $cn = [Te1000MeasurementHelper]::NameOf($c)
+            if ($cn -eq $seg) { $match = $c; break }
+        }
+        if ($null -eq $match) {
+            throw "Scope element segment not found by name: '$seg' (path '$ElementPath'). Child enumeration is the only verified resolution; LookUpChild is unsupported. Restrict the path to existing named children."
+        }
+        $current = $match
+    }
+    return $current
+}
+
 function Ensure-TcPlcTaskRefHelper {
     # ITcPlcTaskReference is a vtable (IUnknown) interface; PowerShell cannot QI a
     # __ComObject to it ([Interface]$obj is not a CLR QI in PS), so the LinkedTask
@@ -7113,6 +7329,237 @@ try {
                     note = 'Modules built for all platforms and exported. Does not activate/restart the runtime.'
                 }
             }
+            exit 0
+        }
+
+        'measurement_scope_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $solution = $dte.Solution
+            if ($null -eq $solution -or -not [bool]$solution.IsOpen) { throw 'No solution is open' }
+
+            $destination = if ($payload.destination) { [string]$payload.destination } else { [System.IO.Path]::GetDirectoryName([string]$solution.FullName) }
+
+            $template = if ($payload.template) { [string]$payload.template } else { Get-ScopeTemplatePath }
+            if ([string]::IsNullOrWhiteSpace($template)) {
+                throw 'Scope project template not found — TE130X Scope View tooling may not be installed. Pass template explicitly (a full .tcmproj path).'
+            }
+            if (-not (Test-Path -LiteralPath $template)) { throw "Scope template not found: $template" }
+
+            $proj = $solution.AddFromTemplate($template, $destination, $name)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    created = $true
+                    name = $name
+                    kind = 'scope'
+                    projectFullName = (Get-SafeValue { [string]$proj.FullName })
+                }
+            }
+            exit 0
+        }
+
+        'measurement_scope_add_child' {
+            $project = [string]$payload.project
+            if ([string]::IsNullOrWhiteSpace($project)) { throw 'project is required' }
+            $name = if ($payload.PSObject.Properties.Name -contains 'name' -and $null -ne $payload.name) { [string]$payload.name } else { '' }
+            $elementType = if ($null -ne $payload.elementType) { [int]$payload.elementType } else { 0 }
+            $parentPath = if ($payload.parentPath) { [string]$payload.parentPath } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            if (-not (Ensure-MeasurementScopeHelper)) {
+                throw 'TE130X Scope automation assembly not found (TwinCAT.Measurement.AutomationInterface.dll). Scope tooling is not installed.'
+            }
+            $obj = Get-ScopeProjectObject -Dte $dte -ProjectName $project
+            if (-not [Te1000MeasurementHelper]::Is($obj)) {
+                throw "Project '$project' is not a Measurement/Scope project (object is not IMeasurementScope)."
+            }
+            $parent = Resolve-ScopeElement -Root $obj -ElementPath $parentPath
+            $child = $null
+            $rc = [Te1000MeasurementHelper]::CreateChild($parent, [ref]$child, $name, $elementType)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    project = $project
+                    parentPath = $parentPath
+                    created = $true
+                    name = $name
+                    elementType = $elementType
+                    rc = $rc
+                }
+            }
+            exit 0
+        }
+
+        'measurement_scope_rename' {
+            $project = [string]$payload.project
+            $path = [string]$payload.path
+            $newName = [string]$payload.newName
+            if ([string]::IsNullOrWhiteSpace($project)) { throw 'project is required' }
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($newName)) { throw 'newName is required' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            if (-not (Ensure-MeasurementScopeHelper)) {
+                throw 'TE130X Scope automation assembly not found (TwinCAT.Measurement.AutomationInterface.dll). Scope tooling is not installed.'
+            }
+            $obj = Get-ScopeProjectObject -Dte $dte -ProjectName $project
+            if (-not [Te1000MeasurementHelper]::Is($obj)) {
+                throw "Project '$project' is not a Measurement/Scope project (object is not IMeasurementScope)."
+            }
+            $element = Resolve-ScopeElement -Root $obj -ElementPath $path
+            $rc = [Te1000MeasurementHelper]::ChangeName($element, $newName)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ project = $project; path = $path; newName = $newName; rc = $rc }
+            }
+            exit 0
+        }
+
+        'measurement_scope_record' {
+            $project = [string]$payload.project
+            $state = [string]$payload.state
+            if ([string]::IsNullOrWhiteSpace($project)) { throw 'project is required' }
+            if ($state -ne 'start' -and $state -ne 'stop') { throw "state must be 'start' or 'stop'" }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            if (-not (Ensure-MeasurementScopeHelper)) {
+                throw 'TE130X Scope automation assembly not found (TwinCAT.Measurement.AutomationInterface.dll). Scope tooling is not installed.'
+            }
+            $obj = Get-ScopeProjectObject -Dte $dte -ProjectName $project
+            if (-not [Te1000MeasurementHelper]::Is($obj)) {
+                throw "Project '$project' is not a Measurement/Scope project (object is not IMeasurementScope)."
+            }
+            $rc = if ($state -eq 'start') { [Te1000MeasurementHelper]::StartRecord($obj) } else { [Te1000MeasurementHelper]::StopRecord($obj) }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ project = $project; state = $state; rc = $rc }
+            }
+            exit 0
+        }
+
+        'measurement_analytics_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $solution = $dte.Solution
+            if ($null -eq $solution -or -not [bool]$solution.IsOpen) { throw 'No solution is open' }
+
+            $destination = if ($payload.destination) { [string]$payload.destination } else { [System.IO.Path]::GetDirectoryName([string]$solution.FullName) }
+
+            $template = if ($payload.template) { [string]$payload.template } else { Get-AnalyticsTemplatePath }
+            if ([string]::IsNullOrWhiteSpace($template)) {
+                throw 'Analytics project template not found — pass template explicitly (TwinCAT Analytics tooling may not be installed).'
+            }
+            if (-not (Test-Path -LiteralPath $template)) { throw "Analytics template not found: $template" }
+
+            $proj = $solution.AddFromTemplate($template, $destination, $name)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    created = $true
+                    name = $name
+                    kind = 'analytics'
+                    projectFullName = (Get-SafeValue { [string]$proj.FullName })
+                }
+            }
+            exit 0
+        }
+
+        'analytics_logger_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+            # subType 1 = DataLogger (infosys 12562942987).
+            $child = $tian.CreateChild($name, 1, $before, $null)
+            Assert-WellFormedChild -Parent $tian -Child $child -RequestedName $name -SubType 1 -ParentPath 'TIAN'
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ parentPath = 'TIAN'; child = Convert-TreeItem -TreeItem $child }
+            }
+            exit 0
+        }
+
+        'analytics_stream_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+            # subType 0 = StreamHelper (infosys 12563004555).
+            $child = $tian.CreateChild($name, 0, $before, $null)
+            Assert-WellFormedChild -Parent $tian -Child $child -RequestedName $name -SubType 0 -ParentPath 'TIAN'
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ parentPath = 'TIAN'; child = Convert-TreeItem -TreeItem $child }
+            }
+            exit 0
+        }
+
+        'analytics_logger_delete' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dryRun = [bool]$payload.dryRun
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+
+            if ($dryRun) {
+                $exists = $false
+                $count = Get-TreeItemChildCount -TreeItem $tian
+                for ($i = 1; $i -le $count; $i++) {
+                    $c = (Get-TreeItemChild -TreeItem $tian -Index $i).Value
+                    if ($null -eq $c) { continue }
+                    $cn = Get-SafeValue { [string]$c.Name }
+                    if ($cn -eq $name) { $exists = $true; break }
+                }
+                Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; exists = $exists; deleted = $false } }
+                exit 0
+            }
+
+            $tian.DeleteChild($name)
+            Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; deleted = $true } }
+            exit 0
+        }
+
+        'analytics_stream_delete' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $deleteName = $name + '_Obj1 (StreamHelper)'
+            $dryRun = [bool]$payload.dryRun
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+
+            if ($dryRun) {
+                $exists = $false
+                $count = Get-TreeItemChildCount -TreeItem $tian
+                for ($i = 1; $i -le $count; $i++) {
+                    $c = (Get-TreeItemChild -TreeItem $tian -Index $i).Value
+                    if ($null -eq $c) { continue }
+                    $cn = Get-SafeValue { [string]$c.Name }
+                    if ($cn -eq $deleteName) { $exists = $true; break }
+                }
+                Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; deleteName = $deleteName; exists = $exists; deleted = $false } }
+                exit 0
+            }
+
+            $tian.DeleteChild($deleteName)
+            Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; deleteName = $deleteName; deleted = $true } }
             exit 0
         }
 
