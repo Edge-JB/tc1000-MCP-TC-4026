@@ -374,9 +374,9 @@ server.registerTool(
 server.registerTool(
   "tc_tree",
   {
-    description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml raw XML; summary:true for a compact identity + slot-module list instead of the full blob); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); create now VALIDATES the created child and errors clearly on a malformed/ghost result (blank name, name mismatch, or wrong parent) instead of silently succeeding — adding an EtherCAT box typically requires a proper ESI-based createInfo (a bare subType such as 9099 with no createInfo produces a blank-named ghost), and create_batch records such failures per-entry as ok:false; CREATE RACK — create_rack (path = parent EtherCAT coupler/box, modules:[{type,revision?,name?}]) builds functional EtherCAT boxes from the stock Beckhoff ESI library by GENERATING a full .xti (identity + PDOs + SyncMan/Fmmu) per module and IMPORTING it (proven to yield a non-hollow box); supports DIGITAL terminals (EL1xxx digital-input, EL2xxx digital-output) and ANALOG INPUT terminals (EL3xxx, e.g. EL3064/EL3104/EL3162 — INT value + BIT/BIT2/byte-status channels, v1.1) and defaults to the highest ESI revision WITH real PDOs (catalog-stub revisions are skipped) unless revision is given — still-unsupported classes (analog output / IO-Link / modular) error per-entry rather than emitting a wrong box; sequential, continue-on-error, returns {parent,count,succeeded,failed,results:[{type,name,ok,error?}]}, optional save:true; DELETE — delete / delete_batch (deletes:[{parent,name}], GUARDED: pass dryRun:true to preview which children exist without deleting, or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete). Mutating *_batch verbs (set_xml_batch, rename_batch, create_batch, delete_batch) accept optional save:true to save the solution once after the batch. No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
+    description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml raw XML; summary:true for a compact identity + slot-module list instead of the full blob); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); create now VALIDATES the created child and errors clearly on a malformed/ghost result (blank name, name mismatch, or wrong parent) instead of silently succeeding — adding an EtherCAT box typically requires a proper ESI-based createInfo (a bare subType such as 9099 with no createInfo produces a blank-named ghost), and create_batch records such failures per-entry as ok:false (to ADD whole EtherCAT terminals/boxes from the ESI, prefer the dedicated createIO tool, which expands them natively); DELETE — delete / delete_batch (deletes:[{parent,name}], GUARDED: pass dryRun:true to preview which children exist without deleting, or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete). Mutating *_batch verbs (set_xml_batch, rename_batch, create_batch, delete_batch) accept optional save:true to save the solution once after the batch. No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
     inputSchema: {
-      action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "create_batch", "create_rack", "delete", "delete_batch", "import", "export", "focus"]),
+      action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "create_batch", "delete", "delete_batch", "import", "export", "focus"]),
       path: z.string().optional(),
       paths: z.array(z.string()).optional(),
       xml: z.string().optional(),
@@ -387,7 +387,6 @@ server.registerTool(
       items: z.array(z.object({ path: z.string(), xml: z.string() })).optional(),
       creates: z.array(z.object({ parent: z.string(), name: z.string(), subType: z.number().int(), before: z.string().optional(), createInfo: z.string().optional() })).optional(),
       deletes: z.array(z.object({ parent: z.string(), name: z.string() })).optional(),
-      modules: z.array(z.object({ type: z.string(), revision: z.string().optional(), name: z.string().optional() })).optional(),
       subType: z.number().int().optional(),
       before: z.string().optional().describe("insert before this sibling"),
       createInfo: z.string().optional(),
@@ -432,9 +431,6 @@ server.registerTool(
       case "create_batch":
         need(p, ["creates"], p.action);
         return textResult(await bridgeCall("twincat_create_children", { creates: p.creates, save: p.save === true }));
-      case "create_rack":
-        need(p, ["path", "modules"], p.action);
-        return textResult(await bridgeCall("twincat_create_rack", { parentPath: p.path, modules: p.modules, save: p.save === true }));
       case "delete":
         need(p, ["path", "name"], p.action);
         return textResult(await bridgeCall("twincat_delete_child", { parentPath: p.path, childName: p.name }));
@@ -452,6 +448,33 @@ server.registerTool(
         return textResult(await bridgeCall("twincat_export_child", { parentPath: p.path, childName: p.name, filePath: p.file }));
       case "focus": need(p, ["path"], p.action); return textResult(await bridgeCall("xae_focus_tree_item", t));
     }
+  },
+);
+
+server.registerTool(
+  "createIO",
+  {
+    description:
+      "Create EtherCAT IO boxes (terminals/couplers) NATIVELY. Each module is added via the GUI's own \"Add Box\" route — ITcSmTreeItem.CreateChild(name, 9099, before, \"<productString>\") — so TwinCAT expands the box FROM ITS OWN ESI: a fully populated, non-hollow box (correct identity, SyncManagers, FMMUs, full <EtherCAT> mailbox/CoE/FoE element, complete PDOs+entries) for ANY class — digital, analog (in AND out), IO-Link, mailbox, DC, couplers. createInfo is the PLAIN PRODUCT STRING (the bare type = latest revision, or a revision-pinned form), NOT identity XML/numbers. " +
+      "ONE unified shape — a single box and a whole multi-coupler design are the SAME operation: racks:[{ parent:\"<EtherCAT coupler/master tree path>\", modules:[{ type:\"EL1008\", name?:\"R01.Main.N07 (EL1008)\", revision?, before?:\"<sibling name>\" }] }]. A single box is just racks:[{parent, modules:[{type}]}]. Modules are created in array order (left-to-right terminal order); `before` inserts ahead of a named sibling; name omitted defaults to type. " +
+      "Revision pinning: pass `revision` as the full Beckhoff product string suffix \"<pppp>-<rrrr>\" (decimal), e.g. type:\"EL1008\" revision:\"0000-0017\" → RevisionNo #x00110000; you may also pass the whole pinned string in `revision` (e.g. \"EL1008-0000-0017\"). Bare type = latest revision. " +
+      "NO fallback — if CreateChild produces a ghost/unknown type, that ONE module is a clean ok:false (any stray child is cleaned up) and the rest continue. Optional save:true saves the solution once after everything. Returns a flat roll-up {count, succeeded, failed, results:[{parent, type, name, ok, error?}]}.",
+    inputSchema: {
+      racks: z.array(z.object({
+        parent: z.string(),
+        modules: z.array(z.object({
+          type: z.string(),
+          name: z.string().optional(),
+          revision: z.string().optional(),
+          before: z.string().optional().describe("insert before this sibling"),
+        })),
+      })),
+      save: z.boolean().optional(),
+    },
+  },
+  async ({ racks, save }) => {
+    need({ racks }, ["racks"], "createIO");
+    return textResult(await bridgeCall("twincat_create_io", { racks, save: save === true }));
   },
 );
 

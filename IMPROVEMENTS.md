@@ -5,6 +5,56 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-21 — `createIO` replaces `create_rack`: native ESI expansion, generator deleted — branch `feature/createio-native`
+
+`createIO` replaces `create_rack`: native `ITcSmTreeItem.CreateChild(name, 9099, '', '<type>')` makes
+TwinCAT expand boxes from its ESI (the GUI's own "Add Box" path); works for **ALL** classes — digital,
+analog input **and** output, IO-Link, mailbox, DC, couplers. The hand-rolled ESI generator + all of its
+helpers are **DELETED** (no fallback). `vInfo` = the **product string**, not identity XML — the old
+dead-end.
+
+**Why.** The 4th `CreateChild` arg (`vInfo`/createInfo) is the plain product string (`"EL1417"` =
+latest revision, or `"EL1008-0000-0017"` = pinned). TwinCAT's own ESI engine then populates the box:
+correct identity, TwinCAT-computed SyncManagers, FMMUs, the full `<EtherCAT>` mailbox/CoE/FoE element,
+and the complete `<Pdo>`/`<Entry>` set — for any device class. The previous dead-end was passing
+identity XML / VendorId+ProductCode numbers as `vInfo`, which yields a blank-named ghost.
+
+**Proven live** (via the hot-reloading `tc_tree create` route, subType 9099, createInfo=type) across
+every class under `EK1200`, each exported and confirmed non-hollow then deleted:
+
+| type   | class            | SyncMan | Pdos | entries |
+|--------|------------------|---------|------|---------|
+| EL2008 | digital-out      | 4 (1 `<SyncMan>` blob) | 8 | 8 |
+| EL3064 | analog-in (CoE)  | 4 | 8 | 44 |
+| EL4004 | analog-out (CoE) | 4 | 4 | 4 |
+| EL6224 | IO-Link master   | 4 | 10 | 6 |
+| EL1417 | mailbox-digital  | 4 | 1 | 32 |
+
+EL4004 (analog-out) and EL6224 (IO-Link) are classes the **old generator could not produce at all** —
+native expansion handles them for free.
+
+**Revision pin format (confirmed live on EL1008).** The product-string suffix `"<pppp>-<rrrr>"` is
+**decimal**: `pppp` = the product-code variant (the EtherCAT `"0000"` variant), `rrrr` = the decimal
+revision number, which TwinCAT renders into the high 16 bits of `RevisionNo`:
+`EL1008-0000-0016` → `RevisionNo #x00100000`, `EL1008-0000-0017` → `#x00110000`. Bare type = latest.
+
+**ONE unified schema.** A single box and a full multi-coupler rack are the same operation:
+`createIO({ racks:[{ parent, modules:[{ type, name?, revision?, before? }] }], save? })`. A single box
+is just `racks:[{ parent, modules:[{ type }] }]` — there is no separate "batch" vs "rack" form.
+Continue-on-error; flat roll-up `{ count, succeeded, failed, results:[{ parent, type, name, ok, error? }] }`.
+
+**Deleted (entire hand-rolled generator + helpers, all confined to the old `create_rack` path, grep-confirmed unused):**
+`Build-BoxXti`, `Build-SyncManFromEsi`, `Build-FmmuFromEsi`, `Get-AnalogEntryType`,
+`Test-EsiDeviceHasRealPdos`, `ConvertFrom-EsiHex`, `Resolve-EsiDevice` (with its `SmList`/`FmmuList`/PDO
+parsing), and the `$script:EsiFolder` constant — 497 lines removed from `te1000-bridge.ps1`. The
+`twincat_create_rack` bridge action is replaced by `twincat_create_io`. **Kept:** `Assert-WellFormedChild`
+(shared by `tc_tree create`/`create_batch` and now `createIO` for ghost detection + cleanup).
+
+The `2026-06-21` entry below (ESI-computed SyncMan/Fmmu) and the moot `improve/esi-parser-robustness`
+hex-parse fix both targeted the now-deleted generator and no longer apply.
+
+---
+
 ## 2026-06-21 — SyncMan/Fmmu now fully ESI-computed; baked framing removed — branch `improve/esi-computed-syncman`
 
 **Refactor.** The box-level `<SyncMan>`/`<Fmmu>` blobs in the `create_rack` ESI→`.xti` generator are
