@@ -5217,8 +5217,8 @@ try {
             }
             $root = (Get-TreeItem -SysManager $sysManager -TreePath $plcPath).Value
             # CheckAllObjects lives on ITcPlcIECProject2, which is implemented by the
-            # nested IEC PROJECT node (e.g. 'Cabsort Lite Project') -- NOT the TcCOM
-            # project INSTANCE node ('Cabsort Lite Instance'). The instance node is what
+            # nested IEC PROJECT node (e.g. '<plcName> Project') -- NOT the TcCOM
+            # project INSTANCE node ('<plcName> Instance'). The instance node is what
             # tree-child enumeration surfaces under the PLC root, but it does NOT QI to
             # ITcPlcIECProject2 (E_NOINTERFACE). The IEC project node is reachable by
             # name via LookupTreeItem at '<plcPath>^<rootName> Project'. Resolve it the
