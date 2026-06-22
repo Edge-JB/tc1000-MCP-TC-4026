@@ -807,6 +807,7 @@ server.registerTool(
       "WRITE — set_decl / set_decl_batch (path, declText); set_impl / set_impl_batch (path, exactly one of implText|implXml — implXml is TwinCAT object XML, round-trip only, for graphical languages); set_document (path, documentXml). " +
       "SURGICAL TEXT EDIT (read-modify-write, returns ONLY the changed region +/-2 ctx, never the whole blob; target decl|impl, CRLF/LF preserved; refuses graphical impl): replace (find literal substring, replaceWith, expectCount? default 1 — fails without writing on 0 or count mismatch); replace_lines (start, end, text — 1-based inclusive span, OOB throws); insert (exactly one of at|after|before, text); insert_in_var_block (block e.g. VAR_INPUT, text, occurrence? — inserts before that block's END_VAR); append (text — default target impl). All surgical writes accept validate:true to run CheckAllObjects after (default off). " +
       "DISCOVER — tree (plcPath?, path? subtree root, depth?, typeFilter?) does a read-only recursive Child() walk of the IEC project and returns {plcPath,projectPath,rootPath,count,tree:[{path,name,type,itemType,subType?,childCount,children?,truncated?}]} (type is a normalized label: Program/FB/Function/FunctionBlock/Struct/Enum/Union/Alias/GVL/Interface/Method/Property/Action/Transition/Visualization/ParameterList/UML/Folder/Project/Task/Unknown; depth 1 = direct children only; typeFilter is a comma list of type labels to KEEP, ancestors retained as scaffolding). find (plcPath?, path?, name? substring or /regex/, typeFilter?; at least one of name/typeFilter) returns a FLAT {plcPath,projectPath,count,matches:[{path,name,type,itemType,subType?,childCount}]} so a caller can resolve a ^ path from a name without the whole nested blob. " +
+      "GREP — search (pattern [regex/.NET or substring], ignoreCase?, declOnly?|implOnly? [mutually exclusive], plcPath?, path? subtree root, maxResults? default 500/max 5000) is a project-wide find-in-code: walks every code object under the IEC project, greps DeclarationText + (ST-only) ImplementationText line-by-line, and returns {pattern,plcPath,scanned,searched,count,truncated,matches:[{path,section:'decl'|'impl',line,text}]}; graphical bodies are scanned-but-not-searched, truncated:true when maxResults is hit. Read-only/offline. " +
       "DELETE — delete (path OR parent+name) GUARDED offline delete of one PLC object via parent.DeleteChild; pass dryRun:true to preview {wouldDelete,target} or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete; verifies the child exists first, refuses TISC. " +
       "BUILD-CHECK — check_objects (plcPath?, default first PLC under TIPC) runs CheckAllObjects on the nested IEC project (no download). Mutating batch verbs (create_batch, set_decl_batch, set_impl_batch) accept save:true to save the solution once after the batch.",
     inputSchema: {
@@ -816,7 +817,7 @@ server.registerTool(
         "set_decl", "set_decl_batch", "set_impl", "set_impl_batch", "set_document",
         "check_objects",
         "replace", "replace_lines", "insert", "insert_in_var_block", "append",
-        "tree", "find", "delete",
+        "tree", "find", "search", "delete",
       ]),
       parent: z.string().optional(),
       name: z.string().optional(),
@@ -869,6 +870,11 @@ server.registerTool(
       typeFilter: z.string().optional().describe("tree/find: comma list of normalized type labels to keep/match (case-insensitive), e.g. 'FB,Method,Struct'"),
       dryRun: z.boolean().optional().describe("delete: preview the target without deleting"),
       confirm: z.string().optional().describe("delete: must equal ALLOW_TWINCAT_DELETE to actually delete"),
+      pattern: z.string().optional().describe("search: regex (.NET syntax) or plain substring, matched per-line against each object's decl/impl text"),
+      ignoreCase: z.boolean().optional().describe("search: case-insensitive match (default false)"),
+      declOnly: z.boolean().optional().describe("search: search only DeclarationText; mutually exclusive with implOnly"),
+      implOnly: z.boolean().optional().describe("search: search only ImplementationText (ST-only); mutually exclusive with declOnly"),
+      maxResults: z.number().int().positive().max(5000).optional().describe("search: cap on returned match rows (default 500, max 5000); stops the walk and sets truncated when hit"),
     },
   },
   async (p) => {
@@ -965,6 +971,17 @@ server.registerTool(
         return textResult(await bridgeCall("plc_pou_find", {
           plcPath: p.plcPath, path: p.path, name: p.name, typeFilter: p.typeFilter,
         }));
+      case "search": {
+        need(p, ["pattern"], p.action);
+        if (p.declOnly === true && p.implOnly === true) {
+          throw new Error("declOnly and implOnly are mutually exclusive.");
+        }
+        return textResult(await bridgeCall("plc_pou_search", {
+          pattern: p.pattern, ignoreCase: p.ignoreCase === true,
+          declOnly: p.declOnly === true, implOnly: p.implOnly === true,
+          plcPath: p.plcPath, path: p.path, maxResults: p.maxResults,
+        }));
+      }
       case "delete": {
         const hasPath = p.path !== undefined && p.path !== "";
         const hasPair = (p.parent !== undefined && p.parent !== "") && (p.name !== undefined && p.name !== "");

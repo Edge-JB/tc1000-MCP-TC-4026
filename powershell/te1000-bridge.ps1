@@ -1706,6 +1706,43 @@ function Select-GrepLines {
     return @($out)
 }
 
+function Find-MatchesInText {
+    # PURE, offline-unit-testable grep core for the project-wide plc_pou search.
+    # Split on CRLF/CR/LF (normalized), 1-based line numbering, build ONE [regex]
+    # with RegexOptions.IgnoreCase as requested (so it composes with multiline),
+    # test each line, and emit {path,section,line,text=trimmed matched line} per
+    # hit. No COM, no DTE. Empty/whitespace text => @() (0 matches, not error).
+    # Throws a clear 'invalid pattern: ...' on a bad regex.
+    param(
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [Parameter(Mandatory = $true)][ValidateSet('decl','impl')][string]$Section,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [bool]$IgnoreCase = $false
+    )
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    $opts = [System.Text.RegularExpressions.RegexOptions]::None
+    if ($IgnoreCase) { $opts = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase }
+    $regex = $null
+    try {
+        $regex = [System.Text.RegularExpressions.Regex]::new($Pattern, $opts)
+    } catch {
+        throw "invalid pattern: $($_.Exception.Message)"
+    }
+    # Normalize CRLF and lone CR to LF, then split (keep all lines, 1-based).
+    $norm = $Text -replace "`r`n", "`n"
+    $norm = $norm -replace "`r", "`n"
+    $lines = $norm -split "`n", -1
+    $count = @($lines).Count
+    $out = @()
+    for ($i = 0; $i -lt $count; $i++) {
+        if ($regex.IsMatch($lines[$i])) {
+            $out += @{ path = $Path; section = $Section; line = ($i + 1); text = ([string]$lines[$i]).Trim() }
+        }
+    }
+    return @($out)
+}
+
 function Get-StrippedToken {
     # PURE helper for VAR-block scanning: return the first whitespace-delimited
     # token of a line with line/block comment leaders ignored; '' for a line
@@ -2199,6 +2236,78 @@ function Invoke-PlcTreeWalk {
         }
     }
     return $node
+}
+
+function Get-PlcCodeObjects {
+    # Recursive Child() enumeration over the resolved IEC project subtree, building
+    # a FLAT list of @{path; item(RCW)} for EVERY descendant (no type filtering:
+    # folders/actions/methods/properties are all walked so nested members like
+    # FB^Action are reachable). De-dupes by ^-path (Ordinal) so an aliased/double
+    # surfaced child is not visited twice. Reads TEXT off the child RCWs returned
+    # by Child(n) directly (the per-node QI to the typed helper is tolerated when
+    # caught in Select-PlcObjectText). NOT pure (touches COM); the recursion/path
+    # building mirrors Invoke-PlcTreeWalk and is exercised indirectly by search.
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)]$RootItem,
+        [AllowNull()]$Seen = $null
+    )
+    if ($null -eq $Seen) {
+        $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    }
+    $out = @()
+    if ($Seen.Add($RootPath)) {
+        $out += @{ path = $RootPath; item = $RootItem }
+    }
+    $childCount = Get-TreeItemChildCount -TreeItem $RootItem
+    for ($i = 1; $i -le $childCount; $i++) {
+        $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $RootItem -Index $i).Value })
+        if ($null -eq $childNode) { continue }
+        $childName = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+        if ([string]::IsNullOrWhiteSpace($childName)) { continue }
+        $childPath = "$RootPath^$childName"
+        if ($Seen.Contains($childPath)) { continue }
+        $out += Get-PlcCodeObjects -SysManager $SysManager -RootPath $childPath -RootItem $childNode -Seen $Seen
+    }
+    return @($out)
+}
+
+function Select-PlcObjectText {
+    # Read wrapper around Te1000PlcPouHelper for ONE RCW. Returns
+    # @{hasDecl; decl; hasImpl; impl; language}. A node that does not QI to
+    # ITcPlcDeclaration/ITcPlcImplementation throws E_NOINTERFACE -> caught ->
+    # hasDecl/hasImpl=$false (folders, the project node, visualizations skip
+    # cleanly). Honors declOnly (skip impl read) / implOnly (skip decl read).
+    # Graphical-language impl (SFC/FBD/CFC/LD) is gated out (no greppable text);
+    # the node is still counted as scanned by the caller. COM-failure handling
+    # lives here so one failing cast never aborts the whole walk.
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [bool]$DeclOnly = $false,
+        [bool]$ImplOnly = $false
+    )
+    $res = @{ hasDecl = $false; decl = $null; hasImpl = $false; impl = $null; language = $null }
+    if (-not $ImplOnly) {
+        try {
+            $res.decl = [Te1000PlcPouHelper]::GetDeclaration($Item)
+            $res.hasDecl = $true
+        } catch { $res.hasDecl = $false }
+    }
+    if (-not $DeclOnly) {
+        $lang = $null
+        try { $lang = [Te1000PlcPouHelper]::GetImplementationLanguage($Item) } catch { $lang = $null }
+        $res.language = $lang
+        # Only ST/IL carry usefully-greppable ImplementationText; graphical bodies
+        # (and nodes with no impl interface) contribute nothing.
+        if (($null -ne $lang) -and (-not (Test-PlcGraphicalLanguage -Language $lang))) {
+            try {
+                $res.impl = [Te1000PlcPouHelper]::GetImplementation($Item)
+                $res.hasImpl = $true
+            } catch { $res.hasImpl = $false }
+        }
+    }
+    return $res
 }
 
 function ConvertTo-NormalizedTypeSet {
@@ -6412,6 +6521,88 @@ try {
                     plcPath = $plcPath
                     projectPath = $projectPath
                     count = @($matches).Count
+                    matches = @($matches)
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_search' {
+            # Project-wide find-in-code. Walk every code-bearing object under the
+            # resolved IEC project node, read decl/(ST) impl via the typed helper,
+            # and grep line-by-line. Read-only, OFFLINE, one DTE attach.
+            $pattern = [string]$payload.pattern
+            if ([string]::IsNullOrEmpty($pattern)) { throw 'pattern is required' }
+            $ignoreCase = $false
+            if ($payload.PSObject.Properties.Name -contains 'ignoreCase') { $ignoreCase = [bool]$payload.ignoreCase }
+            $declOnly = $false
+            if ($payload.PSObject.Properties.Name -contains 'declOnly') { $declOnly = [bool]$payload.declOnly }
+            $implOnly = $false
+            if ($payload.PSObject.Properties.Name -contains 'implOnly') { $implOnly = [bool]$payload.implOnly }
+            if ($declOnly -and $implOnly) { throw 'declOnly and implOnly are mutually exclusive' }
+
+            $maxResults = 500
+            if ($payload.PSObject.Properties.Name -contains 'maxResults' -and $null -ne $payload.maxResults) {
+                $maxResults = [int]$payload.maxResults
+                if ($maxResults -lt 1) { $maxResults = 1 }
+                if ($maxResults -gt 5000) { $maxResults = 5000 }
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcProjectNodePath -SysManager $sysManager -PlcPath ([string]$payload.plcPath)
+            $plcPath = $resolved.plcPath
+            $projectPath = $resolved.projectPath
+
+            # Optional subtree root: must be inside the resolved PLC project; TISC rejected.
+            $startPath = if (-not [string]::IsNullOrWhiteSpace([string]$payload.path)) { [string]$payload.path } else { $projectPath }
+            Assert-NotSafetyPath -Path $startPath
+
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+
+            # Validate the regex once up front so a bad pattern fails fast.
+            [void](Find-MatchesInText -Text 'x' -Pattern $pattern -Section 'decl' -Path '' -IgnoreCase $ignoreCase)
+
+            $startNode = (Get-TreeItem -SysManager $sysManager -TreePath $startPath).Value
+            $objects = Get-PlcCodeObjects -SysManager $sysManager -RootPath $startPath -RootItem $startNode
+
+            $scanned = 0
+            $searched = 0
+            $matches = @()
+            $truncated = $false
+            foreach ($obj in $objects) {
+                $scanned++
+                $txt = Select-PlcObjectText -Item $obj.item -DeclOnly $declOnly -ImplOnly $implOnly
+                $didSearch = $false
+                if ($txt.hasDecl -and -not $implOnly) {
+                    $didSearch = $true
+                    foreach ($m in (Find-MatchesInText -Text $txt.decl -Pattern $pattern -Section 'decl' -Path $obj.path -IgnoreCase $ignoreCase)) {
+                        $matches += $m
+                        if (@($matches).Count -ge $maxResults) { $truncated = $true; break }
+                    }
+                }
+                if ((-not $truncated) -and $txt.hasImpl -and -not $declOnly) {
+                    $didSearch = $true
+                    foreach ($m in (Find-MatchesInText -Text $txt.impl -Pattern $pattern -Section 'impl' -Path $obj.path -IgnoreCase $ignoreCase)) {
+                        $matches += $m
+                        if (@($matches).Count -ge $maxResults) { $truncated = $true; break }
+                    }
+                }
+                if ($didSearch) { $searched++ }
+                if ($truncated) { break }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    pattern = $pattern
+                    plcPath = $plcPath
+                    scanned = $scanned
+                    searched = $searched
+                    count = @($matches).Count
+                    truncated = $truncated
                     matches = @($matches)
                 }
             }

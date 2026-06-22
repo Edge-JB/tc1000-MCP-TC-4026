@@ -155,6 +155,38 @@ Check 'insert_in_var_block before END_VAR' ($mV[2] -eq '    iNew : BOOL;' -and $
 $appMerged = @($lines) + @('// appended')
 Check 'append adds line at end' ($appMerged[$appMerged.Count-1] -eq '// appended')
 
+# --- Find-MatchesInText (project-wide search grep core) --------------------
+# (wrap each result in @() before indexing: PS unwraps single-element arrays)
+# CRLF text: 1-based line numbers, trimmed match text.
+$mCrlf = @(Find-MatchesInText -Text $crlf -Pattern 'iIn' -Section 'decl' -Path 'P^fb_Test' -IgnoreCase $false)
+Check 'find CRLF iIn one hit line 3' ($mCrlf.Count -eq 1 -and $mCrlf[0].line -eq 3 -and $mCrlf[0].text -eq 'iIn : BOOL;')
+Check 'find CRLF section + path carried' ($mCrlf[0].section -eq 'decl' -and $mCrlf[0].path -eq 'P^fb_Test')
+# LF text.
+$mLf = @(Find-MatchesInText -Text $lf -Pattern 'INT' -Section 'impl' -Path 'P^pMain' -IgnoreCase $false)
+Check 'find LF INT two hits lines 3,4' ($mLf.Count -eq 2 -and $mLf[0].line -eq 3 -and $mLf[1].line -eq 4)
+# Lone CR (old-Mac) line endings.
+$crText = "AAA`rbbb VAR`rccc"
+$mCr = @(Find-MatchesInText -Text $crText -Pattern 'VAR' -Section 'decl' -Path 'X' -IgnoreCase $false)
+Check 'find lone-CR VAR hit at line 2' ($mCr.Count -eq 1 -and $mCr[0].line -eq 2 -and $mCr[0].text -eq 'bbb VAR')
+# ignoreCase: case-sensitive misses, ignoreCase hits.
+$mCs = @(Find-MatchesInText -Text $lf -Pattern 'program' -Section 'decl' -Path 'X' -IgnoreCase $false)
+Check 'find case-sensitive misses lower program' ($mCs.Count -eq 0)
+$mCi = @(Find-MatchesInText -Text $lf -Pattern 'program' -Section 'decl' -Path 'X' -IgnoreCase $true)
+Check 'find ignoreCase hits PROGRAM line 1' ($mCi.Count -eq 1 -and $mCi[0].line -eq 1)
+# No-match => empty array, not error.
+$mNo = @(Find-MatchesInText -Text $crlf -Pattern 'ZZZ_no_such_token' -Section 'decl' -Path 'X' -IgnoreCase $false)
+Check 'find no-match => empty (not error)' ($mNo.Count -eq 0)
+# Empty / whitespace text => 0 matches.
+$mEmpty = @(Find-MatchesInText -Text '' -Pattern 'x' -Section 'decl' -Path 'X' -IgnoreCase $false)
+Check 'find empty text => 0' ($mEmpty.Count -eq 0)
+# Invalid regex => clear throw.
+$badPat = $false
+try { Find-MatchesInText -Text $lf -Pattern '[' -Section 'decl' -Path 'X' -IgnoreCase $false } catch { $badPat = ($_.Exception.Message -like 'invalid pattern:*') }
+Check 'find invalid regex throws invalid pattern' ($badPat)
+# Regex anchors compose with per-line splitting.
+$mAnchor = @(Find-MatchesInText -Text $lf -Pattern '^VAR$' -Section 'decl' -Path 'X' -IgnoreCase $false)
+Check 'find anchored ^VAR$ hits line 2 only' ($mAnchor.Count -eq 1 -and $mAnchor[0].line -eq 2)
+
 Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed"
