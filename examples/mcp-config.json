@@ -3,7 +3,7 @@
   "mcpServers": {
     "te1000": {
       "command": "node",
-      "args": ["C:\\path\\to\\tc1000-MCP-TC-4026\\index.js"],
+      "args": ["C:\\path\\to\\TwinCAT-XAE-MCP\\index.js"],
       "env": {
         "//TE1000_PROGID": "TcXaeShell.DTE.17.0 — set only if your XAE Shell ProgID differs"
       }

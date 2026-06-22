@@ -6,7 +6,7 @@
 
 > A [Model Context Protocol](https://modelcontextprotocol.io) server for **Beckhoff TwinCAT 3** engineering automation — drive the **TE1000 / XAE Automation Interface** from an AI agent or any MCP client.
 
-[![CI](https://github.com/Edge-JB/tc1000-MCP-TC-4026/actions/workflows/ci.yml/badge.svg)](https://github.com/Edge-JB/tc1000-MCP-TC-4026/actions/workflows/ci.yml)
+[![CI](https://github.com/Edge-JB/TwinCAT-XAE-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Edge-JB/TwinCAT-XAE-MCP/actions/workflows/ci.yml)
 [![MCP](https://img.shields.io/badge/MCP-server-blue)](https://modelcontextprotocol.io)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![TwinCAT](https://img.shields.io/badge/TwinCAT-3%20%2F%20TE1000-orange)](https://www.beckhoff.com/twincat)
@@ -93,8 +93,8 @@ environment variable if your installation differs.
 ## Install
 
 ```powershell
-git clone https://github.com/Edge-JB/tc1000-MCP-TC-4026.git
-cd tc1000-MCP-TC-4026
+git clone https://github.com/Edge-JB/TwinCAT-XAE-MCP.git
+cd TwinCAT-XAE-MCP
 npm install
 ```
 
@@ -118,7 +118,7 @@ Point your client at the absolute path of `index.js` in your clone. Example
   "mcpServers": {
     "te1000": {
       "command": "node",
-      "args": ["C:\\path\\to\\tc1000-MCP-TC-4026\\index.js"]
+      "args": ["C:\\path\\to\\TwinCAT-XAE-MCP\\index.js"]
     }
   }
 }

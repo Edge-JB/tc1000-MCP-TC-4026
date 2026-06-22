@@ -22,8 +22,8 @@ MCP client ──stdio──► index.js (Node 20) ──spawns──► 32-bit 
 ## Development
 
 ```powershell
-git clone https://github.com/Edge-JB/tc1000-MCP-TC-4026.git
-cd tc1000-MCP-TC-4026
+git clone https://github.com/Edge-JB/TwinCAT-XAE-MCP.git
+cd TwinCAT-XAE-MCP
 npm install
 npm run check        # node --check index.js — syntax-validate the server
 node index.js        # smoke test — prints "running on stdio" and waits

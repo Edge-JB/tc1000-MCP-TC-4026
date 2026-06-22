@@ -54,5 +54,5 @@ nearly the entire automatable TE1000 surface.
   `ProduceXml`/`ConsumeXml`, variable linking, NetId targeting, rescans, NC inspection, and
   guarded activate/restart/download.
 
-[2.0.0]: https://github.com/Edge-JB/tc1000-MCP-TC-4026/releases
-[1.0.0]: https://github.com/Edge-JB/tc1000-MCP-TC-4026/releases
+[2.0.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases
+[1.0.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases

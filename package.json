@@ -21,11 +21,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Edge-JB/tc1000-MCP-TC-4026.git"
+    "url": "git+https://github.com/Edge-JB/TwinCAT-XAE-MCP.git"
   },
-  "homepage": "https://github.com/Edge-JB/tc1000-MCP-TC-4026#readme",
+  "homepage": "https://github.com/Edge-JB/TwinCAT-XAE-MCP#readme",
   "bugs": {
-    "url": "https://github.com/Edge-JB/tc1000-MCP-TC-4026/issues"
+    "url": "https://github.com/Edge-JB/TwinCAT-XAE-MCP/issues"
   },
   "engines": {
     "node": ">=20"
