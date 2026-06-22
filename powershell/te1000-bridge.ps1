@@ -879,6 +879,58 @@ public static class Te1000PlcTaskRefHelper {
     return $null -ne ('Te1000PlcTaskRefHelper' -as [type])
 }
 
+function Ensure-Te1000ModuleHelper {
+    # ITcSysManager3.GetModuleManager(), ITcModuleManager3 enumeration, and
+    # ITcModuleInstance2.SetModuleContext are vtable (IUnknown) calls; PowerShell
+    # cannot QI a __ComObject to those interfaces nor enumerate them, so the work
+    # is done in a compiled C# helper, exactly as Te1000PlcProjectHelper does for
+    # ITcPlcProject. Requires TCatSysManagerLib.dll and the interfaces registered
+    # in the 64-bit registry view for marshaling. Returns $false if the DLL is
+    # unavailable.
+    if ('Te1000ModuleHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using TCatSysManagerLib;
+public static class Te1000ModuleHelper {
+    // ITcSysManager3.GetModuleManager() -> ITcModuleManager3; enumerate the
+    // ITcModuleInstance2 objects under TIRC^TcCOM Objects. oids are decimal
+    // (XAE displays them in hex). Returns object[] of tuples for the bridge.
+    public static object[] List(object sysManager) {
+        ITcSysManager3 sm3 = (ITcSysManager3)sysManager;
+        ITcModuleManager3 mgr = (ITcModuleManager3)sm3.GetModuleManager();
+        List<object> list = new List<object>();
+        foreach (ITcModuleInstance2 mi in mgr) {
+            list.Add(new object[] {
+                mi.ModuleTypeName,
+                mi.ModuleInstanceName,
+                mi.ClassID.ToString(),
+                mi.oid,
+                mi.ObjectId,
+                mi.ParentOID
+            });
+        }
+        return list.ToArray();
+    }
+
+    // Assign a module instance to a task's execution context. taskObjectId and
+    // contextId are DECIMAL oids (XAE displays them in hex). Changes the
+    // activated mapping/runtime context -> guarded in index.js.
+    public static void SetContext(object moduleInstance, int contextId, int taskObjectId) {
+        ((ITcModuleInstance2)moduleInstance).SetModuleContext(contextId, taskObjectId);
+    }
+}
+'@
+    return $null -ne ('Te1000ModuleHelper' -as [type])
+}
+
 # Resolve the PLC project root node path under TIPC. Defaults to the first child
 # of TIPC (TIPC^<name>). Shared by tc_task get/set_linked_task.
 function Resolve-PlcRootPath {
@@ -6620,6 +6672,233 @@ try {
                     applied = $true
                     xml = $echo
                     saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_list' {
+            if (-not (Ensure-Te1000ModuleHelper)) {
+                Fail('TCatSysManagerLib.dll could not be loaded; the typed ITcModuleManager3 enumeration is required to list TcCOM modules on this shell')
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $tuples = [Te1000ModuleHelper]::List($sysManager)
+            $modules = @()
+            foreach ($t in $tuples) {
+                $modules += @{
+                    moduleTypeName = Normalize-ScalarValue $t[0]
+                    moduleInstanceName = Normalize-ScalarValue $t[1]
+                    classId = Normalize-ScalarValue $t[2]
+                    oid = Normalize-ScalarValue $t[3]
+                    objectId = Normalize-ScalarValue $t[4]
+                    parentOid = Normalize-ScalarValue $t[5]
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($modules).Count
+                    modules = $modules
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_create' {
+            $parentPath = 'TIRC^TcCOM Objects'
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $by = [string]$payload.by
+            if ($by -ne 'classid' -and $by -ne 'name') { throw "by must be 'classid' or 'name'" }
+            $id = [string]$payload.id
+            if ([string]::IsNullOrWhiteSpace($id)) { throw 'id is required' }
+            $subType = if ($by -eq 'classid') { 0 } else { 1 }
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $parent = (Get-TreeItem -SysManager $sysManager -TreePath $parentPath).Value
+            $child = $parent.CreateChild($name, $subType, $before, $id)
+            Assert-WellFormedChild -Parent $parent -Child $child -RequestedName $name -SubType $subType -ParentPath $parentPath
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $parentPath
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_get_xml' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $xml = Strip-TreeImage $item.ProduceXml()
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ treePath = $path; xml = $xml }
+            }
+            exit 0
+        }
+
+        'twincat_module_set_xml' {
+            $path = [string]$payload.path
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($xml)) { throw 'xml is required' }
+            $returnXml = $payload.PSObject.Properties.Name -contains 'returnXml' -and [bool]$payload.returnXml
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $path -Xml $xml
+
+            $data = @{ treePath = $path }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml()
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'twincat_module_enable_symbols' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $doParams = $payload.PSObject.Properties.Name -contains 'parameters' -and [bool]$payload.parameters
+            $doAreas = $payload.PSObject.Properties.Name -contains 'dataAreas' -and [bool]$payload.dataAreas
+            $returnXml = $payload.PSObject.Properties.Name -contains 'returnXml' -and [bool]$payload.returnXml
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            [xml]$doc = $item.ProduceXml()
+            $changed = $false
+            if ($doParams) {
+                foreach ($n in $doc.SelectNodes('//Parameters//Parameter')) {
+                    $n.SetAttribute('CreateSymbol', 'true')
+                    $changed = $true
+                }
+            }
+            if ($doAreas) {
+                foreach ($n in $doc.SelectNodes('//DataAreas//DataArea/AreaNo')) {
+                    $n.SetAttribute('CreateSymbols', 'true')
+                    $changed = $true
+                }
+            }
+            if ($changed) {
+                try {
+                    $item.ConsumeXml($doc.OuterXml)
+                } catch {
+                    $xmlError = $null
+                    try { $xmlError = $item.GetLastXmlError() } catch { }
+                    if ($xmlError) { throw "ConsumeXml failed: $xmlError" }
+                    throw
+                }
+            }
+
+            $data = @{
+                treePath = $path
+                parameters = $doParams
+                dataAreas = $doAreas
+                changed = $changed
+            }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml()
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'twincat_module_set_context' {
+            if (-not (Ensure-Te1000ModuleHelper)) {
+                Fail('TCatSysManagerLib.dll could not be loaded; the typed ITcModuleInstance2.SetModuleContext call is required to set a module context on this shell')
+            }
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.taskObjectId) { throw 'taskObjectId is required' }
+            $taskObjectId = [int]$payload.taskObjectId
+            $contextId = if ($payload.PSObject.Properties.Name -contains 'contextId' -and $null -ne $payload.contextId) { [int]$payload.contextId } else { 0 }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            [Te1000ModuleHelper]::SetContext($item, $contextId, $taskObjectId)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $path
+                    contextId = $contextId
+                    taskObjectId = $taskObjectId
+                    contextSet = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_link_variables' {
+            $producer = [string]$payload.a
+            $consumer = [string]$payload.b
+            $autoResolve = $true
+            if ($payload.PSObject.Properties.Name -contains 'autoResolve') {
+                $autoResolve = [bool]$payload.autoResolve
+            }
+            if ([string]::IsNullOrWhiteSpace($producer) -or [string]::IsNullOrWhiteSpace($consumer)) {
+                throw 'a and b are required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $result = Link-Variables -SysManager $sysManager -Producer $producer -Consumer $consumer -AutoResolve $autoResolve
+
+            Write-JsonResult @{
+                ok = $true
+                data = $result
+            }
+            exit 0
+        }
+
+        'twincat_module_unlink_variables' {
+            $variableA = [string]$payload.a
+            $variableB = if ($payload.PSObject.Properties.Name -contains 'b') { [string]$payload.b } else { $null }
+            if ([string]::IsNullOrWhiteSpace($variableA)) {
+                throw 'a is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            if ([string]::IsNullOrWhiteSpace($variableB)) {
+                $sysManager.UnlinkVariables($variableA)
+            } else {
+                $sysManager.UnlinkVariables($variableA, $variableB)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    variableA = $variableA
+                    variableB = $variableB
+                    unlinked = $true
                 }
             }
             exit 0

@@ -25,6 +25,7 @@ const DELETE_CONFIRMATION = "ALLOW_TWINCAT_DELETE";
 const PLC_DOWNLOAD_CONFIRMATION = "ALLOW_PLC_DOWNLOAD";
 const PLC_LIBRARY_REPO_CONFIRMATION = "ALLOW_PLC_LIBRARY_REPO";
 const ROUTE_WRITE_CONFIRMATION = "ALLOW_TWINCAT_ROUTE_WRITE";
+const MODULE_CONTEXT_CONFIRMATION = "ALLOW_TWINCAT_MODULE_CONTEXT";
 
 // --- Modal-dialog watchdog -------------------------------------------------
 // A bridge COM call into XAE blocks until any modal dialog it raises is
@@ -1208,6 +1209,71 @@ server.registerTool(
       case "set_xml":
         need(p, ["path", "xml"], p.action);
         return textResult(await bridgeCall("fieldbus_set_xml", { ...base, path: p.path, xml: p.xml, returnXml: p.returnXml === true, save: p.save === true }));
+    }
+  },
+);
+
+server.registerTool(
+  "tc_module",
+  {
+    description:
+      "TcCOM module objects under TIRC^TcCOM Objects (paths use ^ separators). CONFIG-TIME ONLY — no INIT/PREOP/SAFEOP/OP transitions (not an Automation Interface feature); nothing here activates config, downloads, or touches the runtime/safety system. Actions: " +
+      "list (read-only) — enumerate module instances via ITcModuleManager3, returns {count,modules:[{moduleTypeName,moduleInstanceName,classId,oid,objectId,parentOid}]} (oids are DECIMAL; XAE shows hex). " +
+      "create (name, by=\"classid\"|\"name\", id, before?) — CreateChild under TcCOM Objects: by=classid -> subType 0, id = module GUID/ClassID e.g. {8f5fdcff-...}; by=name -> subType 1, id = registered module type name e.g. \"NewModule\"; a malformed/ghost child is cleaned up and reported as an error. " +
+      "get_xml (path) — ProduceXml of the instance (Parameters / DataAreas / Symbols, with current CreateSymbol/CreateSymbols flags). set_xml (path, xml, returnXml?) — ConsumeXml escape hatch for parameters not exposed as typed properties. " +
+      "enable_symbols (path, parameters?, dataAreas?, returnXml?) — convenience toggle: sets CreateSymbol=true on Parameter nodes and/or CreateSymbols=true on DataArea AreaNo nodes via ProduceXml/ConsumeXml. CAVEAT: the XPath/attribute names are from a how-to summary, NOT verified against a literal ProduceXml dump — call get_xml on a real module first and fall back to set_xml if the toggle reports changed:false. " +
+      "link (a, b, autoResolve?) / unlink (a, b?; a alone removes all of a's links) — wire module DataArea symbols to PLC/IO/other-module variables (symbols must already exist via enable_symbols); offline edit, not guarded. " +
+      "set_context (path, taskObjectId, contextId?) — assign the instance to a task's execution context; taskObjectId/contextId are DECIMAL oids (XAE shows hex). GUARDED: changes the activated mapping/runtime context, requires confirm=\"" + MODULE_CONTEXT_CONFIRMATION + "\" and defaults to no-op.",
+    inputSchema: {
+      action: z.enum(["list", "create", "get_xml", "set_xml", "enable_symbols", "set_context", "link", "unlink"]),
+      path: z.string().optional(),
+      name: z.string().optional(),
+      by: z.enum(["classid", "name"]).optional(),
+      id: z.string().optional(),
+      before: z.string().optional().describe("insert before this sibling under TcCOM Objects"),
+      xml: z.string().optional(),
+      returnXml: z.boolean().optional(),
+      parameters: z.boolean().optional(),
+      dataAreas: z.boolean().optional(),
+      taskObjectId: z.number().int().optional().describe("decimal ObjectId of the target task (XAE shows it in hex)"),
+      contextId: z.number().int().optional(),
+      a: z.string().optional(),
+      b: z.string().optional(),
+      autoResolve: z.boolean().optional(),
+      confirm: z.string().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "list":
+        return textResult(await bridgeCall("twincat_module_list", {}));
+      case "create":
+        need(p, ["name", "by", "id"], p.action);
+        return textResult(await bridgeCall("twincat_module_create", { name: p.name, by: p.by, id: p.id, before: p.before }));
+      case "get_xml":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_module_get_xml", { path: p.path }));
+      case "set_xml":
+        need(p, ["path", "xml"], p.action);
+        return textResult(await bridgeCall("twincat_module_set_xml", { path: p.path, xml: p.xml, returnXml: p.returnXml === true }));
+      case "enable_symbols":
+        need(p, ["path"], p.action);
+        if (p.parameters !== true && p.dataAreas !== true) {
+          throw new Error("enable_symbols: set parameters:true and/or dataAreas:true (nothing to do otherwise).");
+        }
+        return textResult(await bridgeCall("twincat_module_enable_symbols", { path: p.path, parameters: p.parameters === true, dataAreas: p.dataAreas === true, returnXml: p.returnXml === true }));
+      case "link":
+        need(p, ["a", "b"], p.action);
+        return textResult(await bridgeCall("twincat_module_link_variables", { a: p.a, b: p.b, autoResolve: p.autoResolve !== false }));
+      case "unlink":
+        need(p, ["a"], p.action);
+        return textResult(await bridgeCall("twincat_module_unlink_variables", { a: p.a, b: p.b }));
+      case "set_context":
+        if (p.confirm !== MODULE_CONTEXT_CONFIRMATION) {
+          throw new Error('Blocked. set_context assigns the module to a task execution context, changing the activated mapping/runtime context. Re-run with confirm="' + MODULE_CONTEXT_CONFIRMATION + '" to proceed.');
+        }
+        need(p, ["path", "taskObjectId"], p.action);
+        return textResult(await bridgeCall("twincat_module_set_context", { path: p.path, taskObjectId: p.taskObjectId, contextId: p.contextId }));
     }
   },
 );
