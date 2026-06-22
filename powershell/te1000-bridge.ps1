@@ -3873,7 +3873,7 @@ try {
         }
 
         'twincat_create_io' {
-            # NATIVE EtherCAT IO creator (createIO). For each requested module the
+            # NATIVE EtherCAT IO creator (tc_ethercat). For each requested module the
             # box is created by the GUI's own "Add Box" route, exposed through the
             # Automation Interface:
             #

@@ -5,6 +5,21 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-22 — Renamed `createIO` → `tc_ethercat` for clarity — branch `feature/rename-tc-ethercat`
+
+`createIO` is renamed to **`tc_ethercat`** so the EtherCAT-vs-other-buses split is
+obvious and parallel: `tc_ethercat` (EtherCAT IO from ESI) sits beside
+`tc_fieldbus` (PROFINET/PROFIBUS/CANopen/DeviceNet/EAP). "fieldbus" technically
+includes EtherCAT, so the old `createIO`/`tc_fieldbus` pairing was ambiguous.
+Decision: rename + keep them separate (not merged) — `tc_ethercat`'s zero-SubType,
+product-string-only `racks[]` shape is deliberately simpler than the SubType-driven
+`tc_fieldbus`, and merging would dilute it. The MCP **tool name** changed; the
+internal bridge verb stays `twincat_create_io` (no functional change). All
+cross-references in tool descriptions + README updated. Historical entries below
+keep the old `createIO` name as the record of what it was called at the time.
+
+---
+
 ## 2026-06-22 — AI-surface buildout: 13 new tools close almost all of `features.md §17` — branch `feature/ai-surface-buildout`
 
 Added **13 noun-grouped MCP tools** (one commit each) that wrap the automatable

@@ -380,7 +380,7 @@ server.registerTool(
 server.registerTool(
   "tc_tree",
   {
-    description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml raw XML; summary:true for a compact identity + slot-module list instead of the full blob); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); create now VALIDATES the created child and errors clearly on a malformed/ghost result (blank name, name mismatch, or wrong parent) instead of silently succeeding — adding an EtherCAT box typically requires a proper ESI-based createInfo (a bare subType such as 9099 with no createInfo produces a blank-named ghost), and create_batch records such failures per-entry as ok:false (to ADD whole EtherCAT terminals/boxes from the ESI, prefer the dedicated createIO tool, which expands them natively); DELETE — delete / delete_batch (deletes:[{parent,name}], GUARDED: pass dryRun:true to preview which children exist without deleting, or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete). Mutating *_batch verbs (set_xml_batch, rename_batch, create_batch, delete_batch) accept optional save:true to save the solution once after the batch. No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
+    description: "TwinCAT System Manager tree items; paths use ^ separators (e.g. TIPC^MyPlc, TIID^Device 2 (EtherCAT)^Box 1). BATCH-FIRST: when acting on more than one item, use the matching *_batch action — it runs N operations in ONE DTE attach and returns a compact roll-up {count,succeeded,failed,results:[{...,ok,error?}]} (continue-on-error), instead of paying a process-spawn + attach per call. Actions, grouped single / batch: READ identity — get / get_batch (paths:[...]); TEST existence — exists / exists_batch (paths:[...]); READ xml — get_xml (ProduceXml raw XML; summary:true for a compact identity + slot-module list instead of the full blob); WRITE params — set_xml / set_xml_batch (items:[{path,xml}]) (ConsumeXml; compact unless returnXml:true); RENAME — rename / rename_batch (renames:[{name|path,newName}]) (keeps IO links intact); CREATE — create / create_batch (creates:[{parent,name,subType,before?,createInfo?}]); create now VALIDATES the created child and errors clearly on a malformed/ghost result (blank name, name mismatch, or wrong parent) instead of silently succeeding — adding an EtherCAT box typically requires a proper ESI-based createInfo (a bare subType such as 9099 with no createInfo produces a blank-named ghost), and create_batch records such failures per-entry as ok:false (to ADD whole EtherCAT terminals/boxes from the ESI, prefer the dedicated tc_ethercat tool, which expands them natively); DELETE — delete / delete_batch (deletes:[{parent,name}], GUARDED: pass dryRun:true to preview which children exist without deleting, or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete). Mutating *_batch verbs (set_xml_batch, rename_batch, create_batch, delete_batch) accept optional save:true to save the solution once after the batch. No batch form: children (lists child items, incl. CPX-AP/Festo sub-modules), import (.xti under path), export (name to file), focus (Solution Explorer).",
     inputSchema: {
       action: z.enum(["get", "children", "exists", "exists_batch", "get_batch", "get_xml", "set_xml", "set_xml_batch", "rename", "rename_batch", "create", "create_batch", "delete", "delete_batch", "import", "export", "focus"]),
       path: z.string().optional(),
@@ -458,7 +458,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "createIO",
+  "tc_ethercat",
   {
     description:
       "Create EtherCAT IO boxes (terminals/couplers) NATIVELY. Each module is added via the GUI's own \"Add Box\" route — ITcSmTreeItem.CreateChild(name, 9099, before, \"<productString>\") — so TwinCAT expands the box FROM ITS OWN ESI: a fully populated, non-hollow box (correct identity, SyncManagers, FMMUs, full <EtherCAT> mailbox/CoE/FoE element, complete PDOs+entries) for ANY class — digital, analog (in AND out), IO-Link, mailbox, DC, couplers. createInfo is the PLAIN PRODUCT STRING (the bare type = latest revision, or a revision-pinned form), NOT identity XML/numbers. " +
@@ -479,7 +479,7 @@ server.registerTool(
     },
   },
   async ({ racks, save }) => {
-    need({ racks }, ["racks"], "createIO");
+    need({ racks }, ["racks"], "tc_ethercat");
     return textResult(await bridgeCall("twincat_create_io", { racks, save: save === true }));
   },
 );
@@ -1123,7 +1123,7 @@ server.registerTool(
   "tc_fieldbus",
   {
     description:
-      "Create + configure NON-EtherCAT fieldbus masters/slaves/boxes (PROFINET / PROFIBUS / CANopen / DeviceNet / EAP net-vars) via ITcSmTreeItem CreateChild + ClaimResources + ConsumeXml. OFFLINE CONFIG ONLY — every action edits the in-memory project; NOTHING here pushes to the live cell or runtime (activate/download/restart stay the existing guarded tools), so no confirm token is needed. Safety (TISC) paths are rejected by policy. For EtherCAT terminals/boxes use createIO instead. " +
+      "Create + configure NON-EtherCAT fieldbus masters/slaves/boxes (PROFINET / PROFIBUS / CANopen / DeviceNet / EAP net-vars) via ITcSmTreeItem CreateChild + ClaimResources + ConsumeXml. OFFLINE CONFIG ONLY — every action edits the in-memory project; NOTHING here pushes to the live cell or runtime (activate/download/restart stay the existing guarded tools), so no confirm token is needed. Safety (TISC) paths are rejected by policy. For EtherCAT terminals/boxes use tc_ethercat instead. " +
       "BATCH-FIRST: to create more than one device use create_batch (N ops in ONE DTE attach, continue-on-error roll-up {count,succeeded,failed,results:[{parent,name,ok,child?,claimed?,error?}]}). " +
       "SubType cheat-sheet — PROFINET ctrl 113/119/126/140, dev 115/118/142/143; PROFIBUS master 86 slave 97; CANopen master 87 slave 98; DeviceNet master 41/73/88 slave 62/74/99 monitor 59 box 5203; EAP device 112 publisher 9051 subscriber 9052. " +
       "Actions: " +
@@ -1440,7 +1440,7 @@ server.registerTool(
     description:
       'TwinCAT licensing on the TIRC^License node (requires TC3.1 >= 4022.4; older targets have no AvailableLicenseDevices/ActivateResponseFile support and ProduceXml/ConsumeXml return empty or error — the HRESULT is surfaced, not masked). Nothing here touches the safety system (TIRC^License is real-time/licensing config). Actions: ' +
       'list (read-only) — discover available dongle license devices via ProduceXml; returns {treePath, devices:[{name,pathName,typeName,objectId}]} (pass raw:true to also include the full License-node ProduceXml blob). ' +
-      'add (name, device) — OFFLINE config edit: CreateChild a license-device child under License bound to a dongle that MUST already exist in the I/O tree (device = its display-name e.g. "Term 2 (EL6070)" OR its ObjectID e.g. "50462722" from list). This only links the License node to existing hardware; it does NOT create the dongle terminal — add the EL6070 (etc.) first via createIO/tc_tree. Not confirm-gated (config-only). ' +
+      'add (name, device) — OFFLINE config edit: CreateChild a license-device child under License bound to a dongle that MUST already exist in the I/O tree (device = its display-name e.g. "Term 2 (EL6070)" OR its ObjectID e.g. "50462722" from list). This only links the License node to existing hardware; it does NOT create the dongle terminal — add the EL6070 (etc.) first via tc_ethercat/tc_tree. Not confirm-gated (config-only). ' +
       'activate_response (confirm, path, oemGuid?) — GUARDED, requires confirm="' + LICENSE_ACTIVATE_CONFIRMATION + '" and defaults to no-op: ConsumeXml the ActivateResponseFile command to activate an OEM license response file (path = absolute path to the .tmc/.reresponse file). oemGuid is "only required in special cases" and accepts any value; defaults to 0 when omitted. This is a license-activation state change.',
     inputSchema: {
       action: z.enum(["list", "add", "activate_response"]),
