@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/assets/te1000-banner.png" alt="TE1000 MCP — MCP server for Beckhoff TwinCAT XAE / TE1000 Automation Interface" width="100%">
-</p>
-
 # te1000-mcp
 
 > A [Model Context Protocol](https://modelcontextprotocol.io) server for **Beckhoff TwinCAT 3** engineering automation — drive the **TE1000 / XAE Automation Interface** from an AI agent or any MCP client.
@@ -22,6 +18,10 @@ can configure and build a TwinCAT project the same way an engineer would in the 
 > This server drives a **real engineering tool** and can deploy to a **live PLC**.
 > Every action that touches the running target (activate, restart, download, deletes,
 > licensing) is **confirmation-gated** and off by default. See [Safety & guards](#safety--guards).
+
+<p align="center">
+  <img src="docs/assets/te1000-banner.png" alt="TE1000 MCP — MCP server for Beckhoff TwinCAT XAE / TE1000 Automation Interface" width="100%">
+</p>
 
 ---
 
