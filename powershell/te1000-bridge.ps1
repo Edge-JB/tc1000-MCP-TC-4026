@@ -6998,7 +6998,8 @@ try {
         }
 
         'plc_pou_move' {
-            # Reparent one PLC object via export-import-delete in ONE attach.
+            # Reparent one PLC object via export(.zip)-delete-import in ONE attach
+            # (delete-before-import keeps the original name; see Invoke-PlcObjectMove).
             # OFFLINE, unguarded. Refuse TISC on BOTH path and newParent before attach.
             $path = [string]$payload.path
             $newParent = [string]$payload.newParent
