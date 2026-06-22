@@ -1055,6 +1055,67 @@ server.registerTool(
 );
 
 server.registerTool(
+  "tc_settings",
+  {
+    description:
+      'XAE engineering settings & packaging. OFFLINE/engineering-only: NONE of these write toward the live cell or change runtime state (their cell effect, if any, lands only on a SEPARATE later activate/download), so none are confirm-gated. Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy in set_disabled/set_independent_file/save_plc_archive. Actions: ' +
+      'get_silent_mode / set_silent_mode (enabled) — TcAutomationSettings.SilentMode; suppresses AI message-box dialogs (TC3.1>=4020.0; older builds throw). A good companion to the dialog watchdog. ' +
+      'get_target_platform / set_target_platform (platform = "TwinCAT RT (x86)" | "TwinCAT RT (x64)") — ITcSysManager7.ConfigurationManager.ActiveTargetPlatform; switching platform invalidates prior build output, so rebuild (xae_build) before activate/download. ' +
+      'save_solution_archive (file = absolute .tszip) — ITcSysManager9.SaveAsArchive, whole solution; parent dir must exist (not created). ' +
+      'save_plc_archive (file = absolute .tpzip, name? = PLC child under TIPC, default first child) — ExportChild of the PLC project. ' +
+      'get_independent_file / set_independent_file (path, enabled) — ITcSmTreeItem6.SaveInOwnFile (store node settings in its own file vs inline in .tsproj). ' +
+      'get_disabled (path) — reads ITcSmTreeItem.Disabled, returns {disabled:0|1|2, state:SMDS_NOT_DISABLED|SMDS_DISABLED|SMDS_PARENT_DISABLED}; SMDS_PARENT_DISABLED(2) is a derived read-only state. set_disabled (path, disabled) — sets 0/1 only (2 is never settable).',
+    inputSchema: {
+      action: z.enum([
+        "get_silent_mode", "set_silent_mode",
+        "get_target_platform", "set_target_platform",
+        "save_solution_archive", "save_plc_archive",
+        "get_independent_file", "set_independent_file",
+        "get_disabled", "set_disabled",
+      ]),
+      enabled: z.boolean().optional(),
+      disabled: z.boolean().optional(),
+      platform: z.string().optional(),
+      path: z.string().optional(),
+      file: z.string().optional(),
+      name: z.string().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "get_silent_mode":
+        return textResult(await bridgeCall("twincat_get_silent_mode", {}));
+      case "set_silent_mode":
+        need(p, ["enabled"], p.action);
+        return textResult(await bridgeCall("twincat_set_silent_mode", { enabled: p.enabled }));
+      case "get_target_platform":
+        return textResult(await bridgeCall("twincat_get_target_platform", {}));
+      case "set_target_platform":
+        need(p, ["platform"], p.action);
+        return textResult(await bridgeCall("twincat_set_target_platform", { platform: p.platform }));
+      case "save_solution_archive":
+        need(p, ["file"], p.action);
+        return textResult(await bridgeCall("twincat_save_solution_archive", { file: p.file }));
+      case "save_plc_archive":
+        need(p, ["file"], p.action);
+        return textResult(await bridgeCall("twincat_save_plc_archive", { file: p.file, name: p.name }));
+      case "get_independent_file":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_get_independent_file", { path: p.path }));
+      case "set_independent_file":
+        need(p, ["path", "enabled"], p.action);
+        return textResult(await bridgeCall("twincat_set_independent_file", { path: p.path, enabled: p.enabled }));
+      case "get_disabled":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_get_node_disabled", { path: p.path }));
+      case "set_disabled":
+        need(p, ["path", "disabled"], p.action);
+        return textResult(await bridgeCall("twincat_set_node_disabled", { path: p.path, disabled: p.disabled }));
+    }
+  },
+);
+
+server.registerTool(
   "twincat_activate_configuration",
   {
     description: `Activate the TwinCAT configuration on the target. Guarded: confirm="${ACTIVATE_CONFIRMATION}".`,

@@ -1118,6 +1118,48 @@ public static class Te1000PlcLibraryHelper {
     return $null -ne ('Te1000PlcLibraryHelper' -as [type])
 }
 
+function Ensure-TcSettingsHelper {
+    # FALLBACK for tc_settings. ITcSysManager7.ConfigurationManager /
+    # ITcConfigManager.ActiveTargetPlatform, ITcSysManager9.SaveAsArchive, and
+    # ITcSmTreeItem6.SaveInOwnFile are accessed late-bound first; if a versioned
+    # member is vtable-only on the 64-bit TcXaeShell (as ITcPlcProject was),
+    # PowerShell cannot reach it without a CLR QI. This compiled helper QIs the
+    # typed interfaces, exactly as Te1000PlcProjectHelper does. Returns $false if
+    # TCatSysManagerLib.dll is unavailable.
+    if ('Te1000SettingsHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
+public static class Te1000SettingsHelper {
+    public static string GetActiveTargetPlatform(object project) {
+        ITcConfigManager cfg = ((ITcSysManager7)project).ConfigurationManager;
+        return cfg.ActiveTargetPlatform;
+    }
+    public static void SetActiveTargetPlatform(object project, string platform) {
+        ITcConfigManager cfg = ((ITcSysManager7)project).ConfigurationManager;
+        cfg.ActiveTargetPlatform = platform;
+    }
+    public static void SaveAsArchive(object project, string file) {
+        ((ITcSysManager9)project).SaveAsArchive(file);
+    }
+    public static bool GetSaveInOwnFile(object treeItem) {
+        return ((ITcSmTreeItem6)treeItem).SaveInOwnFile;
+    }
+    public static void SetSaveInOwnFile(object treeItem, bool enabled) {
+        ((ITcSmTreeItem6)treeItem).SaveInOwnFile = enabled;
+    }
+}
+'@
+    return $null -ne ('Te1000SettingsHelper' -as [type])
+}
+
 function Resolve-PlcReferencesPath {
     # Shared resolution for the plc_library verbs: returns the References-node tree
     # path. Defaults to the first PLC under TIPC (TIPC^<plc>^<plc> Project^References).
@@ -5827,6 +5869,283 @@ try {
                     added = $true
                     name = $rName
                     netId = $rNetId
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_silent_mode' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $settings = Get-AutomationSettings -Dte $dte
+            $silent = [bool](Get-SafeValue { [bool]$settings.SilentMode })
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    silentMode = $silent
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_silent_mode' {
+            if (-not ($payload.PSObject.Properties.Name -contains 'enabled')) {
+                throw "'enabled' is required (boolean)"
+            }
+            $enabled = [bool]$payload.enabled
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $settings = Get-AutomationSettings -Dte $dte
+            $prev = [bool]$settings.SilentMode
+            $settings.SilentMode = $enabled
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    silentMode = $enabled
+                    previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_target_platform' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $platform = $null
+            try {
+                $cfg = $sysManager.ConfigurationManager
+                $platform = [string]$cfg.ActiveTargetPlatform
+            } catch {
+                if (-not (Ensure-TcSettingsHelper)) { throw }
+                $platform = [Te1000SettingsHelper]::GetActiveTargetPlatform($sysManager)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    activeTargetPlatform = $platform
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_target_platform' {
+            $platform = [string]$payload.platform
+            $allowed = @('TwinCAT RT (x86)', 'TwinCAT RT (x64)')
+            if ($allowed -notcontains $platform) {
+                throw "platform must be exactly one of: '$($allowed -join "', '")'"
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $prev = $null
+            try {
+                $cfg = $sysManager.ConfigurationManager
+                $prev = [string]$cfg.ActiveTargetPlatform
+                $cfg.ActiveTargetPlatform = $platform
+            } catch {
+                if (-not (Ensure-TcSettingsHelper)) { throw }
+                $prev = [Te1000SettingsHelper]::GetActiveTargetPlatform($sysManager)
+                [Te1000SettingsHelper]::SetActiveTargetPlatform($sysManager, $platform)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    activeTargetPlatform = $platform
+                    previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        'twincat_save_solution_archive' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required (absolute path ending in .tszip)'
+            }
+            if (-not $file.ToLowerInvariant().EndsWith('.tszip')) {
+                throw "file must end in .tszip: $file"
+            }
+            $parent = Split-Path -Parent $file
+            if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent)) {
+                throw "parent directory does not exist (not created automatically): $parent"
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.SaveAsArchive($file)
+            } catch {
+                if (-not (Ensure-TcSettingsHelper)) { throw }
+                [Te1000SettingsHelper]::SaveAsArchive($sysManager, $file)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    file = $file
+                    saved = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_save_plc_archive' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required (absolute path ending in .tpzip)'
+            }
+            if (-not $file.ToLowerInvariant().EndsWith('.tpzip')) {
+                throw "file must end in .tpzip: $file"
+            }
+            $parent = Split-Path -Parent $file
+            if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent)) {
+                throw "parent directory does not exist (not created automatically): $parent"
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $plc = (Get-TreeItem -SysManager $sysManager -TreePath 'TIPC').Value
+
+            $childName = if ($payload.name) { [string]$payload.name } else { $null }
+            if ([string]::IsNullOrWhiteSpace($childName)) {
+                if ([int]$plc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $childName = [string]$plc.Child(1).Name
+            }
+
+            $plc.ExportChild($childName, $file)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIPC'
+                    childName = $childName
+                    file = $file
+                    saved = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_independent_file' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $value = $null
+            $raw = Get-SafeValue { [bool]$item.SaveInOwnFile }
+            if ($null -ne $raw) {
+                $value = [bool]$raw
+            } else {
+                if (-not (Ensure-TcSettingsHelper)) { throw 'SaveInOwnFile is not accessible (late-bound) and the typed helper could not be loaded' }
+                $value = [Te1000SettingsHelper]::GetSaveInOwnFile($item)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    saveInOwnFile = $value
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_independent_file' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            Assert-NotSafetyPath -Path $path
+            if (-not ($payload.PSObject.Properties.Name -contains 'enabled')) {
+                throw "'enabled' is required (boolean)"
+            }
+            $enabled = [bool]$payload.enabled
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            $prev = $null
+            $raw = Get-SafeValue { [bool]$item.SaveInOwnFile }
+            if ($null -ne $raw) {
+                $prev = [bool]$raw
+                $item.SaveInOwnFile = $enabled
+            } else {
+                if (-not (Ensure-TcSettingsHelper)) { throw 'SaveInOwnFile is not accessible (late-bound) and the typed helper could not be loaded' }
+                $prev = [Te1000SettingsHelper]::GetSaveInOwnFile($item)
+                [Te1000SettingsHelper]::SetSaveInOwnFile($item, $enabled)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    saveInOwnFile = $enabled
+                    previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_node_disabled' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            $DISABLED_STATE = @{ 0 = 'SMDS_NOT_DISABLED'; 1 = 'SMDS_DISABLED'; 2 = 'SMDS_PARENT_DISABLED' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $raw = [int](Get-SafeValue { [int]$item.Disabled })
+            $state = if ($DISABLED_STATE.ContainsKey($raw)) { $DISABLED_STATE[$raw] } else { "UNKNOWN($raw)" }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    disabled = $raw
+                    state = $state
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_node_disabled' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            Assert-NotSafetyPath -Path $path
+            if (-not ($payload.PSObject.Properties.Name -contains 'disabled')) {
+                throw "'disabled' is required (boolean)"
+            }
+            $disabled = [bool]$payload.disabled
+            $DISABLED_STATE = @{ 0 = 'SMDS_NOT_DISABLED'; 1 = 'SMDS_DISABLED'; 2 = 'SMDS_PARENT_DISABLED' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $prev = [int](Get-SafeValue { [int]$item.Disabled })
+            $newVal = if ($disabled) { 1 } else { 0 }
+            $item.Disabled = $newVal
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    disabled = $newVal
+                    state = $DISABLED_STATE[$newVal]
+                    previous = $prev
                 }
             }
             exit 0
