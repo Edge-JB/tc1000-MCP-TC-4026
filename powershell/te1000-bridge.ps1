@@ -7661,6 +7661,123 @@ try {
             exit 0
         }
 
+        # --- tc_variant: project variant management (OFFLINE config only) ------
+        # ProjectVariantConfig / CurrentProjectVariant live on iTcSysManager14
+        # (TCatSysManagerLib >= 3.3.0.0); PvDisable / Disabled-for-variants on
+        # ITcSmTreeItem9. All accessed late-bound on the __ComObject (no CLR QI).
+        # Every verb edits the open solution's variant definition / active variant
+        # / per-item disable flag — NONE activate/download/touch the runtime, so no
+        # confirm token. The per-item disable verb refuses TISC (safety) paths.
+        'twincat_get_variant_config' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $xml = Get-SafeValue { [string]$sysManager.ProjectVariantConfig }
+            Write-JsonResult @{
+                ok = $true
+                data = @{ xml = $xml }
+            }
+            exit 0
+        }
+
+        'twincat_get_current_variant' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $cur = Get-SafeValue { [string]$sysManager.CurrentProjectVariant }
+            Write-JsonResult @{
+                ok = $true
+                data = @{ current = $cur }
+            }
+            exit 0
+        }
+
+        'twincat_set_variant_config' {
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($xml)) {
+                throw 'xml is required'
+            }
+            $save = ($payload.PSObject.Properties.Name -contains 'save') -and [bool]$payload.save
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.ProjectVariantConfig = $xml
+            } catch {
+                throw "Setting ProjectVariantConfig failed: $($_.Exception.Message)"
+            }
+            if ($save) { Save-Solution -Dte $dte }
+            $readback = Get-SafeValue { [string]$sysManager.ProjectVariantConfig }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    defined = $true
+                    xml = $readback
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_current_variant' {
+            $variant = [string]$payload.variant
+            if ([string]::IsNullOrWhiteSpace($variant)) {
+                throw 'variant is required'
+            }
+            $save = ($payload.PSObject.Properties.Name -contains 'save') -and [bool]$payload.save
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $sysManager.CurrentProjectVariant = $variant
+            if ($save) { Save-Solution -Dte $dte }
+            $cur = [string]$sysManager.CurrentProjectVariant
+            if ($cur -ne $variant) {
+                throw "CurrentProjectVariant is '$cur' after setting '$variant' — variant/group may not exist in the variant config"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    current = $cur
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_item_variant_disable' {
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'treePath is required'
+            }
+            # Safety policy: never address the TISC safety project.
+            if ($treePath -match '^\s*TISC(\^|$)') {
+                throw "Refused: variant operations on the safety project (TISC) are disallowed by policy."
+            }
+            # Default true; index.js sends disable:false for the enable action.
+            $disable = -not (($payload.PSObject.Properties.Name -contains 'disable') -and ($payload.disable -eq $false))
+            $save = ($payload.PSObject.Properties.Name -contains 'save') -and [bool]$payload.save
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $item.PvDisable = $disable
+            $item.Disabled = if ($disable) { 1 } else { 0 }
+            if ($save) { Save-Solution -Dte $dte }
+            $state = [int](Get-SafeValue { [int]$item.Disabled })
+            $pv = [bool](Get-SafeValue { [bool]$item.PvDisable })
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $treePath
+                    pvDisable = $pv
+                    disabled = $state
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
         default {
             throw "Unsupported action: $Action"
         }

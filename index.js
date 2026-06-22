@@ -1471,6 +1471,46 @@ server.registerTool(
 );
 
 server.registerTool(
+  "tc_variant",
+  {
+    description:
+      "Project VARIANT management on the open solution (needs iTcSysManager14 / ITcSmTreeItem9 — TCatSysManagerLib >= 3.3.0.0; on older installs get_* return empty and set_*/disable surface a clear COM error). OFFLINE CONFIG ONLY — every action mutates only the variant definition / active variant / per-item variant-disable flag inside XAE; NOTHING activates config, downloads a boot project, or touches the runtime/safety system, so no confirm token (same project-config class as tc_tree set_xml/rename/create). Per-item disable/enable refuses TISC (safety) paths by policy. Optional save:true does File.SaveAll once after a write. Actions: " +
+      "get_config (read-only) — sysManager.ProjectVariantConfig, returns the raw <ProjectVariants> XML (round-trip this FIRST to capture the live shape before editing). " +
+      "get_current (read-only) — sysManager.CurrentProjectVariant; empty string => no variant active / variant management not configured. " +
+      "set_config (xml, save?) — replaces the WHOLE variant definition: a <ProjectVariants> document with <Group><Name>..</Name><Member>VariantName</Member>..</Group> and/or standalone <Variant><Name>..</Name></Variant> children (raw XML taken verbatim, string readback returned — schema is not validated). " +
+      "select (variant, save?) — sets the active variant by name (e.g. \"Variant3\") or a group in bracket form (e.g. \"[Group1]\"); the variant/group must already exist in the config (errors if the readback does not match). " +
+      "disable / enable (path, save?) — sets ITcSmTreeItem9.PvDisable + Disabled (SMDS_DISABLED=1 / SMDS_NOT_DISABLED=0) on a tree item FOR THE ACTIVE VARIANT; path uses ^ separators (e.g. TIID^Device 2 (EtherCAT)^Box 1, TIPC^MyPlc) and MUST NOT be under TISC. The readback `disabled` int may report SMDS_PARENT_DISABLED=2 (read-only state: disabled because an ancestor is) — that value is never written, only echoed.",
+    inputSchema: {
+      action: z.enum(["get_config", "get_current", "set_config", "select", "disable", "enable"]),
+      xml: z.string().optional(),
+      variant: z.string().optional(),
+      path: z.string().optional(),
+      save: z.boolean().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "get_config":
+        return textResult(await bridgeCall("twincat_get_variant_config", {}));
+      case "get_current":
+        return textResult(await bridgeCall("twincat_get_current_variant", {}));
+      case "set_config":
+        need(p, ["xml"], p.action);
+        return textResult(await bridgeCall("twincat_set_variant_config", { xml: p.xml, save: p.save === true }));
+      case "select":
+        need(p, ["variant"], p.action);
+        return textResult(await bridgeCall("twincat_set_current_variant", { variant: p.variant, save: p.save === true }));
+      case "disable":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_set_item_variant_disable", { treePath: p.path, disable: true, save: p.save === true }));
+      case "enable":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_set_item_variant_disable", { treePath: p.path, disable: false, save: p.save === true }));
+    }
+  },
+);
+
+server.registerTool(
   "twincat_activate_configuration",
   {
     description: `Activate the TwinCAT configuration on the target. Guarded: confirm="${ACTIVATE_CONFIRMATION}".`,
