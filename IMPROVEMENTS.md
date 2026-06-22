@@ -5,6 +5,59 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-22 — plc_pou surgical buildout: snippet reads, surgical edits, list/find, lifecycle, folders — branch `feature/plc-pou-surgical`
+
+Expanded `plc_pou` from a whole-section authoring tool into a token-frugal
+**read-modify-write** code editor plus discovery + lifecycle surface, built in
+five serial groups (one logical commit each): **code_engine**, **list**,
+**find**, **lifecycle**, **folders**. The 12 original actions
+(`create`/`create_batch`/`import_template`/`get_decl`/`get_impl`/`get_document`/
+`set_decl`/`set_decl_batch`/`set_impl`/`set_impl_batch`/`set_document`/
+`check_objects`) are unchanged and unregressed; no other tool was touched (diff
+vs branch point is confined to `index.js`'s `plc_pou` registration block, the
+bridge dispatch, and two offline test files).
+
+**New actions** (15): `outline`; surgical edits `replace`, `replace_lines`,
+`insert`, `insert_in_var_block`, `append`; discovery `tree`, `find`, `search`;
+lifecycle `rename`, `move`; deletion `delete`; folders `create_folder`,
+`create_folder_batch`. `get_decl`/`get_impl` also gained `range` and `grep`
+options so a caller reads only the lines it needs.
+
+**The model:** instead of fetching a full declaration/implementation, editing
+locally, and re-uploading the whole blob, a surgical edit does a `range`/`grep`
+read + a targeted `replace`/`insert`/`replace_lines` and returns **only the
+changed region ±2 context lines**. All COM is isolated in one read-modify-write
+wrapper (`Invoke-PlcTextRMW`); every mutator is a pure string function, so the
+edit logic is unit-testable offline with no XAE attach.
+
+**Safety/posture:** OFFLINE only — nothing here activates/downloads/goes online.
+Every write/rename/move/delete/create/subtree-root path refuses TISC (safety)
+paths via `Assert-NotSafetyPath`. `delete` is double-gated (`dryRun` preview +
+`confirm="ALLOW_TWINCAT_DELETE"`, enforced in `index.js` before the bridge is
+called). CRLF/LF is preserved byte-for-byte; non-unique/zero-match anchors and
+out-of-bounds line ranges fail **without writing**; graphical
+(FBD/LD/SFC/CFC) implementations are refused for text edits.
+
+**Adversarial verification (offline):** `test-code-engine.ps1` (59 checks) plus a
+new `test-code-engine-adversarial.ps1` (37 checks) that replay the exact splice
+mutators and assert byte-for-byte preservation — multi-line replace, anchor
+inside a comment (non-unique → safe fail), insert at line 1 / lineCount+1 / OOB,
+replace_lines over the whole text, insert_in_var_block with multiple/zero/empty
+blocks, CRLF-vs-LF preservation, empty implementation, and grep with regex
+metacharacters. This surfaced and fixed one real defect: `Get-FirstDivergentLine`
+/ `Get-LastDivergentLine` used PowerShell's **case-insensitive** `-ne`/`-eq`, so
+a case-only edit (e.g. `TRUE`→`true`) reported a wrong `changedRange`/snippet
+(the write itself was correct via the ordinal `Apply-Replace`). Switched both to
+case-sensitive (`-cne`/`-ceq`) with null-safe length handling; both suites now
+pass 96/96.
+
+**Live testing is pending** — all verification so far is offline parse-check +
+pure-helper unit tests; the COM-bound dispatch (resolve tree item, GetDeclaration
+/ SetImplementationText round-trip, move's export-import-delete) has not yet been
+exercised against an open solution in XAE.
+
+---
+
 ## 2026-06-22 — Dedupe round 2: removed 4 redundant alias actions — branch `feature/dedupe-overlap-actions`
 
 Dedupe round 2: removed plc_project check (use plc_pou check_objects), plc_project link_task (use tc_task set_linked_task), tc_module link/unlink (use tc_link) — each a redundant alias with a confirmed-better keeper; verified live this session. (tc_measurement node_get_xml/set_xml were removed earlier.)

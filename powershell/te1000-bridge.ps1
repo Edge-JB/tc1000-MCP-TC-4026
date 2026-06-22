@@ -2012,9 +2012,15 @@ function Get-FirstDivergentLine {
     $o = @($OldLines); $n = @($NewLines)
     $max = [Math]::Max($o.Count, $n.Count)
     for ($i = 0; $i -lt $max; $i++) {
-        $ov = if ($i -lt $o.Count) { $o[$i] } else { $null }
-        $nv = if ($i -lt $n.Count) { $n[$i] } else { $null }
-        if ($ov -ne $nv) { return ($i + 1) }
+        $oPresent = $i -lt $o.Count
+        $nPresent = $i -lt $n.Count
+        if ($oPresent -ne $nPresent) { return ($i + 1) }  # one side has an extra line
+        # Case-SENSITIVE, ordinal compare: a case-only edit (e.g. TRUE->true,
+        # bX->BX) is a real change. PowerShell -ne is case-insensitive, so use
+        # -cne (treat null as empty string only for the in-range compare).
+        $ov = if ($oPresent) { [string]$o[$i] } else { '' }
+        $nv = if ($nPresent) { [string]$n[$i] } else { '' }
+        if ($ov -cne $nv) { return ($i + 1) }
     }
     return $null
 }
@@ -2026,7 +2032,8 @@ function Get-LastDivergentLine {
     $o = @($OldLines); $n = @($NewLines)
     $oi = $o.Count - 1
     $ni = $n.Count - 1
-    while ($oi -ge 0 -and $ni -ge 0 -and $o[$oi] -eq $n[$ni]) { $oi--; $ni-- }
+    # Case-SENSITIVE compare (-ceq) so a case-only edit is detected as a change.
+    while ($oi -ge 0 -and $ni -ge 0 -and ([string]$o[$oi]) -ceq ([string]$n[$ni])) { $oi--; $ni-- }
     if ($ni -lt 0 -and $oi -lt 0) { return $null }
     if ($ni -lt 0) { return 1 }
     return ($ni + 1)

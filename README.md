@@ -214,10 +214,39 @@ license action is `confirm`-token gated (see "Guards" at the end of this list).
   `plcopen_export`, `plcopen_import`, `save_as_library`.
   `generate_boot_project` and `online` (Login/Start/Stop/Reset) require
   `confirm="ALLOW_PLC_DOWNLOAD"` (they touch the live runtime/boot dir).
-- **`plc_pou`** — PLC object authoring + code edit (§7.3). Actions: `create`,
-  `create_batch`, `import_template`, `get_decl`, `get_impl`, `get_document`,
-  `set_decl`, `set_decl_batch`, `set_impl`, `set_impl_batch`, `set_document`,
-  `check_objects`. Refuses TISC paths.
+- **`plc_pou`** — PLC object authoring + surgical code edit + discovery (§7.3).
+  OFFLINE engineering only (edits land in-memory; they reach the cell only via a
+  later guarded `plc_download` + `twincat_restart_runtime`). All write/rename/
+  move/delete/create paths refuse TISC (safety) paths. Actions:
+  - **Author** — `create`, `create_batch`, `import_template`.
+  - **Folders** — `create_folder`, `create_folder_batch` (PLC folder, sub-type
+    601). `create`/`create_batch` already author directly into a folder when the
+    folder's `^`-path is the `parent`.
+  - **Read** — `get_decl`, `get_impl`, `get_document`, plus `outline` (structure
+    without the full blob). `get_decl`/`get_impl` accept an optional `range`
+    {start,end} line slice **or** `grep` {pattern,context} so you read only the
+    lines you need — not the whole object.
+  - **Whole-section write** — `set_decl`, `set_decl_batch`, `set_impl`,
+    `set_impl_batch`, `set_document`.
+  - **Surgical edit (read-modify-write)** — `replace` (literal substring +
+    `expectCount` gate), `replace_lines` (1-based inclusive span), `insert`
+    (`at`/`after`/`before`), `insert_in_var_block` (insert before a VAR-block's
+    `END_VAR`), `append`. These read the object, patch in memory, write it back,
+    and return **only the changed region ±2 context lines** — never the whole
+    blob. CRLF/LF is preserved byte-for-byte; non-unique/zero-match anchors and
+    out-of-bounds ranges **fail without writing**; graphical (FBD/LD/SFC/CFC)
+    implementations are refused. Pass `validate:true` to run CheckAllObjects
+    after. This is the token-savings model: a small `get_decl range/grep` +
+    `replace` round-trip costs a fraction of fetching and re-uploading the full
+    declaration/implementation text.
+  - **Discover** — `tree` (recursive read-only project walk, `typeFilter`/`depth`),
+    `find` (flat name/type lookup to resolve a `^`-path), `search` (project-wide
+    find-in-code grep over decl + ST impl).
+  - **Lifecycle** — `rename` (in-place), `move` (reparent via export-import-
+    delete, preserving decl/impl/document/sub-objects).
+  - **Delete** — `delete` is guarded: `dryRun:true` previews, or
+    `confirm="ALLOW_TWINCAT_DELETE"` to actually remove one object.
+  - **Build-check** — `check_objects` runs CheckAllObjects (no download).
 - **`plc_library`** — library refs / placeholders / repos via `ITcPlcLibraryManager`
   (§7.2). Actions: `list`, `scan`, `repos`, `add_library`, `add_placeholder`,
   `set_resolution`, `freeze`, `remove_reference`, `install_library`,
