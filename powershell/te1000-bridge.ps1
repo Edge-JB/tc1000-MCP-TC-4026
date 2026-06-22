@@ -780,14 +780,69 @@ function Ensure-TcPlcProjectHelper {
     }
     $null = [System.Reflection.Assembly]::LoadFrom($libPath)
     Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
 public static class Te1000PlcProjectHelper {
     public static bool GetAutostart(object plcProject) {
-        return ((TCatSysManagerLib.ITcPlcProject)plcProject).BootProjectAutostart;
+        return ((ITcPlcProject)plcProject).BootProjectAutostart;
     }
     public static void Deploy(object plcProject, bool autostart, bool activate) {
-        TCatSysManagerLib.ITcPlcProject typed = (TCatSysManagerLib.ITcPlcProject)plcProject;
+        ITcPlcProject typed = (ITcPlcProject)plcProject;
         typed.BootProjectAutostart = autostart;
         typed.GenerateBootProject(activate);
+    }
+
+    // --- plc_project tool: typed (vtable QI) members PowerShell cannot reach ---
+    // ITcPlcProject lives on the PLC ROOT node (TIPC^<name>); set config-only flags.
+    public static object[] SetBootFlags(object plcProject, bool hasAutostart, bool autostart, bool hasTmc, bool tmc) {
+        ITcPlcProject typed = (ITcPlcProject)plcProject;
+        if (hasAutostart) { typed.BootProjectAutostart = autostart; }
+        if (hasTmc) { typed.TmcFileCopy = tmc; }
+        return new object[] { typed.BootProjectAutostart, typed.TmcFileCopy };
+    }
+
+    // CheckAllObjects (build-validate) lives on ITcPlcIECProject2 on the nested
+    // project INSTANCE node.
+    public static bool CheckAll(object iecProject) {
+        return ((ITcPlcIECProject2)iecProject).CheckAllObjects();
+    }
+
+    // ITcProjectRoot.NestedProject is the documented identity read on the PLC root.
+    public static string GetNestedProjectName(object projectRoot) {
+        try {
+            ITcProjectRoot typed = (ITcProjectRoot)projectRoot;
+            object nested = typed.NestedProject;
+            if (nested == null) { return null; }
+            return ((ITcSmTreeItem)nested).Name;
+        } catch { return null; }
+    }
+
+    // First child of the PLC root is the project instance node ('<name> Project').
+    public static string GetInstanceName(object treeItem) {
+        try {
+            ITcSmTreeItem typed = (ITcSmTreeItem)treeItem;
+            if (typed.ChildCount < 1) { return null; }
+            ITcSmTreeItem child = typed.get_Child(1);
+            return child == null ? null : child.Name;
+        } catch { return null; }
+    }
+
+    // ITcPlcTaskReference lives on the PlcTask node under the project instance.
+    public static string SetLinkedTask(object taskRef, string taskPath) {
+        ITcPlcTaskReference typed = (ITcPlcTaskReference)taskRef;
+        typed.LinkedTask = taskPath;
+        return typed.LinkedTask;
+    }
+
+    // ITcPlcIECProject on the project INSTANCE node: PLCopen + library.
+    public static void PlcOpenExport(object iecProject, string file, string selection) {
+        ((ITcPlcIECProject)iecProject).PlcOpenExport(file, selection);
+    }
+    public static void PlcOpenImport(object iecProject, string file, int options, string selection, bool folderStructure) {
+        ((ITcPlcIECProject)iecProject).PlcOpenImport(file, (PlcImportOptions)options, selection, folderStructure);
+    }
+    public static void SaveAsLibrary(object iecProject, string file, bool install) {
+        ((ITcPlcIECProject)iecProject).SaveAsLibrary(file, install);
     }
 }
 '@
@@ -3464,6 +3519,434 @@ try {
                 data = @{
                     restarted = $true
                     wasStarted = $wasStarted
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                throw 'name is required'
+            }
+            $template = if ($payload.template) { [string]$payload.template } else { 'Standard PLC Template' }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tipc = (Get-TreeItem -SysManager $sysManager -TreePath 'TIPC').Value
+            # subType 0 = copy-to-solution; vInfo carries the stock template NAME (infosys 242730891).
+            $child = $tipc.CreateChild($name, 0, $before, $template)
+            Assert-WellFormedChild -Parent $tipc -Child $child -RequestedName $name -SubType 0 -ParentPath 'TIPC'
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIPC'
+                    pathName = "TIPC^$name"
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_open' {
+            $name = [string]$payload.name
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                throw 'name is required'
+            }
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            if (-not (Test-Path -LiteralPath $file)) {
+                throw "PLC project file not found: $file"
+            }
+            $subType = 0
+            if ($null -ne $payload.subType) {
+                $subType = [int]$payload.subType
+            }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tipc = (Get-TreeItem -SysManager $sysManager -TreePath 'TIPC').Value
+            # Same CreateChild route as create; vInfo = file path, subType selects
+            # copy(0)/move(1)/use-in-place(2) (infosys 242730891).
+            $child = $tipc.CreateChild($name, $subType, $before, $file)
+            Assert-WellFormedChild -Parent $tipc -Child $child -RequestedName $name -SubType $subType -ParentPath 'TIPC'
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIPC'
+                    pathName = "TIPC^$name"
+                    subType = $subType
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_info' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $plc = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed casts required for plc_project_info are unavailable on this shell'
+            }
+            $nestedName = [Te1000PlcProjectHelper]::GetNestedProjectName($plc)
+            $instanceName = [Te1000PlcProjectHelper]::GetInstanceName($plc)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    name = Normalize-ScalarValue (Get-SafeValue { [string]$plc.Name })
+                    nestedProjectName = $nestedName
+                    instanceName = $instanceName
+                    childCount = Get-TreeItemChildCount -TreeItem $plc
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_check' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject2 cast is required for plc_project_check on this shell'
+            }
+            $valid = $null
+            try {
+                $valid = [Te1000PlcProjectHelper]::CheckAll($item)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject2 (use the nested project instance node, e.g. TIPC^<name>^<name> Project): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    allObjectsValid = [bool]$valid
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_boot_flags' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcProject cast is required for plc_project_boot_flags on this shell'
+            }
+            $hasAutostart = $null -ne $payload.autostart
+            $autostart = if ($hasAutostart) { [bool]$payload.autostart } else { $false }
+            $hasTmc = $null -ne $payload.tmcFileCopy
+            $tmc = if ($hasTmc) { [bool]$payload.tmcFileCopy } else { $false }
+            $current = $null
+            try {
+                $current = [Te1000PlcProjectHelper]::SetBootFlags($item, $hasAutostart, $autostart, $hasTmc, $tmc)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcProject (use the PLC root node TIPC^<name>): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    bootProjectAutostart = [bool]$current[0]
+                    tmcFileCopy = [bool]$current[1]
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_generate_boot' {
+            # GUARD enforced in index.js (confirm===ALLOW_PLC_DOWNLOAD). This is the
+            # only verb in this tool that writes toward the live target.
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $plcProject = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $autostart = $true
+            if ($null -ne $payload.autostart) {
+                $autostart = [bool]$payload.autostart
+            }
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcProject cast is required for boot project generation on this shell'
+            }
+            [Te1000PlcProjectHelper]::Deploy($plcProject, $autostart, $true)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    bootProjectGenerated = $true
+                    bootProjectAutostart = $autostart
+                    targetNetId = (Get-SafeValue { [string]$sysManager.GetTargetNetId() })
+                    note = 'Boot project generated to the target boot directory. Restart the TwinCAT runtime (twincat_restart_runtime) to load and run it.'
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_online' {
+            # GUARD enforced in index.js (confirm===ALLOW_PLC_DOWNLOAD for every command).
+            # NOTE: the literal ConsumeXml envelope below is UNVERIFIED against a live
+            # build>=4010 — confirm before relying on it; GetLastXmlError is surfaced verbatim.
+            $command = [string]$payload.command
+            if ([string]::IsNullOrWhiteSpace($command)) {
+                throw 'command is required'
+            }
+            $elementMap = @{
+                'login' = 'LoginCmd'
+                'logout' = 'LogoutCmd'
+                'start' = 'StartCmd'
+                'stop' = 'StopCmd'
+                'reset_cold' = 'ResetColdCmd'
+                'reset_origin' = 'ResetOriginCmd'
+            }
+            if (-not $elementMap.ContainsKey($command)) {
+                throw "Unsupported online command: $command"
+            }
+            $el = $elementMap[$command]
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $xml = "<TreeItem><PlcProjectDef><$el></$el></PlcProjectDef></TreeItem>"
+            try {
+                $item.ConsumeXml($xml)
+            } catch {
+                $xmlError = $null
+                try {
+                    $xmlError = $item.GetLastXmlError()
+                } catch {
+                }
+                if ($xmlError) {
+                    throw "ConsumeXml failed for online command '$command': $xmlError"
+                }
+                throw
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    command = $command
+                    executed = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_link_task' {
+            $treePath = [string]$payload.treePath
+            $taskPath = [string]$payload.taskPath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'treePath is required'
+            }
+            if ([string]::IsNullOrWhiteSpace($taskPath)) {
+                throw 'taskPath is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for plc_project_link_task on this shell'
+            }
+            $linked = $null
+            try {
+                $linked = [Te1000PlcProjectHelper]::SetLinkedTask($item, $taskPath)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcTaskReference (treePath must be the PlcTask reference node under the project instance): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    linkedTask = $linked
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_plcopen_export' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            $selection = if ($payload.selection) { [string]$payload.selection } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject cast is required for plc_project_plcopen_export on this shell'
+            }
+            try {
+                [Te1000PlcProjectHelper]::PlcOpenExport($item, $file, $selection)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject (use the nested project instance node): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    file = $file
+                    selection = $selection
+                    exported = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_plcopen_import' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            if (-not (Test-Path -LiteralPath $file)) {
+                throw "PLCopen XML file not found: $file"
+            }
+            $options = 0
+            if ($null -ne $payload.options) {
+                $options = [int]$payload.options
+            }
+            $selection = if ($payload.selection) { [string]$payload.selection } else { '' }
+            $folderStructure = $true
+            if ($null -ne $payload.folderStructure) {
+                $folderStructure = [bool]$payload.folderStructure
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject cast is required for plc_project_plcopen_import on this shell'
+            }
+            try {
+                [Te1000PlcProjectHelper]::PlcOpenImport($item, $file, $options, $selection, $folderStructure)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject (use the nested project instance node): $($_.Exception.Message)"
+            }
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    file = $file
+                    options = $options
+                    imported = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_save_as_library' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            $install = $false
+            if ($null -ne $payload.install) {
+                $install = [bool]$payload.install
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject cast is required for plc_project_save_as_library on this shell'
+            }
+            try {
+                [Te1000PlcProjectHelper]::SaveAsLibrary($item, $file, $install)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject (use the nested project instance node): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    file = $file
+                    installed = $install
                 }
             }
             exit 0

@@ -608,6 +608,79 @@ server.registerTool(
 );
 
 server.registerTool(
+  "plc_project",
+  {
+    description:
+      'PLC (IEC) project lifecycle on the open solution. Tree paths use ^ separators; the PLC ROOT node is TIPC^<name>, the nested project INSTANCE node is TIPC^<name>^<name> Project. NODE MATTERS: ITcPlcProject (boot flags / generate_boot) is on the ROOT; ITcPlcIECProject* (check / plcopen_export/import / save_as_library) is on the INSTANCE node; ITcPlcTaskReference (link_task) is on the PlcTask node. ' +
+      'Actions: create_from_template (name, template, before?, save?) — new PLC project from a stock template; open (name, file=.plcproj/.tpzip, subType 0 copy/1 move/2 use-in-place, before?, save?) — import an existing project; info (treePath? default first under TIPC) — read identity (nestedProjectName/instanceName/childCount); check (treePath? = INSTANCE node) — CheckAllObjects build-validate, returns allObjectsValid; set_boot_flags (treePath? = ROOT, autostart?, tmcFileCopy?) — config-only boot flags; ' +
+      'plcopen_export (file, treePath? = INSTANCE, selection?) — write PLCopen XML; plcopen_import (file, treePath? = INSTANCE, options 0 NONE/1 RENAME/2 REPLACE/3 SKIP, selection?, folderStructure? default true, save?) — import PLCopen XML; save_as_library (file, treePath? = INSTANCE, install? default false — install:true mutates the local library repository) — save project as .library; link_task (treePath = PlcTask node, taskPath = ^-path of TIRT/TINC task) — set LinkedTask. ' +
+      'GUARDED (live runtime/target writes), require confirm="' + PLC_DOWNLOAD_CONFIRMATION + '" and default to no-op: generate_boot_project (treePath? = ROOT, autostart? default true) — generates the boot project to the target boot dir (restart runtime to load); online (command login/logout/start/stop/reset_cold/reset_origin, treePath? — changes live online/runtime state; the ConsumeXml envelope is UNVERIFIED on this build and surfaces GetLastXmlError verbatim, reset_* need a prior login, build>=4010). Safety projects are deliberately out of scope.',
+    inputSchema: {
+      action: z.enum([
+        "create_from_template", "open", "info", "check", "set_boot_flags",
+        "generate_boot_project", "online", "link_task",
+        "plcopen_export", "plcopen_import", "save_as_library",
+      ]),
+      name: z.string().optional(),
+      template: z.enum(["Standard PLC Template", "Empty PLC Template"]).optional(),
+      file: z.string().optional(),
+      treePath: z.string().optional(),
+      taskPath: z.string().optional(),
+      subType: z.number().int().min(0).max(2).optional(),
+      before: z.string().optional().describe("insert before this sibling PLC project"),
+      autostart: z.boolean().optional(),
+      tmcFileCopy: z.boolean().optional(),
+      command: z.enum(["login", "logout", "start", "stop", "reset_cold", "reset_origin"]).optional(),
+      options: z.number().int().min(0).max(3).optional(),
+      selection: z.string().optional(),
+      folderStructure: z.boolean().optional(),
+      install: z.boolean().optional(),
+      save: z.boolean().optional(),
+      confirm: z.string().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "create_from_template":
+        need(p, ["name"], p.action);
+        return textResult(await bridgeCall("plc_project_create", { name: p.name, template: p.template, before: p.before, save: p.save === true }));
+      case "open":
+        need(p, ["name", "file"], p.action);
+        return textResult(await bridgeCall("plc_project_open", { name: p.name, file: p.file, subType: p.subType, before: p.before, save: p.save === true }));
+      case "info":
+        return textResult(await bridgeCall("plc_project_info", { treePath: p.treePath }));
+      case "check":
+        return textResult(await bridgeCall("plc_project_check", { treePath: p.treePath }));
+      case "set_boot_flags":
+        return textResult(await bridgeCall("plc_project_boot_flags", { treePath: p.treePath, autostart: p.autostart, tmcFileCopy: p.tmcFileCopy }));
+      case "generate_boot_project":
+        if (p.confirm !== PLC_DOWNLOAD_CONFIRMATION) {
+          throw new Error('Blocked. generate_boot_project writes the boot project to the live target. Re-run with confirm="' + PLC_DOWNLOAD_CONFIRMATION + '" to proceed.');
+        }
+        return textResult(await bridgeCall("plc_project_generate_boot", { treePath: p.treePath, autostart: p.autostart }));
+      case "online":
+        need(p, ["command"], p.action);
+        if (p.confirm !== PLC_DOWNLOAD_CONFIRMATION) {
+          throw new Error('Blocked. online command "' + p.command + '" changes the live runtime/IDE online state. Re-run with confirm="' + PLC_DOWNLOAD_CONFIRMATION + '" to proceed.');
+        }
+        return textResult(await bridgeCall("plc_project_online", { command: p.command, treePath: p.treePath }));
+      case "link_task":
+        need(p, ["treePath", "taskPath"], p.action);
+        return textResult(await bridgeCall("plc_project_link_task", { treePath: p.treePath, taskPath: p.taskPath }));
+      case "plcopen_export":
+        need(p, ["file"], p.action);
+        return textResult(await bridgeCall("plc_project_plcopen_export", { treePath: p.treePath, file: p.file, selection: p.selection }));
+      case "plcopen_import":
+        need(p, ["file"], p.action);
+        return textResult(await bridgeCall("plc_project_plcopen_import", { treePath: p.treePath, file: p.file, options: p.options, selection: p.selection, folderStructure: p.folderStructure, save: p.save === true }));
+      case "save_as_library":
+        need(p, ["file"], p.action);
+        return textResult(await bridgeCall("plc_project_save_as_library", { treePath: p.treePath, file: p.file, install: p.install === true }));
+    }
+  },
+);
+
+server.registerTool(
   "twincat_activate_configuration",
   {
     description: `Activate the TwinCAT configuration on the target. Guarded: confirm="${ACTIVATE_CONFIRMATION}".`,
