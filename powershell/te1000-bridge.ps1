@@ -7563,6 +7563,104 @@ try {
             exit 0
         }
 
+        'twincat_license_list_devices' {
+            # Read-only: discover available dongle license devices under TIRC^License
+            # via ProduceXml. No ConsumeXml. Requires TC3.1 >= 4022.4; on older
+            # targets the License node has no device support and the blob is empty.
+            $rawFlag = ($payload.PSObject.Properties.Name -contains 'raw') -and [bool]$payload.raw
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $license = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRC^License').Value
+            $xmlText = $license.ProduceXml()
+
+            $devices = @()
+            try {
+                [xml]$doc = $xmlText
+                foreach ($d in $doc.SelectNodes('//LicenseDevice')) {
+                    $devices += @{
+                        name = [string]$d.Name
+                        pathName = [string]$d.PathName
+                        typeName = [string]$d.TypeName
+                        objectId = [string]$d.ObjectID
+                    }
+                }
+            } catch {
+                $devices = @()
+            }
+
+            $data = @{ treePath = 'TIRC^License'; devices = $devices }
+            if ($rawFlag) { $data.xml = Strip-TreeImage $xmlText }
+
+            Write-JsonResult @{ ok = $true; data = $data }
+            exit 0
+        }
+
+        'twincat_license_add_device' {
+            # Offline config edit: CreateChild a license-device node under
+            # TIRC^License bound to a dongle that already exists in the I/O tree.
+            # vInfo = the device display-name OR ObjectID string from the list
+            # action. Not a runtime write -> not confirm-gated (mirrors create).
+            $name = [string]$payload.name
+            $device = [string]$payload.device
+            if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($device)) {
+                throw 'name and device are required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $license = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRC^License').Value
+            $child = $license.CreateChild($name, 0, '', $device)
+
+            # Validate the created child; a ghost (blank/mismatched name, wrong
+            # parent) throws with best-effort cleanup instead of a false success.
+            Assert-WellFormedChild -Parent $license -Child $child -RequestedName $name -SubType 0 -ParentPath 'TIRC^License'
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIRC^License'
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'twincat_license_activate_response' {
+            # License-activation state change (GUARDED in index.js before the
+            # bridge spawns). ConsumeXml the ActivateResponseFile command on the
+            # TIRC^License node. Set-TreeItemXml surfaces GetLastXmlError; the
+            # outer try/catch reports the HRESULT (e.g. NTE_BAD_SIGNATURE).
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            $oemGuid = if ($payload.PSObject.Properties.Name -contains 'oemGuid' -and -not [string]::IsNullOrWhiteSpace([string]$payload.oemGuid)) { [string]$payload.oemGuid } else { '0' }
+
+            # Defense-in-depth: re-check the confirm token even though index.js gates it.
+            if (([string]$payload.confirm) -ne 'ALLOW_LICENSE_ACTIVATE') {
+                throw 'Blocked. license activate_response requires confirm="ALLOW_LICENSE_ACTIVATE".'
+            }
+
+            $escPath = $path.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+            $escGuid = $oemGuid.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+            $xml = "<TreeItem><ItemName>License</ItemName><PathName>TIRC^License</PathName><ItemType>59</ItemType><LicenseDef><Commands><ActivateResponseFile><Path>$escPath</Path><OemGuid>$escGuid</OemGuid></ActivateResponseFile></Commands></LicenseDef></TreeItem>"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRC^License' -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = 'TIRC^License'
+                    path = $path
+                    activated = $true
+                }
+            }
+            exit 0
+        }
+
         default {
             throw "Unsupported action: $Action"
         }

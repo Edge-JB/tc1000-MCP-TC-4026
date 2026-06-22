@@ -28,6 +28,7 @@ const ROUTE_WRITE_CONFIRMATION = "ALLOW_TWINCAT_ROUTE_WRITE";
 const MODULE_CONTEXT_CONFIRMATION = "ALLOW_TWINCAT_MODULE_CONTEXT";
 const CPP_PUBLISH_CONFIRMATION = "ALLOW_CPP_PUBLISH";
 const MEASUREMENT_RECORD_CONFIRMATION = "ALLOW_MEASUREMENT_RECORD";
+const LICENSE_ACTIVATE_CONFIRMATION = "ALLOW_LICENSE_ACTIVATE";
 
 // --- Modal-dialog watchdog -------------------------------------------------
 // A bridge COM call into XAE blocks until any modal dialog it raises is
@@ -1430,6 +1431,41 @@ server.registerTool(
       case "node_set_xml":
         need(p, ["path", "xml"], p.action);
         return textResult(await bridgeCall("twincat_set_tree_item_xml", { ...base, treePath: p.path, xml: p.xml, returnXml: p.returnXml === true }));
+    }
+  },
+);
+
+server.registerTool(
+  "tc_license",
+  {
+    description:
+      'TwinCAT licensing on the TIRC^License node (requires TC3.1 >= 4022.4; older targets have no AvailableLicenseDevices/ActivateResponseFile support and ProduceXml/ConsumeXml return empty or error — the HRESULT is surfaced, not masked). Nothing here touches the safety system (TIRC^License is real-time/licensing config). Actions: ' +
+      'list (read-only) — discover available dongle license devices via ProduceXml; returns {treePath, devices:[{name,pathName,typeName,objectId}]} (pass raw:true to also include the full License-node ProduceXml blob). ' +
+      'add (name, device) — OFFLINE config edit: CreateChild a license-device child under License bound to a dongle that MUST already exist in the I/O tree (device = its display-name e.g. "Term 2 (EL6070)" OR its ObjectID e.g. "50462722" from list). This only links the License node to existing hardware; it does NOT create the dongle terminal — add the EL6070 (etc.) first via createIO/tc_tree. Not confirm-gated (config-only). ' +
+      'activate_response (confirm, path, oemGuid?) — GUARDED, requires confirm="' + LICENSE_ACTIVATE_CONFIRMATION + '" and defaults to no-op: ConsumeXml the ActivateResponseFile command to activate an OEM license response file (path = absolute path to the .tmc/.reresponse file). oemGuid is "only required in special cases" and accepts any value; defaults to 0 when omitted. This is a license-activation state change.',
+    inputSchema: {
+      action: z.enum(["list", "add", "activate_response"]),
+      raw: z.boolean().optional(),
+      name: z.string().optional(),
+      device: z.string().optional().describe('dongle display-name (e.g. "Term 2 (EL6070)") or ObjectID string from list'),
+      path: z.string().optional().describe("absolute path to the OEM license response (.tmc/.reresponse) file"),
+      oemGuid: z.string().optional(),
+      confirm: z.string().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "list":
+        return textResult(await bridgeCall("twincat_license_list_devices", { raw: p.raw === true }));
+      case "add":
+        need(p, ["name", "device"], p.action);
+        return textResult(await bridgeCall("twincat_license_add_device", { name: p.name, device: p.device }));
+      case "activate_response":
+        if (p.confirm !== LICENSE_ACTIVATE_CONFIRMATION) {
+          throw new Error('Blocked. activate_response activates an OEM license response file (a license-activation state change). Re-run with confirm="' + LICENSE_ACTIVATE_CONFIRMATION + '" to proceed.');
+        }
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("twincat_license_activate_response", { confirm: p.confirm, path: p.path, oemGuid: p.oemGuid }));
     }
   },
 );
