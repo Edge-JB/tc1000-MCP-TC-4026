@@ -802,6 +802,7 @@ server.registerTool(
     description:
       "PLC object authoring + code edit on the open solution (OFFLINE engineering only — no activate/download/online; edits land in-memory and reach the cell only via a later guarded plc_download + twincat_restart_runtime). Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy. " +
       "CREATE — create / create_batch (parent, name, subType, language?, returnType?, extends?, implements?, declText?, before?): CreateChild sub-types 602 Program, 603 Function (returnType required), 604 FunctionBlock, 605 Enum, 606 Struct, 607 Union, 608 Action, 609 Method, 611 Property (returnType required), 615 GVL, 616 Transition, 618 Interface, 619 Visualization, 623 Alias, 629 ParameterList, 631 UML. language IECLANGUAGETYPES 0 NONE/1 ST/2 IL/3 SFC/4 FBD/5 CFC/6 LD (default 1). extends/implements for FB 604 / Program 602 derivation (618 uses extends as its base); declText seeds DUT/GVL decl. For code POUs prefer set_decl after create. " +
+      "FOLDERS — create_folder (parent, name, before?) creates a PLC folder (CreateChild sub-type 601 PLCFOLDER, vInfo=null) under parent; parent may be a PLC project subtree node, a POUs/DUTs/GVLs container, or another folder (nesting). Returns the same shape as create: { parentPath, child:{name,pathName,itemType,subType,childCount} } (itemType 601). create_folder_batch (creates:[{parent,name,before?}], save?) loops create_folder continue-on-error and returns the canonical roll-up {count,succeeded,failed,results:[{parent,name,ok,child?|error?}]} — list a parent-folder entry BEFORE its child-folder entry (created in array order). NOTE: create / create_batch already author objects INTO a folder when parent is the folder's tree path (a folder is a valid CreateChild parent) — no separate action needed. " +
       "TEMPLATE — import_template (parent, paths[]) imports POU template file(s) (CreateChild sub-type 58). " +
       "READ — get_decl / get_impl / get_document (path). get_decl/get_impl take an optional range {start,end} (1-based inclusive line slice, clamped) OR grep {pattern, context?} (regex over lines + context each side); mutually exclusive; default returns full text. Both always report lineCount; get_impl also returns language (graphical 3-6 -> lineCount:0 + {graphical,hint}). outline (path) returns structure WITHOUT full text: header + varBlocks + child code items. " +
       "WRITE — set_decl / set_decl_batch (path, declText); set_impl / set_impl_batch (path, exactly one of implText|implXml — implXml is TwinCAT object XML, round-trip only, for graphical languages); set_document (path, documentXml). " +
@@ -813,7 +814,7 @@ server.registerTool(
       "BUILD-CHECK — check_objects (plcPath?, default first PLC under TIPC) runs CheckAllObjects on the nested IEC project (no download). Mutating batch verbs (create_batch, set_decl_batch, set_impl_batch) accept save:true to save the solution once after the batch.",
     inputSchema: {
       action: z.enum([
-        "create", "create_batch", "import_template",
+        "create", "create_batch", "create_folder", "create_folder_batch", "import_template",
         "get_decl", "get_impl", "get_document", "outline",
         "set_decl", "set_decl_batch", "set_impl", "set_impl_batch", "set_document",
         "check_objects",
@@ -838,7 +839,7 @@ server.registerTool(
       creates: z.array(z.object({
         parent: z.string(),
         name: z.string(),
-        subType: z.number().int(),
+        subType: z.number().int().optional().describe("required for create_batch (POU/DUT/GVL sub-type); omit for create_folder_batch (always 601 PLC folder)"),
         language: z.number().int().min(0).max(6).optional(),
         returnType: z.string().optional(),
         extends: z.string().optional(),
@@ -892,6 +893,12 @@ server.registerTool(
       case "create_batch":
         need(p, ["creates"], p.action);
         return textResult(await bridgeCall("plc_pou_create_batch", { creates: p.creates, save: p.save === true }));
+      case "create_folder":
+        need(p, ["parent", "name"], p.action);
+        return textResult(await bridgeCall("plc_pou_create_folder", { parent: p.parent, name: p.name, before: p.before }));
+      case "create_folder_batch":
+        need(p, ["creates"], p.action);
+        return textResult(await bridgeCall("plc_pou_create_folder_batch", { creates: p.creates, save: p.save === true }));
       case "import_template":
         need(p, ["parent", "paths"], p.action);
         return textResult(await bridgeCall("plc_pou_import_template", { parent: p.parent, paths: p.paths, save: p.save === true }));

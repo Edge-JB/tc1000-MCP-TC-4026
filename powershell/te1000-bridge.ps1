@@ -2683,6 +2683,31 @@ function Invoke-PlcPouCreate {
     return $child
 }
 
+function Invoke-PlcPouCreateFolder {
+    # Shared single-folder create used by both plc_pou_create_folder and the batch verb.
+    # Mirrors Invoke-PlcPouCreate but always creates subType 601 (TREEITEMTYPE_PLCFOLDER)
+    # with vInfo=$null (folders carry no declaration/createInfo). $Entry is payload-shaped
+    # with parent/name[/before]. A folder node is itself a valid CreateChild parent, so
+    # parent may be a PLC project subtree node, a container, or another folder (nesting).
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)]$Entry
+    )
+
+    $parent = [string]$Entry.parent
+    $name = [string]$Entry.name
+    if ([string]::IsNullOrWhiteSpace($parent)) { throw 'parent is required' }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+    Assert-NotSafetyPath -Path $parent
+
+    $before = if ($Entry.before) { [string]$Entry.before } else { '' }
+
+    $parentItem = (Get-TreeItem -SysManager $SysManager -TreePath $parent).Value
+    $child = $parentItem.CreateChild($name, 601, $before, $null)
+    Assert-WellFormedChild -Parent $parentItem -Child $child -RequestedName $name -SubType 601 -ParentPath $parent
+    return $child
+}
+
 function Expand-UIHierarchyChildren {
     param($Item)
 
@@ -5898,6 +5923,62 @@ try {
                 $n = if ($entry.name) { [string]$entry.name } else { '' }
                 try {
                     $child = Invoke-PlcPouCreate -SysManager $sysManager -Entry $entry
+                    $results += @{ parent = $p; name = $n; ok = $true; child = Convert-TreeItem -TreeItem $child }
+                    $succeeded++
+                } catch {
+                    $results += @{ parent = $p; name = $n; ok = $false; error = $_.Exception.Message }
+                    $failed++
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($creates).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_create_folder' {
+            # Offline engineering edit: CreateChild a PLC folder (subType 601) under parent.
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $child = Invoke-PlcPouCreateFolder -SysManager $sysManager -Entry $payload
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = [string]$payload.parent
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_create_folder_batch' {
+            $creates = $payload.creates
+            if ($null -eq $creates -or @($creates).Count -lt 1) {
+                throw 'creates must be a non-empty array'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+            foreach ($entry in @($creates)) {
+                $p = if ($entry.parent) { [string]$entry.parent } else { '' }
+                $n = if ($entry.name) { [string]$entry.name } else { '' }
+                try {
+                    $child = Invoke-PlcPouCreateFolder -SysManager $sysManager -Entry $entry
                     $results += @{ parent = $p; name = $n; ok = $true; child = Convert-TreeItem -TreeItem $child }
                     $succeeded++
                 } catch {
