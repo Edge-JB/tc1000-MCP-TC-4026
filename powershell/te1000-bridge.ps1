@@ -1587,6 +1587,63 @@ function Assert-NotSafetyPath {
 }
 
 # =====================================================================
+# plc_pou lifecycle: PURE path helpers (no COM/XAE), unit-testable.
+# =====================================================================
+
+function Split-PlcObjectPath {
+    # PURE. Given a '^'-joined path, return @{ parent = everything before the
+    # last '^'; name = the last segment }. Throws when the path has no '^' (a
+    # root such as 'TIPC' is not a deletable/movable leaf - the caller must pass
+    # a child path). No COM - offline unit-testable.
+    param([Parameter(Mandatory = $true)][AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'path is required'
+    }
+    $idx = $Path.LastIndexOf('^')
+    if ($idx -lt 1 -or $idx -ge ($Path.Length - 1)) {
+        throw "path '$Path' must be a child object (contain '^' with a parent and a trailing name segment)"
+    }
+    return @{
+        parent = $Path.Substring(0, $idx)
+        name   = $Path.Substring($idx + 1)
+    }
+}
+
+function Assert-PlcMoveLegal {
+    # PURE. Throw on an illegal/no-op move: newParent equals the source's current
+    # parent (no-op), newParent equals the path itself (into self), or newParent
+    # is a descendant of path (startswith path + '^'). Returns nothing on success.
+    # No COM - offline unit-testable.
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][string]$Path,
+        [Parameter(Mandatory = $true)][AllowNull()][string]$NewParent
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw 'path is required' }
+    if ([string]::IsNullOrWhiteSpace($NewParent)) { throw 'newParent is required' }
+    $split = Split-PlcObjectPath -Path $Path
+    if ($NewParent -eq $split.parent) {
+        throw "newParent '$NewParent' is already the current parent of '$Path' (no-op move refused)"
+    }
+    if ($NewParent -eq $Path) {
+        throw "newParent '$NewParent' is the object itself (cannot move an object into itself)"
+    }
+    if ($NewParent.StartsWith($Path + '^')) {
+        throw "newParent '$NewParent' is a descendant of '$Path' (cannot move an object into its own subtree)"
+    }
+}
+
+function New-PlcTempExportPath {
+    # Build a unique temp file path for the ExportChild/ImportChild round-trip.
+    # Object export uses a .tpzip archive (per features.md 7.1); the path is
+    # returned so the import and the finally{} cleanup share the same file.
+    param([string]$Extension = '.tpzip')
+    $ext = if ([string]::IsNullOrWhiteSpace($Extension)) { '.tpzip' } else { $Extension }
+    if (-not $ext.StartsWith('.')) { $ext = '.' + $ext }
+    $name = 'te1000-plcmove-' + ([guid]::NewGuid().ToString('N')) + $ext
+    return [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), $name)
+}
+
+# =====================================================================
 # plc_pou code_engine: PURE text-manipulation helpers (no COM/XAE).
 # These take strings/arrays in and return strings/arrays/hashtables out,
 # so they are unit-testable standalone. All COM lives in Invoke-PlcTextRMW
@@ -2910,6 +2967,102 @@ function Rename-TreeItem($SysManager, [string]$TargetPath, [string]$NewName) {
     }
 
     return (Normalize-ScalarValue (Get-SafeValue { [string]$item.PathName }))
+}
+
+function Invoke-PlcObjectRename {
+    # COM. PLC-object-scoped rename of one tree item. Resolves $Path, tries the
+    # late-bind ITcSmTreeItem.Name = $NewName (the RW Name property), and on COM
+    # failure falls back to ConsumeXml('<TreeItem><ItemName>..') exactly like
+    # Rename-TreeItem (with GetLastXmlError surfacing). Returns the post-rename
+    # PathName. One place for both the single verb and any future batch.
+    param($SysManager, [string]$Path, [string]$NewName)
+    if ([string]::IsNullOrWhiteSpace($NewName)) {
+        throw 'newName is required'
+    }
+    $item = (Get-TreeItem -SysManager $SysManager -TreePath $Path).Value
+
+    $renamed = $false
+    try {
+        $item.Name = $NewName
+        $renamed = $true
+    } catch {
+        $renamed = $false
+    }
+
+    if (-not $renamed) {
+        # Verified fallback: ConsumeXml ItemName envelope (XML-escape the name).
+        $escapedName = $NewName.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+        $xml = "<TreeItem><ItemName>$escapedName</ItemName></TreeItem>"
+        try {
+            $item.ConsumeXml($xml)
+        } catch {
+            $xmlError = $null
+            try { $xmlError = $item.GetLastXmlError() } catch { }
+            if ($xmlError) { throw "ConsumeXml failed: $xmlError" }
+            throw
+        }
+    }
+
+    return (Normalize-ScalarValue (Get-SafeValue { [string]$item.PathName }))
+}
+
+function Invoke-PlcObjectMove {
+    # COM. Reparent one PLC object while preserving it (decl/impl/document/sub-
+    # objects). There is no native ITcSmTreeItem reparent in the installed interop,
+    # so this is export-to-temp + import-under-newParent + delete-original, all in
+    # ONE attach. On import/verify failure the original is left intact (never
+    # deleted). The temp file is removed by the caller's finally{} via $TempPath.
+    param(
+        $SysManager,
+        [string]$Path,
+        [string]$NewParent,
+        [string]$Before,
+        [string]$TempPath
+    )
+
+    $split = Split-PlcObjectPath -Path $Path
+    Assert-PlcMoveLegal -Path $Path -NewParent $NewParent
+    Assert-NotSafetyPath -Path $Path
+    Assert-NotSafetyPath -Path $NewParent
+
+    $oldParent = (Get-TreeItem -SysManager $SysManager -TreePath $split.parent).Value
+    $newParentItem = (Get-TreeItem -SysManager $SysManager -TreePath $NewParent).Value
+    $beforeName = if ([string]::IsNullOrWhiteSpace($Before)) { '' } else { [string]$Before }
+
+    # 1) Export the object from its old parent to the temp archive.
+    $oldParent.ExportChild($split.name, $TempPath)
+
+    # 2) Import it under the new parent (bReconnect = $true re-links by name).
+    $imported = $null
+    try {
+        $imported = $newParentItem.ImportChild($TempPath, $beforeName, $true, '')
+    } catch {
+        # Original is untouched; surface the import failure.
+        throw "ImportChild of '$($split.name)' under '$NewParent' failed: $($_.Exception.Message). The original object at '$Path' was left intact."
+    }
+
+    # 3) Verify the imported child exists under the new parent.
+    $verified = $null
+    try {
+        $verified = (Get-ChildTreeItemByName -ParentItem $newParentItem -ChildName $split.name).Value
+    } catch {
+        $verified = $null
+    }
+    if ($null -eq $verified) {
+        throw "Move verification failed: '$($split.name)' was not found under '$NewParent' after ImportChild. The original object at '$Path' was left intact."
+    }
+    $newPath = Normalize-ScalarValue (Get-SafeValue { [string]$verified.PathName })
+
+    # 4) Delete the original ONLY after a verified import.
+    try {
+        $oldParent.DeleteChild($split.name)
+    } catch {
+        # Edge case (9): object now exists in BOTH places. Report so the caller
+        # can clean up, rather than silently leaving a duplicate.
+        throw "Move partially completed: '$($split.name)' was imported under '$NewParent' (now at '$newPath') but DeleteChild of the original under '$($split.parent)' failed: $($_.Exception.Message). The object now exists in BOTH '$Path' and '$newPath' - remove one manually."
+    }
+
+    return $newPath
 }
 
 function Assert-WellFormedChild {
@@ -6675,6 +6828,69 @@ try {
                     name = $childName
                     deleted = $true
                     type = $cType
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_rename' {
+            # PLC-object-scoped rename. OFFLINE, unguarded. Refuse TISC BEFORE attach.
+            $path = [string]$payload.path
+            $newName = [string]$payload.newName
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($newName)) { throw 'newName is required' }
+            if ($newName.Contains('^')) { throw "newName must be a bare name, not a path (got '$newName')" }
+            Assert-NotSafetyPath -Path $path
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $newPath = Invoke-PlcObjectRename -SysManager $sysManager -Path $path -NewName $newName
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    newName = $newName
+                    newPath = $newPath
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_move' {
+            # Reparent one PLC object via export-import-delete in ONE attach.
+            # OFFLINE, unguarded. Refuse TISC on BOTH path and newParent before attach.
+            $path = [string]$payload.path
+            $newParent = [string]$payload.newParent
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($newParent)) { throw 'newParent is required' }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+            Assert-NotSafetyPath -Path $path
+            Assert-NotSafetyPath -Path $newParent
+            # Pure legality + parse checks before touching COM (no-op / into-self / descendant).
+            $splitInfo = Split-PlcObjectPath -Path $path
+            Assert-PlcMoveLegal -Path $path -NewParent $newParent
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $tempPath = New-PlcTempExportPath
+            try {
+                $newPath = Invoke-PlcObjectMove -SysManager $sysManager -Path $path -NewParent $newParent -Before $before -TempPath $tempPath
+            } finally {
+                if (Test-Path -LiteralPath $tempPath) {
+                    try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction Stop } catch { }
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    newParent = $newParent
+                    newPath = $newPath
+                    name = $splitInfo.name
+                    via = 'export-import-delete'
                 }
             }
             exit 0

@@ -809,6 +809,7 @@ server.registerTool(
       "DISCOVER — tree (plcPath?, path? subtree root, depth?, typeFilter?) does a read-only recursive Child() walk of the IEC project and returns {plcPath,projectPath,rootPath,count,tree:[{path,name,type,itemType,subType?,childCount,children?,truncated?}]} (type is a normalized label: Program/FB/Function/FunctionBlock/Struct/Enum/Union/Alias/GVL/Interface/Method/Property/Action/Transition/Visualization/ParameterList/UML/Folder/Project/Task/Unknown; depth 1 = direct children only; typeFilter is a comma list of type labels to KEEP, ancestors retained as scaffolding). find (plcPath?, path?, name? substring or /regex/, typeFilter?; at least one of name/typeFilter) returns a FLAT {plcPath,projectPath,count,matches:[{path,name,type,itemType,subType?,childCount}]} so a caller can resolve a ^ path from a name without the whole nested blob. " +
       "GREP — search (pattern [regex/.NET or substring], ignoreCase?, declOnly?|implOnly? [mutually exclusive], plcPath?, path? subtree root, maxResults? default 500/max 5000) is a project-wide find-in-code: walks every code object under the IEC project, greps DeclarationText + (ST-only) ImplementationText line-by-line, and returns {pattern,plcPath,scanned,searched,count,truncated,matches:[{path,section:'decl'|'impl',line,text}]}; graphical bodies are scanned-but-not-searched, truncated:true when maxResults is hit. Read-only/offline. " +
       "DELETE — delete (path OR parent+name) GUARDED offline delete of one PLC object via parent.DeleteChild; pass dryRun:true to preview {wouldDelete,target} or confirm=\"ALLOW_TWINCAT_DELETE\" to actually delete; verifies the child exists first, refuses TISC. " +
+      "LIFECYCLE (OFFLINE, unguarded, refuses TISC) — rename (path, newName = bare name) renames one PLC object in place (late-bind Name, ConsumeXml ItemName fallback), returns {path,newName,newPath}. move (path, newParent, before?) reparents one object preserving decl/impl/document/sub-objects via export-import-delete in ONE attach (no native reparent exists); refuses no-op/into-self/into-own-descendant moves; returns {path,newParent,newPath,name,via}. " +
       "BUILD-CHECK — check_objects (plcPath?, default first PLC under TIPC) runs CheckAllObjects on the nested IEC project (no download). Mutating batch verbs (create_batch, set_decl_batch, set_impl_batch) accept save:true to save the solution once after the batch.",
     inputSchema: {
       action: z.enum([
@@ -817,7 +818,7 @@ server.registerTool(
         "set_decl", "set_decl_batch", "set_impl", "set_impl_batch", "set_document",
         "check_objects",
         "replace", "replace_lines", "insert", "insert_in_var_block", "append",
-        "tree", "find", "search", "delete",
+        "tree", "find", "search", "delete", "rename", "move",
       ]),
       parent: z.string().optional(),
       name: z.string().optional(),
@@ -870,6 +871,8 @@ server.registerTool(
       typeFilter: z.string().optional().describe("tree/find: comma list of normalized type labels to keep/match (case-insensitive), e.g. 'FB,Method,Struct'"),
       dryRun: z.boolean().optional().describe("delete: preview the target without deleting"),
       confirm: z.string().optional().describe("delete: must equal ALLOW_TWINCAT_DELETE to actually delete"),
+      newName: z.string().optional().describe("rename: new bare object name (not a path)"),
+      newParent: z.string().optional().describe("move: ^-separated destination parent tree path (TISC refused)"),
       pattern: z.string().optional().describe("search: regex (.NET syntax) or plain substring, matched per-line against each object's decl/impl text"),
       ignoreCase: z.boolean().optional().describe("search: case-insensitive match (default false)"),
       declOnly: z.boolean().optional().describe("search: search only DeclarationText; mutually exclusive with implOnly"),
@@ -993,6 +996,14 @@ server.registerTool(
           path: p.path, parent: p.parent, name: p.name, dryRun: p.dryRun === true,
         }));
       }
+      case "rename":
+        need(p, ["path", "newName"], p.action);
+        return textResult(await bridgeCall("plc_pou_rename", { path: p.path, newName: p.newName }));
+      case "move":
+        need(p, ["path", "newParent"], p.action);
+        return textResult(await bridgeCall("plc_pou_move", {
+          path: p.path, newParent: p.newParent, before: p.before,
+        }));
     }
   },
 );
