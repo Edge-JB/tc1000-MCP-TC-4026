@@ -304,3 +304,26 @@ npm run check    # node --check index.js — syntax-validate the server
 ## License
 
 [MIT](LICENSE) © Edge Automation.
+
+## Legal & trademarks
+
+This is an **independent, third-party project**. It is **not affiliated with, endorsed by,
+sponsored by, or supported by Beckhoff Automation GmbH & Co. KG**.
+
+All product names, logos, and brands are the property of their respective owners:
+
+- **Beckhoff®**, **TwinCAT®**, **TE1000**, and **XAE Shell** are trademarks or registered
+  trademarks of **Beckhoff Automation GmbH & Co. KG**.
+- **EtherCAT®** is a registered trademark and patented technology, licensed by
+  **Beckhoff Automation GmbH, Germany**.
+
+These names are used for identification and descriptive purposes only; their use does not
+imply any affiliation with or endorsement by the trademark holders.
+
+This project does **not** include, bundle, or redistribute any Beckhoff software. It automates
+a separately installed and licensed TwinCAT 3 / TE1000 environment that you must obtain from
+Beckhoff yourself. **You are responsible** for complying with all applicable Beckhoff license
+terms and for any action this tool performs against your engineering or runtime systems.
+
+The software is provided **"AS IS"**, without warranty of any kind, under the [MIT License](LICENSE).
+See [NOTICE](NOTICE) for the full attributions.

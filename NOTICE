@@ -1,0 +1,48 @@
+TwinCAT-XAE-MCP
+Copyright (c) 2026 Edge Automation
+
+This product is licensed under the MIT License. See the LICENSE file for the
+full license text.
+
+--------------------------------------------------------------------------------
+Independence & non-affiliation
+--------------------------------------------------------------------------------
+
+This is an independent, third-party project. It is NOT affiliated with, endorsed
+by, sponsored by, or supported by Beckhoff Automation GmbH & Co. KG.
+
+This project does not include, bundle, or redistribute any Beckhoff software. It
+automates a separately installed and licensed TwinCAT 3 / TE1000 environment that
+the user must obtain from Beckhoff. The user is solely responsible for complying
+with all applicable Beckhoff license and usage terms, and for any action this
+software performs against their engineering or runtime systems.
+
+--------------------------------------------------------------------------------
+Trademark attributions
+--------------------------------------------------------------------------------
+
+All product names, logos, and brands are the property of their respective owners.
+All company, product, and service names used in this project are for
+identification and descriptive purposes only. Use of these names does not imply
+endorsement or affiliation.
+
+- "Beckhoff", "TwinCAT", "TE1000", and "XAE Shell" are trademarks or registered
+  trademarks of Beckhoff Automation GmbH & Co. KG.
+
+- "EtherCAT" is a registered trademark and patented technology, licensed by
+  Beckhoff Automation GmbH, Germany.
+
+- "Windows" and "PowerShell" are trademarks of the Microsoft group of companies.
+
+- "Node.js" is a trademark of the OpenJS Foundation.
+
+- "Model Context Protocol" is a project of Anthropic.
+
+--------------------------------------------------------------------------------
+Disclaimer of warranty
+--------------------------------------------------------------------------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. See the LICENSE file. The authors are not liable for any damage, loss,
+downtime, or safety incident arising from the use of this software against any
+engineering tool, controller, machine, or runtime system.
