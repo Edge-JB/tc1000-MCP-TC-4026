@@ -5518,6 +5518,92 @@ try {
             exit 0
         }
 
+        'twincat_produce_mapping_info' {
+            # Read-only: serialize ALL current variable links/mappings of the loaded
+            # .tsproj to one XML blob (the IDE's "Export Mapping Information"). Called
+            # late-bound on the aggregated project COM object (same surface that answers
+            # ActivateConfiguration / LinkVariables / SetTargetNetId), so no QI/cast helper
+            # is needed. No tree path: operates on the whole project.
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $xml = $null
+            try {
+                $xml = $sysManager.ProduceMappingInfo()
+            } catch {
+                Fail "ProduceMappingInfo failed: $($_.Exception.Message) ($(Get-ErrorCode $_.Exception))"
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    xml = ([string]$xml)
+                }
+            }
+            exit 0
+        }
+
+        'twincat_consume_mapping_info' {
+            # Re-apply/merge a previously produced mapping-info XML blob into the current
+            # project. MUTATES the offline config (adds links); no effect on the live cell
+            # until a later twincat_activate_configuration. ConsumeMappingInfo is on the
+            # aggregated project COM object; no GetLastXmlError here (that is an
+            # ITcSmTreeItem member) so just surface the COM message on failure.
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($xml)) {
+                throw 'xml is required'
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.ConsumeMappingInfo($xml)
+            } catch {
+                Fail "ConsumeMappingInfo failed: $($_.Exception.Message) ($(Get-ErrorCode $_.Exception))"
+            }
+            if ($save) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    consumed = $true
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
+        'twincat_clear_mapping_info' {
+            # Destructive: removes ALL variable links project-wide. MUTATES the offline
+            # config; no effect on the live cell until a later twincat_activate_configuration.
+            # The confirm token (ALLOW_TWINCAT_DELETE) is enforced in index.js, mirroring
+            # twincat_activate_configuration / plc_download which gate in JS.
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.ClearMappingInfo()
+            } catch {
+                Fail "ClearMappingInfo failed: $($_.Exception.Message) ($(Get-ErrorCode $_.Exception))"
+            }
+            if ($save) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    cleared = $true
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
         default {
             throw "Unsupported action: $Action"
         }

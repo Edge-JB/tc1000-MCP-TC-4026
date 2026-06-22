@@ -540,6 +540,38 @@ server.registerTool(
 );
 
 server.registerTool(
+  "tc_mapping",
+  {
+    description:
+      'Bulk variable-mapping (ALL links) ops on the loaded TwinCAT project via ITcSysManager2/3, whole-project (no tree path): ' +
+      'produce (read-only) — ProduceMappingInfo serializes every current variable link/mapping to ONE XML blob (the IDE\'s "Export Mapping Information"); the blob is returned as raw XML. ' +
+      'consume (xml) — ConsumeMappingInfo re-applies/merges a previously produced blob, ADDING links; MUTATES the offline config only (no live-cell impact until a later twincat_activate_configuration); optional save:true saves the solution after. ' +
+      'clear — ClearMappingInfo deletes ALL variable links project-wide; destructive, GUARDED: requires confirm="' + DELETE_CONFIRMATION + '" (reuses the existing delete token); optional save:true. ' +
+      'These are PROJECT-WIDE config-tree ops, NOT runtime/cell writes. SAFETY: the mapping blob spans the whole project and CAN include TwinSAFE I/O image links — produce/consume/clear may touch safety-related links; per project policy nothing should write toward safety, so run produce FIRST as a backup and treat the blob as opaque (export -> store -> consume round-trip). The exact XML schema is undocumented; test-import hand-edited blobs in the IDE before relying on them.',
+    inputSchema: {
+      action: z.enum(["produce", "consume", "clear"]),
+      xml: z.string().optional(),
+      confirm: z.string().optional(),
+      save: z.boolean().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "produce":
+        return textResult(await bridgeCall("twincat_produce_mapping_info", {}));
+      case "consume":
+        need(p, ["xml"], p.action);
+        return textResult(await bridgeCall("twincat_consume_mapping_info", { xml: p.xml, save: p.save === true }));
+      case "clear":
+        if (p.confirm !== DELETE_CONFIRMATION) {
+          throw new Error('Blocked. clear deletes ALL variable links project-wide. Re-run with confirm="' + DELETE_CONFIRMATION + '" to proceed.');
+        }
+        return textResult(await bridgeCall("twincat_clear_mapping_info", { save: p.save === true }));
+    }
+  },
+);
+
+server.registerTool(
   "nc",
   {
     description: "NC motion tree: tasks (list under TINC), axes (path = task, default first task), axis (path = full axis path, returns info + children).",
