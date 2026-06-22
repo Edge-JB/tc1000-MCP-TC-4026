@@ -1116,6 +1116,103 @@ server.registerTool(
 );
 
 server.registerTool(
+  "tc_fieldbus",
+  {
+    description:
+      "Create + configure NON-EtherCAT fieldbus masters/slaves/boxes (PROFINET / PROFIBUS / CANopen / DeviceNet / EAP net-vars) via ITcSmTreeItem CreateChild + ClaimResources + ConsumeXml. OFFLINE CONFIG ONLY — every action edits the in-memory project; NOTHING here pushes to the live cell or runtime (activate/download/restart stay the existing guarded tools), so no confirm token is needed. Safety (TISC) paths are rejected by policy. For EtherCAT terminals/boxes use createIO instead. " +
+      "BATCH-FIRST: to create more than one device use create_batch (N ops in ONE DTE attach, continue-on-error roll-up {count,succeeded,failed,results:[{parent,name,ok,child?,claimed?,error?}]}). " +
+      "SubType cheat-sheet — PROFINET ctrl 113/119/126/140, dev 115/118/142/143; PROFIBUS master 86 slave 97; CANopen master 87 slave 98; DeviceNet master 41/73/88 slave 62/74/99 monitor 59 box 5203; EAP device 112 publisher 9051 subscriber 9052. " +
+      "Actions: " +
+      "create_device (parent? default TIID / EAP device path, name, subType, before?, vInfo?, claimIndex?, save?) — CreateChild a master/slave/box; claimIndex immediately ClaimResources to bind underlying hardware; a wrong subType/vInfo ghost is cleaned up and reported as failure; " +
+      "create_batch (creates:[{parent?,name,subType,before?,vInfo?,claimIndex?}], save?); " +
+      "list_resources (path) — read-only; probes ITcSmTreeItem5.ResourcesCount then ResourceCount (Beckhoff pages disagree on the name) and reports which answered; " +
+      "claim_resources (path, index [1-based per Beckhoff examples], save?) — bind the node to underlying FC/EL hardware (offline config edit, NOT a cell write); " +
+      "create_gsd_box (controllerPath, name, gsdPath, moduleIdentNumber, subType [REQUIRED — PN device subType, depends on controller variant], boxFlags? [GENERATE_NAME_FROM_PAB 0x0004 / GET_STATIONNAME 0x0400 / SET_NOT_IP_TO_OS 0x4000], dapNumber?, before?, save?) — PROFINET GSD/GSDML box; vInfo = gsdPath#moduleIdentNumber#boxFlags#dapNumber. CAVEAT: GSD box subType + vInfo format from a doc summary, confirm against infosys 1041677067 before relying on it; " +
+      "add_netvar (boxPath = EAP publisher/subscriber box, name, dataType [IEC type as vInfo, e.g. BOOL/INT], before?, save?) — EAP pub/sub variable (SubType 0; resulting ItemType 35 publisher / 36 subscriber); " +
+      "set_station_address (path = PROFIBUS slave/box, address, save?) — discovers the address element via ProduceXml then ConsumeXml a minimal envelope (the bare-number form is unverified and NOT shipped); if discovery fails, use get_xml + set_xml; " +
+      "import_dbc (masterPath = CANopen master, fileName [.dbc], importExtendedMessages?, importMultiplexedDataMessages?, keepUnchangedMessages?, communicateWithSlavesFromDbcFile?, save?) — CanOpenMaster/ImportDbcFile config import (requires TC3.1 build >= 4018); " +
+      "get_xml (path) — raw ProduceXml passthrough for discovering real param elements; " +
+      "set_xml (path, xml = partial <TreeItem> XML, returnXml?, save?) — generic ConsumeXml escape hatch for any fieldbus param not covered above.",
+    inputSchema: {
+      action: z.enum([
+        "create_device", "create_batch", "list_resources", "claim_resources",
+        "create_gsd_box", "add_netvar", "set_station_address", "import_dbc",
+        "get_xml", "set_xml",
+      ]),
+      parent: z.string().optional(),
+      name: z.string().optional(),
+      subType: z.number().int().optional(),
+      before: z.string().optional().describe("insert before this sibling"),
+      vInfo: z.string().optional(),
+      claimIndex: z.number().int().optional(),
+      creates: z.array(z.object({
+        parent: z.string().optional(),
+        name: z.string(),
+        subType: z.number().int(),
+        before: z.string().optional(),
+        vInfo: z.string().optional(),
+        claimIndex: z.number().int().optional(),
+      })).optional(),
+      path: z.string().optional(),
+      index: z.number().int().optional(),
+      controllerPath: z.string().optional(),
+      gsdPath: z.string().optional(),
+      moduleIdentNumber: z.string().optional(),
+      boxFlags: z.number().int().optional(),
+      dapNumber: z.string().optional(),
+      boxPath: z.string().optional(),
+      dataType: z.string().optional(),
+      address: z.number().int().optional(),
+      masterPath: z.string().optional(),
+      fileName: z.string().optional(),
+      importExtendedMessages: z.boolean().optional(),
+      importMultiplexedDataMessages: z.boolean().optional(),
+      keepUnchangedMessages: z.boolean().optional(),
+      communicateWithSlavesFromDbcFile: z.boolean().optional(),
+      xml: z.string().optional(),
+      returnXml: z.boolean().optional(),
+      mode: z.enum(["active", "activeOrCreate", "create"]).optional().describe("DTE attach mode; default active"),
+      save: z.boolean().optional(),
+    },
+  },
+  async (p) => {
+    const base = { mode: p.mode };
+    switch (p.action) {
+      case "create_device":
+        need(p, ["name", "subType"], p.action);
+        return textResult(await bridgeCall("fieldbus_create_device", { ...base, parent: p.parent, name: p.name, subType: p.subType, before: p.before, vInfo: p.vInfo, claimIndex: p.claimIndex, save: p.save === true }));
+      case "create_batch":
+        need(p, ["creates"], p.action);
+        return textResult(await bridgeCall("fieldbus_create_devices", { ...base, creates: p.creates, save: p.save === true }));
+      case "list_resources":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("fieldbus_list_resources", { ...base, path: p.path }));
+      case "claim_resources":
+        need(p, ["path", "index"], p.action);
+        return textResult(await bridgeCall("fieldbus_claim_resources", { ...base, path: p.path, index: p.index, save: p.save === true }));
+      case "create_gsd_box":
+        need(p, ["controllerPath", "name", "gsdPath", "moduleIdentNumber", "subType"], p.action);
+        return textResult(await bridgeCall("fieldbus_create_gsd_box", { ...base, controllerPath: p.controllerPath, name: p.name, gsdPath: p.gsdPath, moduleIdentNumber: p.moduleIdentNumber, subType: p.subType, boxFlags: p.boxFlags, dapNumber: p.dapNumber, before: p.before, save: p.save === true }));
+      case "add_netvar":
+        need(p, ["boxPath", "name", "dataType"], p.action);
+        return textResult(await bridgeCall("fieldbus_add_netvar", { ...base, boxPath: p.boxPath, name: p.name, dataType: p.dataType, before: p.before, save: p.save === true }));
+      case "set_station_address":
+        need(p, ["path", "address"], p.action);
+        return textResult(await bridgeCall("fieldbus_set_station_address", { ...base, path: p.path, address: p.address, save: p.save === true }));
+      case "import_dbc":
+        need(p, ["masterPath", "fileName"], p.action);
+        return textResult(await bridgeCall("fieldbus_import_dbc", { ...base, masterPath: p.masterPath, fileName: p.fileName, importExtendedMessages: p.importExtendedMessages, importMultiplexedDataMessages: p.importMultiplexedDataMessages, keepUnchangedMessages: p.keepUnchangedMessages, communicateWithSlavesFromDbcFile: p.communicateWithSlavesFromDbcFile, save: p.save === true }));
+      case "get_xml":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("fieldbus_get_xml", { ...base, path: p.path }));
+      case "set_xml":
+        need(p, ["path", "xml"], p.action);
+        return textResult(await bridgeCall("fieldbus_set_xml", { ...base, path: p.path, xml: p.xml, returnXml: p.returnXml === true, save: p.save === true }));
+    }
+  },
+);
+
+server.registerTool(
   "twincat_activate_configuration",
   {
     description: `Activate the TwinCAT configuration on the target. Guarded: confirm="${ACTIVATE_CONFIRMATION}".`,

@@ -1740,6 +1740,54 @@ function Convert-TreeItem {
     }
 }
 
+# --- tc_fieldbus helpers ---------------------------------------------------
+# Shared CreateChild path for NON-EtherCAT fieldbus masters/slaves/boxes
+# (PROFINET / PROFIBUS / CANopen / DeviceNet / EAP). Mirrors twincat_create_child:
+# CreateChild(name, subType, before, vInfo) then Assert-WellFormedChild so a
+# wrong subType/vInfo "ghost" (blank-named child) is cleaned up and surfaced as a
+# failure rather than a false success. OFFLINE config only — no cell write.
+# $Entry is a payload-shaped object with parent?/name/subType[/before/vInfo/claimIndex].
+function Invoke-FieldbusCreateDevice {
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)]$Entry
+    )
+
+    $name = if ($Entry.PSObject.Properties.Name -contains 'name') { [string]$Entry.name } else { $null }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+    if ($null -eq $Entry.subType) { throw 'subType is required' }
+    $subType = [int]$Entry.subType
+
+    $parentPath = if ($Entry.PSObject.Properties.Name -contains 'parent' -and -not [string]::IsNullOrWhiteSpace([string]$Entry.parent)) { [string]$Entry.parent } else { 'TIID' }
+    Assert-NotSafetyPath -Path $parentPath
+    $before = if ($Entry.PSObject.Properties.Name -contains 'before' -and $Entry.before) { [string]$Entry.before } else { '' }
+    $vInfo = if ($Entry.PSObject.Properties.Name -contains 'vInfo' -and -not [string]::IsNullOrWhiteSpace([string]$Entry.vInfo)) { [string]$Entry.vInfo } else { $null }
+
+    $parent = (Get-TreeItem -SysManager $SysManager -TreePath $parentPath).Value
+    $child = $parent.CreateChild($name, $subType, $before, $vInfo)
+    Assert-WellFormedChild -Parent $parent -Child $child -RequestedName $name -SubType $subType -ParentPath $parentPath
+
+    $claimed = $null
+    if ($Entry.PSObject.Properties.Name -contains 'claimIndex' -and $null -ne $Entry.claimIndex) {
+        $claimIndex = [int]$Entry.claimIndex
+        try {
+            # ClaimResources lives on ITcSmTreeItem5/2; PowerShell late-binds it
+            # directly on the COM object (same as CreateChild/ConsumeXml). OFFLINE
+            # config binding of the node to underlying FC/EL hardware — NOT a cell write.
+            $child.ClaimResources($claimIndex)
+            $claimed = $true
+        } catch {
+            $claimed = $false
+        }
+    }
+
+    return @{
+        parentPath = $parentPath
+        child = Convert-TreeItem -TreeItem $child
+        claimed = $claimed
+    }
+}
+
 function Get-TwinCatVariablePathCandidates {
     param(
         [Parameter(Mandatory = $true)]
@@ -6146,6 +6194,432 @@ try {
                     disabled = $newVal
                     state = $DISABLED_STATE[$newVal]
                     previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        # --- tc_fieldbus: NON-EtherCAT fieldbus config (OFFLINE only) ----------
+        # PROFINET / PROFIBUS / CANopen / DeviceNet / EAP masters, slaves, boxes.
+        # Every verb edits the in-memory project (CreateChild / ClaimResources /
+        # ConsumeXml) — NONE push to the live cell, so no confirm token. Safety
+        # (TISC) paths are rejected by Assert-NotSafetyPath.
+        'fieldbus_create_device' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $created = Invoke-FieldbusCreateDevice -SysManager $sysManager -Entry $payload
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $created.parentPath
+                    child = $created.child
+                    claimed = $created.claimed
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_create_devices' {
+            $creates = $payload.creates
+            if ($null -eq $creates -or @($creates).Count -eq 0) {
+                throw 'creates is required'
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+
+            foreach ($entry in $creates) {
+                $entryParent = if ($entry.PSObject.Properties.Name -contains 'parent' -and -not [string]::IsNullOrWhiteSpace([string]$entry.parent)) { [string]$entry.parent } else { 'TIID' }
+                $entryName = if ($entry.PSObject.Properties.Name -contains 'name') { [string]$entry.name } else { $null }
+                try {
+                    $created = Invoke-FieldbusCreateDevice -SysManager $sysManager -Entry $entry
+                    $succeeded++
+                    $results += @{
+                        parent = $created.parentPath
+                        name = $entryName
+                        ok = $true
+                        child = $created.child
+                        claimed = $created.claimed
+                    }
+                } catch {
+                    $failed++
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        ok = $false
+                        error = [string]$_.Exception.Message
+                    }
+                }
+            }
+
+            $data = @{
+                count = @($creates).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'fieldbus_list_resources' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            # Beckhoff pages disagree on the property name (PROFIBUS page cites
+            # ResourcesCount returning a string; CANopen page cites ResourceCount).
+            # Probe both via Get-SafeValue and report which one answered.
+            $count = Normalize-ScalarValue (Get-SafeValue { $item.ResourcesCount })
+            $prop = 'ResourcesCount'
+            if ($null -eq $count) {
+                $count = Normalize-ScalarValue (Get-SafeValue { $item.ResourceCount })
+                $prop = 'ResourceCount'
+            }
+            if ($null -eq $count) {
+                $prop = $null
+            } else {
+                # Coerce to int when parseable; otherwise keep the raw value.
+                $parsed = 0
+                if ([int]::TryParse([string]$count, [ref]$parsed)) {
+                    $count = $parsed
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    resourcesCount = $count
+                    property = $prop
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_claim_resources' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            if ($null -eq $payload.index) {
+                throw 'index is required'
+            }
+            $index = [int]$payload.index
+            Assert-NotSafetyPath -Path $path
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            try {
+                $item.ClaimResources($index)
+            } catch {
+                $xmlError = Get-SafeValue { [string]$item.GetLastXmlError() }
+                if (-not [string]::IsNullOrWhiteSpace($xmlError)) {
+                    throw "ClaimResources failed: $xmlError"
+                }
+                throw
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    index = $index
+                    claimed = $true
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_create_gsd_box' {
+            $controllerPath = [string]$payload.controllerPath
+            $name = [string]$payload.name
+            $gsdPath = [string]$payload.gsdPath
+            $moduleIdentNumber = [string]$payload.moduleIdentNumber
+            if ([string]::IsNullOrWhiteSpace($controllerPath)) { throw 'controllerPath is required' }
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($gsdPath)) { throw 'gsdPath is required' }
+            if ([string]::IsNullOrWhiteSpace($moduleIdentNumber)) { throw 'moduleIdentNumber is required' }
+            # GSD box SubType depends on the PROFINET controller variant (PN device
+            # 115/118/142/143) and is NOT auto-defaulted — caller must pass it.
+            if ($null -eq $payload.subType) {
+                throw 'subType is required for create_gsd_box (PROFINET device subType, e.g. 115/118/142/143; depends on the controller variant). Confirm against the GSD how-to before use.'
+            }
+            $subType = [int]$payload.subType
+            Assert-NotSafetyPath -Path $controllerPath
+
+            $flags = if ($payload.PSObject.Properties.Name -contains 'boxFlags' -and $null -ne $payload.boxFlags) { [int]$payload.boxFlags } else { 0 }
+            $dap = if ($payload.PSObject.Properties.Name -contains 'dapNumber' -and -not [string]::IsNullOrWhiteSpace([string]$payload.dapNumber)) { [string]$payload.dapNumber } else { '' }
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            # Beckhoff GSD vInfo syntax: PathToGSDfile#ModuleIdentNumber#BoxFlags#DAPNumber
+            $vInfo = "$gsdPath#$moduleIdentNumber#$flags#$dap"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $controller = (Get-TreeItem -SysManager $sysManager -TreePath $controllerPath).Value
+            $box = $controller.CreateChild($name, $subType, $before, $vInfo)
+            Assert-WellFormedChild -Parent $controller -Child $box -RequestedName $name -SubType $subType -ParentPath $controllerPath
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    controllerPath = $controllerPath
+                    box = Convert-TreeItem -TreeItem $box
+                    vInfo = $vInfo
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_add_netvar' {
+            $boxPath = [string]$payload.boxPath
+            $name = [string]$payload.name
+            $dataType = [string]$payload.dataType
+            if ([string]::IsNullOrWhiteSpace($boxPath)) { throw 'boxPath is required' }
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($dataType)) { throw 'dataType is required' }
+            Assert-NotSafetyPath -Path $boxPath
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $box = (Get-TreeItem -SysManager $sysManager -TreePath $boxPath).Value
+            # EAP pub/sub variable: SubType 0, dataType passed as vInfo. Resulting
+            # ItemType is 35 (publisher) / 36 (subscriber) — informational read-back.
+            $var = $box.CreateChild($name, 0, $before, $dataType)
+            Assert-WellFormedChild -Parent $box -Child $var -RequestedName $name -SubType 0 -ParentPath $boxPath
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    boxPath = $boxPath
+                    var = Convert-TreeItem -TreeItem $var
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_set_station_address' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            if ($null -eq $payload.address) {
+                throw 'address is required'
+            }
+            $address = [int]$payload.address
+            Assert-NotSafetyPath -Path $path
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            # The exact station-address XML element is not pinned in the docs (the
+            # summarized bare ConsumeXml("44") form is suspect), so discover it first:
+            # ProduceXml(false), locate an element whose name contains "Station" and an
+            # "Address"/"No"/"Number" sibling, then ConsumeXml a minimal envelope.
+            $current = Get-SafeValue { [string]$item.ProduceXml($false) }
+            $element = $null
+            if (-not [string]::IsNullOrWhiteSpace($current)) {
+                $m = [regex]::Match($current, '<(?<el>\w*Station(Address|No|Number)\w*)>')
+                if ($m.Success) {
+                    $element = $m.Groups['el'].Value
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($element)) {
+                throw "Could not discover the station-address XML element from ProduceXml for '$path'. Use tc_fieldbus get_xml to inspect the node and set_xml to apply the correct element (the bare ConsumeXml(number) form is unverified and is not shipped)."
+            }
+
+            $xml = "<TreeItem><$element>$address</$element></TreeItem>"
+            try {
+                $item.ConsumeXml($xml)
+            } catch {
+                $xmlError = Get-SafeValue { [string]$item.GetLastXmlError() }
+                if (-not [string]::IsNullOrWhiteSpace($xmlError)) {
+                    throw "ConsumeXml failed: $xmlError"
+                }
+                throw
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    address = $address
+                    element = $element
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_import_dbc' {
+            $masterPath = [string]$payload.masterPath
+            $fileName = [string]$payload.fileName
+            if ([string]::IsNullOrWhiteSpace($masterPath)) { throw 'masterPath is required' }
+            if ([string]::IsNullOrWhiteSpace($fileName)) { throw 'fileName is required' }
+            Assert-NotSafetyPath -Path $masterPath
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $masterPath).Value
+
+            # CanOpenMaster/ImportDbcFile config import (topic 1095735435, needs
+            # TC3.1 build >= 4018 — cannot easily detect, documented). OFFLINE.
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.Append('<TreeItem><CanOpenMaster><ImportDbcFile>')
+            [void]$sb.Append("<FileName>$(ConvertTo-XmlText $fileName)</FileName>")
+            foreach ($flag in @('importExtendedMessages', 'importMultiplexedDataMessages', 'keepUnchangedMessages', 'communicateWithSlavesFromDbcFile')) {
+                if ($payload.PSObject.Properties.Name -contains $flag -and $null -ne $payload.$flag) {
+                    $tag = switch ($flag) {
+                        'importExtendedMessages' { 'ImportExtendedMessages' }
+                        'importMultiplexedDataMessages' { 'ImportMultiplexedDataMessages' }
+                        'keepUnchangedMessages' { 'KeepUnchangedMessages' }
+                        'communicateWithSlavesFromDbcFile' { 'CommunicateWithSlavesFromDbcFile' }
+                    }
+                    $val = if ([bool]$payload.$flag) { 'true' } else { 'false' }
+                    [void]$sb.Append("<$tag>$val</$tag>")
+                }
+            }
+            [void]$sb.Append('</ImportDbcFile></CanOpenMaster></TreeItem>')
+            $xml = $sb.ToString()
+
+            try {
+                $item.ConsumeXml($xml)
+            } catch {
+                $xmlError = Get-SafeValue { [string]$item.GetLastXmlError() }
+                if (-not [string]::IsNullOrWhiteSpace($xmlError)) {
+                    throw "ImportDbcFile ConsumeXml failed: $xmlError (requires TC3.1 build >= 4018)"
+                }
+                throw
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    masterPath = $masterPath
+                    fileName = $fileName
+                    imported = $true
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_get_xml' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $xml = [string]$item.ProduceXml($false)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ path = $path; xml = $xml }
+            }
+            exit 0
+        }
+
+        'fieldbus_set_xml' {
+            $path = [string]$payload.path
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($xml)) { throw 'xml is required' }
+            Assert-NotSafetyPath -Path $path
+            $returnXml = $payload.PSObject.Properties.Name -contains 'returnXml' -and [bool]$payload.returnXml
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $path -Xml $xml
+
+            $echo = $null
+            if ($returnXml) {
+                $echo = Normalize-ScalarValue (Get-SafeValue { [string]$item.ProduceXml($false) })
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    applied = $true
+                    xml = $echo
+                    saved = $saved
                 }
             }
             exit 0
