@@ -24,6 +24,7 @@ const PLC_LOGOUT_CONFIRMATION = "ALLOW_PLC_LOGOUT";
 const DELETE_CONFIRMATION = "ALLOW_TWINCAT_DELETE";
 const PLC_DOWNLOAD_CONFIRMATION = "ALLOW_PLC_DOWNLOAD";
 const PLC_LIBRARY_REPO_CONFIRMATION = "ALLOW_PLC_LIBRARY_REPO";
+const ROUTE_WRITE_CONFIRMATION = "ALLOW_TWINCAT_ROUTE_WRITE";
 
 // --- Modal-dialog watchdog -------------------------------------------------
 // A bridge COM call into XAE blocks until any modal dialog it raises is
@@ -980,6 +981,75 @@ server.registerTool(
         repoGuard();
         need(p, ["name", "index"], p.action);
         return textResult(await bridgeCall("plc_library_move_repository", { ...base, confirm: p.confirm, name: p.name, index: p.index }));
+    }
+  },
+);
+
+server.registerTool(
+  "tc_route",
+  {
+    description:
+      'ADS routes via the System Manager TIRR (Routes) node, ConsumeXml/ProduceXml. READ (unguarded — a transient search trigger, never persists a route): ' +
+      'list — existing static routes under RemoteConnections (best-effort name/netId/address); ' +
+      'broadcast_search — LAN-wide UDP discovery (timeoutMs settle wait, default ~4000ms) → targets [{name,netId,ipAddr}]; ' +
+      'search_host — direct by host (hostname or IP; needs TwinCAT 3.1 build>=4020.10, older builds return found:false) → {found, target:{name,netId,ipAddr,version,os}}. ' +
+      'WRITE (GUARDED, require confirm="' + ROUTE_WRITE_CONFIRMATION + '", default NO-OP): ' +
+      'add_route — credentialed route to a remote target (remoteName, remoteNetId, one of remoteIpAddr|remoteHostName; optional userName/password/noEncryption/localName); ' +
+      'add_project_route — lighter project-local entry (name, netId, one of ipAddr|hostName). ' +
+      'NOTE: route changes via TIRR ConsumeXml take effect in the engineering project; whether they propagate to the live target depends on the current target connection — this does NOT auto-activate. Nothing here targets the safety system (config/engineering-side only).',
+    inputSchema: {
+      action: z.enum(["list", "broadcast_search", "search_host", "add_route", "add_project_route"]),
+      confirm: z.string().optional(),
+      timeoutMs: z.number().int().positive().max(60000).optional(),
+      host: z.string().optional(),
+      remoteName: z.string().optional(),
+      remoteNetId: z.string().optional(),
+      remoteIpAddr: z.string().optional(),
+      remoteHostName: z.string().optional(),
+      userName: z.string().optional(),
+      password: z.string().optional(),
+      noEncryption: z.boolean().optional(),
+      localName: z.string().optional(),
+      name: z.string().optional(),
+      netId: z.string().optional(),
+      ipAddr: z.string().optional(),
+      hostName: z.string().optional(),
+    },
+  },
+  async (p) => {
+    const routeGuard = (label) => {
+      if (p.confirm !== ROUTE_WRITE_CONFIRMATION) {
+        throw new Error('Blocked. ' + label + ' writes an ADS route. Re-run with confirm="' + ROUTE_WRITE_CONFIRMATION + '" to proceed.');
+      }
+    };
+    switch (p.action) {
+      case "list":
+        return textResult(await bridgeCall("twincat_list_routes", {}));
+      case "broadcast_search":
+        return textResult(await bridgeCall("twincat_route_broadcast_search", { timeoutMs: p.timeoutMs }));
+      case "search_host":
+        need(p, ["host"], p.action);
+        return textResult(await bridgeCall("twincat_route_search_host", { host: p.host, timeoutMs: p.timeoutMs }));
+      case "add_route":
+        routeGuard("add_route");
+        need(p, ["remoteName", "remoteNetId"], p.action);
+        if (!p.remoteIpAddr && !p.remoteHostName) {
+          throw new Error("add_route requires one of remoteIpAddr / remoteHostName.");
+        }
+        return textResult(await bridgeCall("twincat_add_route", {
+          confirm: p.confirm, remoteName: p.remoteName, remoteNetId: p.remoteNetId,
+          remoteIpAddr: p.remoteIpAddr, remoteHostName: p.remoteHostName,
+          userName: p.userName, password: p.password, noEncryption: p.noEncryption === true, localName: p.localName,
+        }));
+      case "add_project_route":
+        routeGuard("add_project_route");
+        need(p, ["name", "netId"], p.action);
+        if (!p.ipAddr && !p.hostName) {
+          throw new Error("add_project_route requires one of ipAddr / hostName.");
+        }
+        return textResult(await bridgeCall("twincat_add_project_route", {
+          confirm: p.confirm, name: p.name, netId: p.netId, ipAddr: p.ipAddr, hostName: p.hostName,
+        }));
     }
   },
 );

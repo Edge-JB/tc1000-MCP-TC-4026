@@ -5604,6 +5604,234 @@ try {
             exit 0
         }
 
+        'twincat_list_routes' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRR').Value
+
+            $routes = @()
+            $xml = Get-SafeValue { $item.ProduceXml() }
+            if (-not [string]::IsNullOrEmpty($xml)) {
+                try {
+                    [xml]$doc = $xml
+                    foreach ($n in $doc.SelectNodes('//TreeItem/RoutePrj/RemoteConnections/*')) {
+                        $rName = Get-SafeValue { [string]$n.Name }
+                        $rNetId = Get-SafeValue { [string]$n.NetId }
+                        if ([string]::IsNullOrWhiteSpace($rNetId)) { $rNetId = Get-SafeValue { [string]$n.AmsNetId } }
+                        $rAddr = Get-SafeValue { [string]$n.Address }
+                        if ([string]::IsNullOrWhiteSpace($rAddr)) { $rAddr = Get-SafeValue { [string]$n.IpAddr } }
+                        $routes += @{
+                            name = $rName
+                            netId = $rNetId
+                            address = $rAddr
+                            type = [string]$n.LocalName
+                        }
+                    }
+                } catch {
+                    $routes = @()
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $routes.Count
+                    routes = $routes
+                }
+            }
+            exit 0
+        }
+
+        'twincat_route_broadcast_search' {
+            $timeoutMs = if ($payload.timeoutMs) { [int]$payload.timeoutMs } else { 4000 }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRR').Value
+
+            $trigger = '<TreeItem><RoutePrj><TargetList><BroadcastSearch>true</BroadcastSearch></TargetList></RoutePrj></TreeItem>'
+            try {
+                $item.ConsumeXml($trigger)
+            } catch {
+                $e = Get-SafeValue { $item.GetLastXmlError() }
+                if ($e) { throw "ConsumeXml failed: $e" } else { throw }
+            }
+            Start-Sleep -Milliseconds $timeoutMs
+
+            $targets = @()
+            $res = Get-SafeValue { $item.ProduceXml() }
+            if (-not [string]::IsNullOrEmpty($res)) {
+                try {
+                    [xml]$doc = $res
+                    foreach ($t in $doc.SelectNodes('//TreeItem/RoutePrj/TargetList/Target')) {
+                        $targets += @{
+                            name = [string]$t.Name
+                            netId = [string]$t.NetId
+                            ipAddr = [string]$t.IpAddr
+                        }
+                    }
+                } catch {
+                    $targets = @()
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $targets.Count
+                    targets = $targets
+                }
+            }
+            exit 0
+        }
+
+        'twincat_route_search_host' {
+            $searchHost = [string]$payload.host
+            if ([string]::IsNullOrWhiteSpace($searchHost)) {
+                throw 'host is required'
+            }
+            $timeoutMs = if ($payload.timeoutMs) { [int]$payload.timeoutMs } else { 4000 }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRR').Value
+
+            $h = ConvertTo-XmlText $searchHost
+            $trigger = "<TreeItem><RoutePrj><TargetList><Search>$h</Search></TargetList></RoutePrj></TreeItem>"
+            try {
+                $item.ConsumeXml($trigger)
+            } catch {
+                $e = Get-SafeValue { $item.GetLastXmlError() }
+                if ($e) { throw "ConsumeXml failed: $e" } else { throw }
+            }
+            Start-Sleep -Milliseconds $timeoutMs
+
+            $target = $null
+            $found = $false
+            $res = Get-SafeValue { $item.ProduceXml() }
+            if (-not [string]::IsNullOrEmpty($res)) {
+                try {
+                    [xml]$doc = $res
+                    $t = $doc.SelectSingleNode('//TreeItem/RoutePrj/TargetList/Target')
+                    if ($t) {
+                        $target = @{
+                            name = [string]$t.Name
+                            netId = [string]$t.NetId
+                            ipAddr = [string]$t.IpAddr
+                            version = [string]$t.Version
+                            os = [string]$t.OS
+                        }
+                        $found = $true
+                    }
+                } catch {
+                    $target = $null
+                    $found = $false
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    host = $searchHost
+                    found = $found
+                    target = $target
+                }
+            }
+            exit 0
+        }
+
+        'twincat_add_route' {
+            if ([string]$payload.confirm -ne 'ALLOW_TWINCAT_ROUTE_WRITE') {
+                throw 'Blocked: confirm=ALLOW_TWINCAT_ROUTE_WRITE required to write an ADS route.'
+            }
+            $remoteName = [string]$payload.remoteName
+            $remoteNetId = [string]$payload.remoteNetId
+            $remoteIpAddr = [string]$payload.remoteIpAddr
+            $remoteHostName = [string]$payload.remoteHostName
+            if ([string]::IsNullOrWhiteSpace($remoteName)) { throw 'remoteName is required' }
+            if ([string]::IsNullOrWhiteSpace($remoteNetId)) { throw 'remoteNetId is required' }
+            if ([string]::IsNullOrWhiteSpace($remoteIpAddr) -and [string]::IsNullOrWhiteSpace($remoteHostName)) {
+                throw 'one of remoteIpAddr / remoteHostName is required'
+            }
+
+            $sb = '<AddRoute>'
+            $sb += "<RemoteName>$(ConvertTo-XmlText $remoteName)</RemoteName>"
+            $sb += "<RemoteNetId>$(ConvertTo-XmlText $remoteNetId)</RemoteNetId>"
+            if (-not [string]::IsNullOrWhiteSpace($remoteIpAddr)) {
+                $sb += "<RemoteIpAddr>$(ConvertTo-XmlText $remoteIpAddr)</RemoteIpAddr>"
+            } elseif (-not [string]::IsNullOrWhiteSpace($remoteHostName)) {
+                $sb += "<RemoteHostName>$(ConvertTo-XmlText $remoteHostName)</RemoteHostName>"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$payload.userName)) {
+                $sb += "<UserName>$(ConvertTo-XmlText ([string]$payload.userName))</UserName>"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$payload.password)) {
+                $sb += "<Password>$(ConvertTo-XmlText ([string]$payload.password))</Password>"
+            }
+            if (($payload.PSObject.Properties.Name -contains 'noEncryption') -and [bool]$payload.noEncryption) {
+                $sb += '<NoEncryption>1</NoEncryption>'
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$payload.localName)) {
+                $sb += "<LocalName>$(ConvertTo-XmlText ([string]$payload.localName))</LocalName>"
+            }
+            $sb += '</AddRoute>'
+            $xml = "<TreeItem><RoutePrj><RemoteConnections>$sb</RemoteConnections></RoutePrj></TreeItem>"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $null = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRR' -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    added = $true
+                    remoteName = $remoteName
+                    remoteNetId = $remoteNetId
+                }
+            }
+            exit 0
+        }
+
+        'twincat_add_project_route' {
+            if ([string]$payload.confirm -ne 'ALLOW_TWINCAT_ROUTE_WRITE') {
+                throw 'Blocked: confirm=ALLOW_TWINCAT_ROUTE_WRITE required to write an ADS route.'
+            }
+            $rName = [string]$payload.name
+            $rNetId = [string]$payload.netId
+            $rIpAddr = [string]$payload.ipAddr
+            $rHostName = [string]$payload.hostName
+            if ([string]::IsNullOrWhiteSpace($rName)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($rNetId)) { throw 'netId is required' }
+            if ([string]::IsNullOrWhiteSpace($rIpAddr) -and [string]::IsNullOrWhiteSpace($rHostName)) {
+                throw 'one of ipAddr / hostName is required'
+            }
+
+            $sb = '<AddProjectRoute>'
+            $sb += "<Name>$(ConvertTo-XmlText $rName)</Name>"
+            $sb += "<NetId>$(ConvertTo-XmlText $rNetId)</NetId>"
+            if (-not [string]::IsNullOrWhiteSpace($rIpAddr)) {
+                $sb += "<IpAddr>$(ConvertTo-XmlText $rIpAddr)</IpAddr>"
+            } elseif (-not [string]::IsNullOrWhiteSpace($rHostName)) {
+                $sb += "<HostName>$(ConvertTo-XmlText $rHostName)</HostName>"
+            }
+            $sb += '</AddProjectRoute>'
+            $xml = "<TreeItem><RoutePrj><RemoteConnections>$sb</RemoteConnections></RoutePrj></TreeItem>"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $null = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRR' -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    added = $true
+                    name = $rName
+                    netId = $rNetId
+                }
+            }
+            exit 0
+        }
+
         default {
             throw "Unsupported action: $Action"
         }
