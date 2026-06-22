@@ -780,18 +780,916 @@ function Ensure-TcPlcProjectHelper {
     }
     $null = [System.Reflection.Assembly]::LoadFrom($libPath)
     Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
 public static class Te1000PlcProjectHelper {
     public static bool GetAutostart(object plcProject) {
-        return ((TCatSysManagerLib.ITcPlcProject)plcProject).BootProjectAutostart;
+        return ((ITcPlcProject)plcProject).BootProjectAutostart;
     }
     public static void Deploy(object plcProject, bool autostart, bool activate) {
-        TCatSysManagerLib.ITcPlcProject typed = (TCatSysManagerLib.ITcPlcProject)plcProject;
+        ITcPlcProject typed = (ITcPlcProject)plcProject;
         typed.BootProjectAutostart = autostart;
         typed.GenerateBootProject(activate);
+    }
+
+    // --- plc_project tool: typed (vtable QI) members PowerShell cannot reach ---
+    // ITcPlcProject lives on the PLC ROOT node (TIPC^<name>); set config-only flags.
+    public static object[] SetBootFlags(object plcProject, bool hasAutostart, bool autostart, bool hasTmc, bool tmc) {
+        ITcPlcProject typed = (ITcPlcProject)plcProject;
+        if (hasAutostart) { typed.BootProjectAutostart = autostart; }
+        if (hasTmc) { typed.TmcFileCopy = tmc; }
+        return new object[] { typed.BootProjectAutostart, typed.TmcFileCopy };
+    }
+
+    // CheckAllObjects (build-validate) lives on ITcPlcIECProject2 on the nested
+    // project INSTANCE node.
+    public static bool CheckAll(object iecProject) {
+        return ((ITcPlcIECProject2)iecProject).CheckAllObjects();
+    }
+
+    // ITcProjectRoot.NestedProject is the documented identity read on the PLC root.
+    public static string GetNestedProjectName(object projectRoot) {
+        try {
+            ITcProjectRoot typed = (ITcProjectRoot)projectRoot;
+            object nested = typed.NestedProject;
+            if (nested == null) { return null; }
+            return ((ITcSmTreeItem)nested).Name;
+        } catch { return null; }
+    }
+
+    // First child of the PLC root is the project instance node ('<name> Project').
+    public static string GetInstanceName(object treeItem) {
+        try {
+            ITcSmTreeItem typed = (ITcSmTreeItem)treeItem;
+            if (typed.ChildCount < 1) { return null; }
+            ITcSmTreeItem child = typed.get_Child(1);
+            return child == null ? null : child.Name;
+        } catch { return null; }
+    }
+
+    // ITcPlcTaskReference lives on the PlcTask node under the project instance.
+    public static string SetLinkedTask(object taskRef, string taskPath) {
+        ITcPlcTaskReference typed = (ITcPlcTaskReference)taskRef;
+        typed.LinkedTask = taskPath;
+        return typed.LinkedTask;
+    }
+
+    // ITcPlcIECProject on the project INSTANCE node: PLCopen + library.
+    public static void PlcOpenExport(object iecProject, string file, string selection) {
+        ((ITcPlcIECProject)iecProject).PlcOpenExport(file, selection);
+    }
+    public static void PlcOpenImport(object iecProject, string file, int options, string selection, bool folderStructure) {
+        // Installed interop: ITcPlcIECProject.PlcOpenImport(string, Int32, string, bool).
+        // The options parameter is a plain Int32 (PLCIMPORTOPTIONS enum: 0 NONE/1 REPLACE/2 RENAME/3 SKIP),
+        // NOT a 'PlcImportOptions' type (that name does not exist in this TCatSysManagerLib build).
+        ((ITcPlcIECProject)iecProject).PlcOpenImport(file, options, selection, folderStructure);
+    }
+    public static void SaveAsLibrary(object iecProject, string file, bool install) {
+        ((ITcPlcIECProject)iecProject).SaveAsLibrary(file, install);
     }
 }
 '@
     return $null -ne ('Te1000PlcProjectHelper' -as [type])
+}
+
+# --- tc_measurement helpers ------------------------------------------------
+# Resolve the TE130X Scope View Automation Interface assembly. The product may
+# not be installed (then this returns $null and the scope actions fail with a
+# clear 'tooling not installed' message rather than a raw COM HRESULT).
+function Get-MeasurementLibPath {
+    $name = 'TwinCAT.Measurement.AutomationInterface.dll'
+    $dirs = @(
+        'C:\TwinCAT\Functions\TE130X-Scope-View',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE130X-Scope-View',
+        'C:\Program Files\Beckhoff\TwinCAT\Functions\TE130X-Scope-View',
+        (Get-XaePublicAssembliesPath)
+    )
+    foreach ($dir in $dirs) {
+        if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir)) { continue }
+        $direct = Join-Path $dir $name
+        if (Test-Path -LiteralPath $direct) { return $direct }
+        $hit = Get-ChildItem -LiteralPath $dir -Filter $name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+# Resolve a Scope project template (.tcmproj). The leaf filename varies by
+# install/version, so probe the Templates\Projects dir rather than hardcode it.
+function Get-ScopeTemplatePath {
+    $dirs = @(
+        'C:\TwinCAT\Functions\TE130X-Scope-View\Templates\Projects',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\Templates\Projects',
+        'C:\Program Files\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\Templates\Projects'
+    )
+    foreach ($dir in $dirs) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $hit = Get-ChildItem -LiteralPath $dir -Filter '*.tcmproj' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+# Resolve a TwinCAT Analytics project template. The exact leaf filename is not
+# documented, so probe the known Analytics product template dirs.
+function Get-AnalyticsTemplatePath {
+    $roots = @(
+        'C:\TwinCAT\Functions\TE3500-Analytics-Workbench',
+        'C:\TwinCAT\Functions\TE3520-Analytics-Service-Tool',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE3500-Analytics-Workbench',
+        'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE3520-Analytics-Service-Tool'
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($pat in @('*.tcaproj', '*.tcanalyticsproj', '*.tsproj')) {
+            $hit = Get-ChildItem -LiteralPath $root -Filter $pat -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '[\\/]Templates[\\/]' } | Select-Object -First 1
+            if ($null -ne $hit) { return $hit.FullName }
+        }
+    }
+    return $null
+}
+
+# IMeasurementScope is a vtable (IUnknown-derived) interface; PowerShell cannot
+# QI a __ComObject to it ([Interface]$obj is not a CLR QI in PS), so the member
+# calls go through a compiled C# helper, exactly as Te1000PlcProjectHelper does
+# for ITcPlcProject. Because the exact interface namespace is not documented and
+# the TE130X product may be absent here, the shim discovers the IMeasurementScope
+# interface type by name from the loaded assembly via reflection and invokes its
+# members by name (CreateChild/ChangeName/StartRecord/StopRecord) — the VERIFIED
+# surface only. Returns $false if the assembly can't be loaded (callers then
+# throw a clear 'TE130X Scope automation assembly not found' error).
+# NOTE: SaveSVD/ExportCSV/LookUpChild are deliberately NOT exposed (UNVERIFIED).
+function Ensure-MeasurementScopeHelper {
+    if ('Te1000MeasurementHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-MeasurementLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    try {
+        $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    } catch {
+        return $false
+    }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Linq;
+using System.Reflection;
+public static class Te1000MeasurementHelper {
+    // Find the IMeasurementScope interface across all loaded assemblies.
+    static Type ScopeType() {
+        foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies()) {
+            Type t = null;
+            try { t = a.GetTypes().FirstOrDefault(x => x.IsInterface && x.Name == "IMeasurementScope"); }
+            catch { t = null; }
+            if (t != null) return t;
+        }
+        return null;
+    }
+    public static bool Is(object o) {
+        if (o == null) return false;
+        Type t = ScopeType();
+        return t != null && t.IsInstanceOfType(o);
+    }
+    // CreateChild(out object item, string name, int elementType) -> int rc.
+    public static int CreateChild(object scope, out object child, string name, int elementType) {
+        child = null;
+        Type t = ScopeType();
+        if (t == null) throw new InvalidOperationException("IMeasurementScope type not found");
+        MethodInfo m = t.GetMethod("CreateChild");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.CreateChild");
+        object[] args = new object[] { null, name == null ? "" : name, elementType };
+        object rc = m.Invoke(scope, args);
+        child = args[0];
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    public static int ChangeName(object el, string n) {
+        Type t = ScopeType();
+        MethodInfo m = t.GetMethod("ChangeName");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.ChangeName");
+        object rc = m.Invoke(el, new object[] { n });
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    public static int StartRecord(object s) {
+        Type t = ScopeType();
+        MethodInfo m = t.GetMethod("StartRecord");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.StartRecord");
+        object rc = m.Invoke(s, null);
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    public static int StopRecord(object s) {
+        Type t = ScopeType();
+        MethodInfo m = t.GetMethod("StopRecord");
+        if (m == null) throw new MissingMethodException("IMeasurementScope.StopRecord");
+        object rc = m.Invoke(s, null);
+        return rc == null ? 0 : Convert.ToInt32(rc);
+    }
+    // Enumerate a parent scope element's children (for name-walking parentPath).
+    // Tries common collection members; returns an empty array if none resolve.
+    public static object[] Children(object el) {
+        if (el == null) return new object[0];
+        Type t = el.GetType();
+        foreach (string p in new string[] { "Children", "ChildCollection", "Items" }) {
+            try {
+                PropertyInfo pi = t.GetProperty(p);
+                if (pi != null) {
+                    object col = pi.GetValue(el, null);
+                    if (col is System.Collections.IEnumerable) {
+                        return ((System.Collections.IEnumerable)col).Cast<object>().ToArray();
+                    }
+                }
+            } catch { }
+        }
+        return new object[0];
+    }
+    public static string NameOf(object el) {
+        if (el == null) return null;
+        try {
+            PropertyInfo pi = el.GetType().GetProperty("Name");
+            if (pi != null) { object v = pi.GetValue(el, null); return v == null ? null : v.ToString(); }
+        } catch { }
+        return null;
+    }
+}
+'@
+    return $null -ne ('Te1000MeasurementHelper' -as [type])
+}
+
+# Locate a Scope/Analytics EnvDTE.Project by Name in the open solution and return
+# its .Object (the IMeasurementScope-capable automation object). These projects
+# are SEPARATE EnvDTE.Project nodes, NOT System Manager tree items.
+function Get-ScopeProjectObject($Dte, [string]$ProjectName) {
+    if ([string]::IsNullOrWhiteSpace($ProjectName)) { throw 'project is required' }
+    $solution = $Dte.Solution
+    if ($null -eq $solution -or -not [bool]$solution.IsOpen) {
+        throw 'No solution is open'
+    }
+    $projects = $solution.Projects
+    if ($null -ne $projects) {
+        for ($i = 1; $i -le $projects.Count; $i++) {
+            $proj = $null
+            try { $proj = $projects.Item($i) } catch { continue }
+            if ($null -eq $proj) { continue }
+            $pname = Get-SafeValue { [string]$proj.Name }
+            if ($pname -eq $ProjectName) {
+                $obj = $null
+                try { $obj = $proj.Object } catch { }
+                if ($null -eq $obj) { throw "Scope project '$ProjectName' has no automation object (.Object is null)" }
+                return $obj
+            }
+        }
+    }
+    throw "Scope project not found in the open solution: $ProjectName"
+}
+
+# Walk a ^-separated parentPath of element names from a scope root object,
+# resolving each segment by enumerating the parent's children by name. Returns
+# the resolved parent object (the root itself when parentPath is empty).
+# NOTE: LookUpChild is UNVERIFIED; resolution is by enumeration only.
+function Resolve-ScopeElement($Root, [string]$ElementPath) {
+    $current = $Root
+    if ([string]::IsNullOrWhiteSpace($ElementPath)) { return $current }
+    $segments = $ElementPath -split '\^'
+    foreach ($seg in $segments) {
+        if ([string]::IsNullOrWhiteSpace($seg)) { continue }
+        $children = [Te1000MeasurementHelper]::Children($current)
+        $match = $null
+        foreach ($c in $children) {
+            $cn = [Te1000MeasurementHelper]::NameOf($c)
+            if ($cn -eq $seg) { $match = $c; break }
+        }
+        if ($null -eq $match) {
+            throw "Scope element segment not found by name: '$seg' (path '$ElementPath'). Child enumeration is the only verified resolution; LookUpChild is unsupported. Restrict the path to existing named children."
+        }
+        $current = $match
+    }
+    return $current
+}
+
+function Ensure-TcPlcTaskRefHelper {
+    # ITcPlcTaskReference is a vtable (IUnknown) interface; PowerShell cannot QI a
+    # __ComObject to it ([Interface]$obj is not a CLR QI in PS), so the LinkedTask
+    # get/set is done in a compiled C# helper, exactly as Te1000PlcProjectHelper does
+    # for ITcPlcProject. The interface lives on the PLC project root/instance node
+    # (TIPC^<name>); QI/marshaling also requires the interface registered in the
+    # 64-bit registry view. Returns $false if TCatSysManagerLib.dll is unavailable.
+    if ('Te1000PlcTaskRefHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
+public static class Te1000PlcTaskRefHelper {
+    public static string GetLinkedTask(object n) {
+        return ((ITcPlcTaskReference)n).LinkedTask;
+    }
+    public static void SetLinkedTask(object n, string t) {
+        ((ITcPlcTaskReference)n).LinkedTask = t;
+    }
+}
+'@
+    return $null -ne ('Te1000PlcTaskRefHelper' -as [type])
+}
+
+function Ensure-Te1000ModuleHelper {
+    # ITcSysManager3.GetModuleManager(), ITcModuleManager3 enumeration, and
+    # ITcModuleInstance2.SetModuleContext are vtable (IUnknown) calls; PowerShell
+    # cannot QI a __ComObject to those interfaces nor enumerate them, so the work
+    # is done in a compiled C# helper, exactly as Te1000PlcProjectHelper does for
+    # ITcPlcProject. Requires TCatSysManagerLib.dll and the interfaces registered
+    # in the 64-bit registry view for marshaling. Returns $false if the DLL is
+    # unavailable.
+    if ('Te1000ModuleHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using TCatSysManagerLib;
+public static class Te1000ModuleHelper {
+    // GetModuleManager() is on ITcSysManager4+ (NOT on ITcSysManager3 -- it has no
+    // such member on this installed TCatSysManagerLib). It returns ITcModuleManager,
+    // which we QI to ITcModuleManager3 to enumerate the module instances under
+    // TIRC^TcCOM Objects. The enumerator yields ITcModuleInstance2 elements, which
+    // expose ModuleTypeName/ModuleInstanceName/ClassID/oid/ParentOID. There is no
+    // 'ObjectId' member on this build, so objectId is reported as the same value as
+    // oid (XAE merely displays it in hex). oids are decimal. An empty cell (no TcCOM
+    // module instances) yields an empty list, not an error.
+    public static object[] List(object sysManager) {
+        ITcSysManager4 sm = (ITcSysManager4)sysManager;
+        ITcModuleManager3 mgr = (ITcModuleManager3)sm.GetModuleManager();
+        List<object> list = new List<object>();
+        foreach (object o in mgr) {
+            ITcModuleInstance2 mi = o as ITcModuleInstance2;
+            if (mi == null) { continue; }
+            uint oid = mi.oid;
+            list.Add(new object[] {
+                mi.ModuleTypeName,
+                mi.ModuleInstanceName,
+                mi.ClassID.ToString(),
+                oid,
+                oid,
+                mi.ParentOID
+            });
+        }
+        return list.ToArray();
+    }
+
+    // Assign a module instance to a task's execution context. taskObjectId and
+    // contextId are DECIMAL oids (XAE displays them in hex). Changes the
+    // activated mapping/runtime context -> guarded in index.js.
+    public static void SetContext(object moduleInstance, int contextId, int taskObjectId) {
+        // Installed ITcModuleInstance2.SetModuleContext takes (UInt32 contextId, UInt32 taskObjectId).
+        ((ITcModuleInstance2)moduleInstance).SetModuleContext((uint)contextId, (uint)taskObjectId);
+    }
+}
+'@
+    return $null -ne ('Te1000ModuleHelper' -as [type])
+}
+
+# Resolve the PLC project root node path under TIPC. Defaults to the first child
+# of TIPC (TIPC^<name>). Shared by tc_task get/set_linked_task.
+function Resolve-PlcRootPath {
+    param(
+        [Parameter(Mandatory = $true)] $SysManager,
+        [AllowNull()][string]$Path
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        return $Path
+    }
+    $tipc = $SysManager.LookupTreeItem('TIPC')
+    if ([int]$tipc.ChildCount -lt 1) {
+        throw 'No PLC project found under TIPC'
+    }
+    return "TIPC^$([string]$tipc.Child(1).Name)"
+}
+
+# Build the ordered list of candidate tree PATHS (strings, NOT cached RCWs) that
+# might implement ITcPlcTaskReference (GetLinkedTask/SetLinkedTask). That interface
+# is NOT on the PLC ROOT (TIPC^<name>) -- it lives on a task-reference sub-node
+# (e.g. 'PlcTask') under the nested IEC PROJECT node ('<name> Project'). This mirrors
+# the plc_pou check_objects resolution: emit candidate PATHS and let the caller
+# LookupTreeItem a FRESH RCW per attempt (looping over cached RCWs QI-fails
+# E_NOINTERFACE). When $Path is supplied it is used as-is (single candidate).
+function Resolve-PlcTaskRefCandidates {
+    param(
+        [Parameter(Mandatory = $true)] $SysManager,
+        [AllowNull()][string]$Path
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        return , @($Path)
+    }
+    $plcPath = Resolve-PlcRootPath -SysManager $SysManager -Path $null
+    $root = (Get-TreeItem -SysManager $SysManager -TreePath $plcPath).Value
+    $rootName = Normalize-ScalarValue (Get-SafeValue { [string]$root.Name })
+
+    $candidatePaths = New-Object System.Collections.ArrayList
+
+    # The task-reference node lives under the '<name> Project' node. Probe its
+    # children (a 'PlcTask'-named child first, then any other child) before falling
+    # back to the project/instance/root nodes. Paths are resolved by name later.
+    $projectPaths = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace($rootName)) {
+        [void]$projectPaths.Add("$plcPath^$rootName Project")
+    }
+    $rootChildCount = Get-TreeItemChildCount -TreeItem $root
+    for ($ri = 1; $ri -le $rootChildCount; $ri++) {
+        $rc = (Get-SafeValue { (Get-TreeItemChild -TreeItem $root -Index $ri).Value })
+        if ($null -ne $rc) {
+            $rcn = Normalize-ScalarValue (Get-SafeValue { [string]$rc.Name })
+            if (-not [string]::IsNullOrWhiteSpace($rcn)) {
+                $rcp = "$plcPath^$rcn"
+                if (-not $projectPaths.Contains($rcp)) { [void]$projectPaths.Add($rcp) }
+            }
+        }
+    }
+
+    foreach ($projPath in $projectPaths) {
+        $projNode = (Get-SafeValue { (Get-TreeItem -SysManager $SysManager -TreePath $projPath).Value })
+        if ($null -eq $projNode) { continue }
+        $named = New-Object System.Collections.ArrayList
+        $other = New-Object System.Collections.ArrayList
+
+        # Enumerate the project node's children. .Child() enumeration can disagree
+        # with LookupTreeItem-by-name on some shells, so we resolve each candidate by
+        # NAME-PATH later; here we only collect the child names.
+        $childCount = Get-TreeItemChildCount -TreeItem $projNode
+        for ($ci = 1; $ci -le $childCount; $ci++) {
+            $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $projNode -Index $ci).Value })
+            if ($null -eq $childNode) { continue }
+            $cn = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+            if ([string]::IsNullOrWhiteSpace($cn)) { continue }
+            $cp = "$projPath^$cn"
+            if ($cn -eq 'PlcTask') { [void]$named.Add($cp) } else { [void]$other.Add($cp) }
+        }
+
+        # Always also probe the well-known task-reference child names by path, in case
+        # .Child() enumeration did not surface them (LookupTreeItem resolves by name).
+        foreach ($wk in @('PlcTask', 'VISU_TASK')) {
+            $wkp = "$projPath^$wk"
+            if ((-not $named.Contains($wkp)) -and (-not $other.Contains($wkp))) {
+                if ($wk -eq 'PlcTask') { [void]$named.Add($wkp) } else { [void]$other.Add($wkp) }
+            }
+        }
+
+        foreach ($p in $named) { if (-not $candidatePaths.Contains($p)) { [void]$candidatePaths.Add($p) } }
+        foreach ($p in $other) { if (-not $candidatePaths.Contains($p)) { [void]$candidatePaths.Add($p) } }
+    }
+
+    # Fall back to the project/instance/root nodes themselves (older layouts).
+    foreach ($p in $projectPaths) { if (-not $candidatePaths.Contains($p)) { [void]$candidatePaths.Add($p) } }
+    if (-not $candidatePaths.Contains($plcPath)) { [void]$candidatePaths.Add($plcPath) }
+
+    if ($candidatePaths.Count -lt 1) {
+        throw "No task-reference node found under PLC project '$plcPath' (nothing implementing ITcPlcTaskReference)"
+    }
+    return , @($candidatePaths.ToArray())
+}
+
+# Map a CpuAffinity name (or pass through a raw #x.. hex token) to a TwinCAT
+# affinity token #x{16 hex}. Used by tc_task_bind_cpu.
+function Convert-CpuAffinity {
+    param([Parameter(Mandatory = $true)][string]$Affinity)
+    $a = $Affinity.Trim()
+    if ($a -match '^#x') {
+        return $a
+    }
+    $cpu1 = [uint64]0x1; $cpu2 = [uint64]0x2; $cpu3 = [uint64]0x4; $cpu4 = [uint64]0x8
+    $cpu5 = [uint64]0x10; $cpu6 = [uint64]0x20; $cpu7 = [uint64]0x40; $cpu8 = [uint64]0x80
+    $mask = $null
+    switch ($a.ToUpperInvariant()) {
+        'NONE'      { $mask = [uint64]0 }
+        'CPU1'      { $mask = $cpu1 }
+        'CPU2'      { $mask = $cpu2 }
+        'CPU3'      { $mask = $cpu3 }
+        'CPU4'      { $mask = $cpu4 }
+        'CPU5'      { $mask = $cpu5 }
+        'CPU6'      { $mask = $cpu6 }
+        'CPU7'      { $mask = $cpu7 }
+        'CPU8'      { $mask = $cpu8 }
+        'MASKSINGLE' { $mask = $cpu1 }
+        'MASKDUAL'  { $mask = $cpu1 -bor $cpu2 }
+        'MASKQUAD'  { $mask = $cpu1 -bor $cpu2 -bor $cpu3 -bor $cpu4 }
+        'MASKHEXA'  { $mask = $cpu1 -bor $cpu2 -bor $cpu3 -bor $cpu4 -bor $cpu5 -bor $cpu6 }
+        'MASKOCT'   { $mask = $cpu1 -bor $cpu2 -bor $cpu3 -bor $cpu4 -bor $cpu5 -bor $cpu6 -bor $cpu7 -bor $cpu8 }
+        'MASKALL'   { $mask = [uint64]::MaxValue }
+        default {
+            throw "Unrecognized affinity '$Affinity'. Use a name (CPU1..CPU8, MaskSingle/Dual/Quad/Hexa/Oct/All, None) or a raw #x.. hex token."
+        }
+    }
+    return ('#x{0:x16}' -f $mask)
+}
+
+# XML-escape a scalar value for safe inclusion in a ConsumeXml envelope.
+function ConvertTo-XmlText([AllowNull()]$Value) {
+    if ($null -eq $Value) { return '' }
+    return ([string]$Value).Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+}
+
+function Ensure-TcPlcPouHelper {
+    # ITcPlcPou / ITcPlcDeclaration / ITcPlcImplementation / ITcPlcIECProject2 are
+    # vtable (IUnknown) interfaces; PowerShell cannot QI a __ComObject to them
+    # ([Interface]$obj is not a CLR QI in PS), so the declaration/implementation/
+    # document accessors are done in a compiled C# helper, exactly as
+    # Te1000PlcProjectHelper does for ITcPlcProject. Requires TCatSysManagerLib.dll
+    # and the interfaces registered in the 64-bit registry view for marshaling.
+    if ('Te1000PlcPouHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
+public static class Te1000PlcPouHelper {
+    public static string GetDeclaration(object o) {
+        return ((ITcPlcDeclaration)o).DeclarationText;
+    }
+    public static void SetDeclaration(object o, string s) {
+        ((ITcPlcDeclaration)o).DeclarationText = s;
+    }
+    public static string GetImplementation(object o) {
+        return ((ITcPlcImplementation)o).ImplementationText;
+    }
+    public static int GetImplementationLanguage(object o) {
+        return (int)((ITcPlcImplementation)o).Language;
+    }
+    public static void SetImplementationText(object o, string s) {
+        ((ITcPlcImplementation)o).ImplementationText = s;
+    }
+    public static void SetImplementationXml(object o, string s) {
+        ((ITcPlcImplementation)o).ImplementationXml = s;
+    }
+    public static string GetImplementationXml(object o) {
+        return ((ITcPlcImplementation)o).ImplementationXml;
+    }
+    public static string GetDocumentXml(object o) {
+        return ((ITcPlcPou)o).DocumentXml;
+    }
+    public static void SetDocumentXml(object o, string s) {
+        ((ITcPlcPou)o).DocumentXml = s;
+    }
+    public static bool CheckAllObjects(object o) {
+        return ((ITcPlcIECProject2)o).CheckAllObjects();
+    }
+}
+'@
+    return $null -ne ('Te1000PlcPouHelper' -as [type])
+}
+
+function Ensure-TcPlcLibraryManagerHelper {
+    # ITcPlcLibraryManager (and ITcPlcReferences / ITcPlcLibRef / ITcPlcLibrary /
+    # ITcPlcPlaceholderRef / ITcPlcLibRepositories / ITcPlcLibRepository) are vtable
+    # (IUnknown) interfaces; PowerShell cannot cast a __ComObject to them
+    # ([Interface]$obj is not a CLR QI in PS), so every QI + member call is done in a
+    # compiled C# helper, exactly as Te1000PlcProjectHelper / Te1000PlcPouHelper do.
+    # The manager lives on the References node (TIPC^<plc>^<plc> Project^References);
+    # QI/marshaling also requires the interfaces registered in the 64-bit registry view.
+    if ('Te1000PlcLibraryHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using TCatSysManagerLib;
+public static class Te1000PlcLibraryHelper {
+    // --- readers -----------------------------------------------------------
+    public static object[] ListReferences(object refsItem) {
+        ITcPlcLibraryManager mgr = (ITcPlcLibraryManager)refsItem;
+        ITcPlcReferences refs = mgr.References;
+        var list = new List<object[]>();
+        int count = refs.Count;
+        for (int i = 0; i < count; i++) {
+            ITcPlcLibRef r = refs[i];
+            string name = null, displayName = null, distributor = null, version = null, kind = "reference";
+            try { name = r.Name; } catch {}
+            ITcPlcPlaceholderRef ph = r as ITcPlcPlaceholderRef;
+            ITcPlcLibrary lib = r as ITcPlcLibrary;
+            if (ph != null) {
+                kind = "placeholder";
+                // Installed ITcPlcPlaceholderRef only exposes Name / PlaceholderName /
+                // CurrentLibrary / EffectiveResolution. DisplayName, Distributor and
+                // Version are NOT on the placeholder ref itself -- derive them from the
+                // resolved ITcPlcLibrary (EffectiveResolution preferred, else CurrentLibrary).
+                try { if (name == null) name = ph.Name; } catch {}
+                ITcPlcLibrary res = null;
+                try { res = ph.EffectiveResolution; } catch {}
+                if (res == null) { try { res = ph.CurrentLibrary; } catch {} }
+                if (res != null) {
+                    try { displayName = res.DisplayName; } catch {}
+                    try { distributor = res.Distributor; } catch {}
+                    try { version = res.Version; } catch {}
+                }
+            } else if (lib != null) {
+                kind = "library";
+                try { displayName = lib.DisplayName; } catch {}
+                try { distributor = lib.Distributor; } catch {}
+                try { if (name == null) name = lib.Name; } catch {}
+                try { version = lib.Version; } catch {}
+            }
+            list.Add(new object[] { name, kind, displayName, distributor, version });
+        }
+        return list.ToArray();
+    }
+    public static object[] ScanLibraries(object refsItem) {
+        ITcPlcLibraryManager mgr = (ITcPlcLibraryManager)refsItem;
+        ITcPlcReferences libs = mgr.ScanLibraries();
+        var list = new List<object[]>();
+        int count = libs.Count;
+        for (int i = 0; i < count; i++) {
+            ITcPlcLibRef r = libs[i];
+            string name = null, version = null, distributor = null, displayName = null;
+            ITcPlcLibrary lib = r as ITcPlcLibrary;
+            if (lib != null) {
+                try { name = lib.Name; } catch {}
+                try { version = lib.Version; } catch {}
+                try { distributor = lib.Distributor; } catch {}
+                try { displayName = lib.DisplayName; } catch {}
+            } else {
+                try { name = r.Name; } catch {}
+            }
+            list.Add(new object[] { name, version, distributor, displayName });
+        }
+        return list.ToArray();
+    }
+    public static object[] ListRepositories(object refsItem) {
+        ITcPlcLibraryManager mgr = (ITcPlcLibraryManager)refsItem;
+        ITcPlcLibRepositories repos = mgr.Repositories;
+        var list = new List<object[]>();
+        int count = repos.Count;
+        for (int i = 0; i < count; i++) {
+            ITcPlcLibRepository repo = repos[i];
+            string name = null, folder = null;
+            try { name = repo.Name; } catch {}
+            try { folder = repo.Folder; } catch {}
+            list.Add(new object[] { name, folder });
+        }
+        return list.ToArray();
+    }
+    // --- writers (project-local .plcproj edits) ----------------------------
+    public static void AddLibrary(object refsItem, string name, string ver, string co) {
+        ((ITcPlcLibraryManager)refsItem).AddLibrary(name, ver, co);
+    }
+    public static void AddPlaceholder(object refsItem, string name, string defLib, string defVer, string defDist) {
+        ((ITcPlcLibraryManager)refsItem).AddPlaceholder(name, defLib, defVer, defDist);
+    }
+    public static void AddPlaceholderNameOnly(object refsItem, string name) {
+        ((ITcPlcLibraryManager)refsItem).AddPlaceholder(name);
+    }
+    public static void SetEffectiveResolution(object refsItem, string ph, string lib, string ver, string dist) {
+        ((ITcPlcLibraryManager)refsItem).SetEffectiveResolution(ph, lib, ver, dist);
+    }
+    public static void FreezePlaceholder(object refsItem, string name) {
+        ((ITcPlcLibraryManager)refsItem).FreezePlaceholder(name);
+    }
+    public static void FreezePlaceholderAll(object refsItem) {
+        ((ITcPlcLibraryManager)refsItem).FreezePlaceholder();
+    }
+    public static void RemoveReference(object refsItem, string name) {
+        ((ITcPlcLibraryManager)refsItem).RemoveReference(name);
+    }
+    // --- repo admin (machine-wide library store mutations) -----------------
+    public static void InstallLibrary(object refsItem, string repo, string path, bool overwrite) {
+        ((ITcPlcLibraryManager)refsItem).InstallLibrary(repo, path, overwrite);
+    }
+    public static void UninstallLibrary(object refsItem, string repo, string lib, string ver, string dist) {
+        ((ITcPlcLibraryManager)refsItem).UninstallLibrary(repo, lib, ver, dist);
+    }
+    public static void InsertRepository(object refsItem, string name, string folder, int idx) {
+        ((ITcPlcLibraryManager)refsItem).InsertRepository(name, folder, idx);
+    }
+    public static void RemoveRepository(object refsItem, string name) {
+        ((ITcPlcLibraryManager)refsItem).RemoveRepository(name);
+    }
+    public static void MoveRepository(object refsItem, string name, int idx) {
+        ((ITcPlcLibraryManager)refsItem).MoveRepository(name, idx);
+    }
+}
+'@
+    return $null -ne ('Te1000PlcLibraryHelper' -as [type])
+}
+
+function Ensure-TcSettingsHelper {
+    # FALLBACK for tc_settings. ITcSysManager7.ConfigurationManager /
+    # ITcConfigManager.ActiveTargetPlatform, ITcSysManager9.SaveAsArchive, and
+    # ITcSmTreeItem6.SaveInOwnFile are accessed late-bound first; if a versioned
+    # member is vtable-only on the 64-bit TcXaeShell (as ITcPlcProject was),
+    # PowerShell cannot reach it without a CLR QI. This compiled helper QIs the
+    # typed interfaces, exactly as Te1000PlcProjectHelper does. Returns $false if
+    # TCatSysManagerLib.dll is unavailable.
+    if ('Te1000SettingsHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
+public static class Te1000SettingsHelper {
+    public static string GetActiveTargetPlatform(object project) {
+        ITcConfigManager cfg = ((ITcSysManager7)project).ConfigurationManager;
+        return cfg.ActiveTargetPlatform;
+    }
+    public static void SetActiveTargetPlatform(object project, string platform) {
+        ITcConfigManager cfg = ((ITcSysManager7)project).ConfigurationManager;
+        cfg.ActiveTargetPlatform = platform;
+    }
+    public static void SaveAsArchive(object project, string file) {
+        ((ITcSysManager9)project).SaveAsArchive(file);
+    }
+    public static bool GetSaveInOwnFile(object treeItem) {
+        return ((ITcSmTreeItem6)treeItem).SaveInOwnFile;
+    }
+    public static void SetSaveInOwnFile(object treeItem, bool enabled) {
+        ((ITcSmTreeItem6)treeItem).SaveInOwnFile = enabled;
+    }
+}
+'@
+    return $null -ne ('Te1000SettingsHelper' -as [type])
+}
+
+function Resolve-PlcReferencesPath {
+    # Shared resolution for the plc_library verbs: returns the References-node tree
+    # path. Defaults to the first PLC under TIPC (TIPC^<plc>^<plc> Project^References).
+    param(
+        [Parameter(Mandatory = $true)] $SysManager,
+        [AllowNull()][string]$ReferencesPath
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ReferencesPath)) {
+        return $ReferencesPath
+    }
+    $tipc = $SysManager.LookupTreeItem('TIPC')
+    if ([int]$tipc.ChildCount -lt 1) {
+        throw 'No PLC project found under TIPC'
+    }
+    $plcName = [string]$tipc.Child(1).Name
+    return "TIPC^$plcName^$plcName Project^References"
+}
+
+function Get-PlcLibraryReferencesItem {
+    # Resolve the References node and return the tree item, ensuring the typed
+    # ITcPlcLibraryManager helper is loaded (same failure message as plc_download).
+    param(
+        [Parameter(Mandatory = $true)] $SysManager,
+        [AllowNull()][string]$ReferencesPath
+    )
+    $path = Resolve-PlcReferencesPath -SysManager $SysManager -ReferencesPath $ReferencesPath
+    $refsItem = (Get-TreeItem -SysManager $SysManager -TreePath $path).Value
+    if (-not (Ensure-TcPlcLibraryManagerHelper)) {
+        throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcLibraryManager cast is required for PLC library operations on this shell'
+    }
+    return @{ path = $path; item = $refsItem }
+}
+
+$script:PlcLibraryRefNote = '.plcproj reference change requires a solution close+reopen in XAE to take effect (adding/removing/repinning a library or placeholder, set resolution); adding source files alone does not.'
+
+function Assert-PlcLibraryRepoConfirm {
+    param([AllowNull()][string]$Confirm)
+    if ($Confirm -ne 'ALLOW_PLC_LIBRARY_REPO') {
+        throw 'Blocked: confirm=ALLOW_PLC_LIBRARY_REPO required for repository administration.'
+    }
+}
+
+function Assert-NotSafetyPath {
+    # Project policy: nothing in this toolchain may write toward the EL6910 safety
+    # system. The safety project lives under the TISC root, so reject any parent /
+    # target tree path that addresses it so plc_pou can never author safety objects.
+    param([Parameter(Mandatory = $true)][AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    if ($Path -match '^\s*TISC(\^|$)') {
+        throw "Refused: '$Path' targets the TISC safety project. plc_pou must not author toward the safety system (project policy: nothing writes toward safety)."
+    }
+}
+
+function New-PlcPouVInfo {
+    # Build the VARIANT vInfo argument for ITcSmTreeItem.CreateChild per PLC sub-type
+    # (infosys 242732427). Multi-element cases MUST be a typed [object[]] / [string[]]
+    # so PowerShell marshals a SAFEARRAY-of-VARIANT (not a flattened pipeline).
+    #   603 Function / 611 Property => [object[]]{ langInt, returnType }   (returnType mandatory)
+    #   604 FunctionBlock / 602 Program => [object[]]{ langInt [,'Extends',ext][,'Implements',impl] }
+    #   608 Action / 609 Method / 616 Transition => [object[]]{ langInt }
+    #   618 Interface => extends string or $null (vInfo[0] = extend type)
+    #   605/606/607/615/623/629 (DUT/GVL/Alias/ParamList) => declText or $null
+    #   619 Visualization / 631 UML => $null
+    param(
+        [Parameter(Mandatory = $true)][int]$SubType,
+        [int]$Language = 1,
+        [AllowNull()][string]$ReturnType,
+        [AllowNull()][string]$Extends,
+        [AllowNull()][string]$Implements,
+        [AllowNull()][string]$DeclText
+    )
+
+    switch ($SubType) {
+        603 {
+            if ([string]::IsNullOrWhiteSpace($ReturnType)) {
+                throw 'returnType is required for Function (subType 603)'
+            }
+            Write-Output -NoEnumerate ([object[]]@($Language, [string]$ReturnType))
+            return
+        }
+        611 {
+            if ([string]::IsNullOrWhiteSpace($ReturnType)) {
+                throw 'returnType is required for Property (subType 611)'
+            }
+            Write-Output -NoEnumerate ([object[]]@($Language, [string]$ReturnType))
+            return
+        }
+        { $_ -eq 604 -or $_ -eq 602 } {
+            $info = New-Object System.Collections.Generic.List[object]
+            $info.Add($Language)
+            if (-not [string]::IsNullOrWhiteSpace($Extends)) {
+                $info.Add('Extends'); $info.Add([string]$Extends)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($Implements)) {
+                $info.Add('Implements'); $info.Add([string]$Implements)
+            }
+            Write-Output -NoEnumerate ([object[]]$info.ToArray())
+            return
+        }
+        { $_ -eq 608 -or $_ -eq 609 -or $_ -eq 616 } {
+            Write-Output -NoEnumerate ([object[]]@($Language))
+            return
+        }
+        618 {
+            if ([string]::IsNullOrWhiteSpace($Extends)) {
+                Write-Output -NoEnumerate $null
+            } else {
+                Write-Output -NoEnumerate ([string]$Extends)
+            }
+            return
+        }
+        { $_ -eq 605 -or $_ -eq 606 -or $_ -eq 607 -or $_ -eq 615 -or $_ -eq 623 -or $_ -eq 629 } {
+            if ([string]::IsNullOrWhiteSpace($DeclText)) {
+                Write-Output -NoEnumerate $null
+            } else {
+                Write-Output -NoEnumerate ([string]$DeclText)
+            }
+            return
+        }
+        default {
+            # 619 Visualization / 631 UML and any other code-less type: null vInfo.
+            Write-Output -NoEnumerate $null
+            return
+        }
+    }
+}
+
+function Invoke-PlcPouCreate {
+    # Shared CreateChild path used by both plc_pou_create and the batch verb.
+    # $Entry is a payload-shaped object with parent/name/subType[/language/returnType/extends/implements/declText/before].
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)]$Entry
+    )
+
+    $parent = [string]$Entry.parent
+    $name = [string]$Entry.name
+    if ([string]::IsNullOrWhiteSpace($parent)) { throw 'parent is required' }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+    if ($null -eq $Entry.subType) { throw 'subType is required' }
+    $subType = [int]$Entry.subType
+    Assert-NotSafetyPath -Path $parent
+
+    $language = 1
+    if ($null -ne $Entry.language) { $language = [int]$Entry.language }
+    $returnType = if ($null -ne $Entry.returnType) { [string]$Entry.returnType } else { $null }
+    $extends = if ($null -ne $Entry.extends) { [string]$Entry.extends } else { $null }
+    $implements = if ($null -ne $Entry.implements) { [string]$Entry.implements } else { $null }
+    $declText = if ($null -ne $Entry.declText) { [string]$Entry.declText } else { $null }
+    $before = if ($Entry.before) { [string]$Entry.before } else { '' }
+
+    $parentItem = (Get-TreeItem -SysManager $SysManager -TreePath $parent).Value
+    $vInfo = New-PlcPouVInfo -SubType $subType -Language $language -ReturnType $returnType -Extends $extends -Implements $implements -DeclText $declText
+
+    $child = $parentItem.CreateChild($name, $subType, $before, $vInfo)
+    Assert-WellFormedChild -Parent $parentItem -Child $child -RequestedName $name -SubType $subType -ParentPath $parent
+    return $child
 }
 
 function Expand-UIHierarchyChildren {
@@ -1210,6 +2108,54 @@ function Convert-TreeItem {
         itemType = Normalize-ScalarValue (Get-SafeValue { [int]$TreeItem.ItemType })
         subType = $subType
         childCount = Get-TreeItemChildCount -TreeItem $TreeItem
+    }
+}
+
+# --- tc_fieldbus helpers ---------------------------------------------------
+# Shared CreateChild path for NON-EtherCAT fieldbus masters/slaves/boxes
+# (PROFINET / PROFIBUS / CANopen / DeviceNet / EAP). Mirrors twincat_create_child:
+# CreateChild(name, subType, before, vInfo) then Assert-WellFormedChild so a
+# wrong subType/vInfo "ghost" (blank-named child) is cleaned up and surfaced as a
+# failure rather than a false success. OFFLINE config only — no cell write.
+# $Entry is a payload-shaped object with parent?/name/subType[/before/vInfo/claimIndex].
+function Invoke-FieldbusCreateDevice {
+    param(
+        [Parameter(Mandatory = $true)]$SysManager,
+        [Parameter(Mandatory = $true)]$Entry
+    )
+
+    $name = if ($Entry.PSObject.Properties.Name -contains 'name') { [string]$Entry.name } else { $null }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+    if ($null -eq $Entry.subType) { throw 'subType is required' }
+    $subType = [int]$Entry.subType
+
+    $parentPath = if ($Entry.PSObject.Properties.Name -contains 'parent' -and -not [string]::IsNullOrWhiteSpace([string]$Entry.parent)) { [string]$Entry.parent } else { 'TIID' }
+    Assert-NotSafetyPath -Path $parentPath
+    $before = if ($Entry.PSObject.Properties.Name -contains 'before' -and $Entry.before) { [string]$Entry.before } else { '' }
+    $vInfo = if ($Entry.PSObject.Properties.Name -contains 'vInfo' -and -not [string]::IsNullOrWhiteSpace([string]$Entry.vInfo)) { [string]$Entry.vInfo } else { $null }
+
+    $parent = (Get-TreeItem -SysManager $SysManager -TreePath $parentPath).Value
+    $child = $parent.CreateChild($name, $subType, $before, $vInfo)
+    Assert-WellFormedChild -Parent $parent -Child $child -RequestedName $name -SubType $subType -ParentPath $parentPath
+
+    $claimed = $null
+    if ($Entry.PSObject.Properties.Name -contains 'claimIndex' -and $null -ne $Entry.claimIndex) {
+        $claimIndex = [int]$Entry.claimIndex
+        try {
+            # ClaimResources lives on ITcSmTreeItem5/2; PowerShell late-binds it
+            # directly on the COM object (same as CreateChild/ConsumeXml). OFFLINE
+            # config binding of the node to underlying FC/EL hardware — NOT a cell write.
+            $child.ClaimResources($claimIndex)
+            $claimed = $true
+        } catch {
+            $claimed = $false
+        }
+    }
+
+    return @{
+        parentPath = $parentPath
+        child = Convert-TreeItem -TreeItem $child
+        claimed = $claimed
     }
 }
 
@@ -3464,6 +4410,3537 @@ try {
                 data = @{
                     restarted = $true
                     wasStarted = $wasStarted
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                throw 'name is required'
+            }
+            $template = if ($payload.template) { [string]$payload.template } else { 'Standard PLC Template' }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tipc = (Get-TreeItem -SysManager $sysManager -TreePath 'TIPC').Value
+            # subType 0 = copy-to-solution; vInfo carries the stock template NAME (infosys 242730891).
+            $child = $tipc.CreateChild($name, 0, $before, $template)
+            Assert-WellFormedChild -Parent $tipc -Child $child -RequestedName $name -SubType 0 -ParentPath 'TIPC'
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIPC'
+                    pathName = "TIPC^$name"
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_open' {
+            $name = [string]$payload.name
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                throw 'name is required'
+            }
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            if (-not (Test-Path -LiteralPath $file)) {
+                throw "PLC project file not found: $file"
+            }
+            $subType = 0
+            if ($null -ne $payload.subType) {
+                $subType = [int]$payload.subType
+            }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tipc = (Get-TreeItem -SysManager $sysManager -TreePath 'TIPC').Value
+            # Same CreateChild route as create; vInfo = file path, subType selects
+            # copy(0)/move(1)/use-in-place(2) (infosys 242730891).
+            $child = $tipc.CreateChild($name, $subType, $before, $file)
+            Assert-WellFormedChild -Parent $tipc -Child $child -RequestedName $name -SubType $subType -ParentPath 'TIPC'
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIPC'
+                    pathName = "TIPC^$name"
+                    subType = $subType
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_info' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $plc = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed casts required for plc_project_info are unavailable on this shell'
+            }
+            $nestedName = [Te1000PlcProjectHelper]::GetNestedProjectName($plc)
+            $instanceName = [Te1000PlcProjectHelper]::GetInstanceName($plc)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    name = Normalize-ScalarValue (Get-SafeValue { [string]$plc.Name })
+                    nestedProjectName = $nestedName
+                    instanceName = $instanceName
+                    childCount = Get-TreeItemChildCount -TreeItem $plc
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_check' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject2 cast is required for plc_project_check on this shell'
+            }
+            $valid = $null
+            try {
+                $valid = [Te1000PlcProjectHelper]::CheckAll($item)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject2 (use the nested project instance node, e.g. TIPC^<name>^<name> Project): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    allObjectsValid = [bool]$valid
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_boot_flags' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcProject cast is required for plc_project_boot_flags on this shell'
+            }
+            $hasAutostart = $null -ne $payload.autostart
+            $autostart = if ($hasAutostart) { [bool]$payload.autostart } else { $false }
+            $hasTmc = $null -ne $payload.tmcFileCopy
+            $tmc = if ($hasTmc) { [bool]$payload.tmcFileCopy } else { $false }
+            $current = $null
+            try {
+                $current = [Te1000PlcProjectHelper]::SetBootFlags($item, $hasAutostart, $autostart, $hasTmc, $tmc)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcProject (use the PLC root node TIPC^<name>): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    bootProjectAutostart = [bool]$current[0]
+                    tmcFileCopy = [bool]$current[1]
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_generate_boot' {
+            # GUARD enforced in index.js (confirm===ALLOW_PLC_DOWNLOAD). This is the
+            # only verb in this tool that writes toward the live target.
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $plcProject = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $autostart = $true
+            if ($null -ne $payload.autostart) {
+                $autostart = [bool]$payload.autostart
+            }
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcProject cast is required for boot project generation on this shell'
+            }
+            [Te1000PlcProjectHelper]::Deploy($plcProject, $autostart, $true)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    bootProjectGenerated = $true
+                    bootProjectAutostart = $autostart
+                    targetNetId = (Get-SafeValue { [string]$sysManager.GetTargetNetId() })
+                    note = 'Boot project generated to the target boot directory. Restart the TwinCAT runtime (twincat_restart_runtime) to load and run it.'
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_online' {
+            # GUARD enforced in index.js (confirm===ALLOW_PLC_DOWNLOAD for every command).
+            # NOTE: the literal ConsumeXml envelope below is UNVERIFIED against a live
+            # build>=4010 — confirm before relying on it; GetLastXmlError is surfaced verbatim.
+            $command = [string]$payload.command
+            if ([string]::IsNullOrWhiteSpace($command)) {
+                throw 'command is required'
+            }
+            $elementMap = @{
+                'login' = 'LoginCmd'
+                'logout' = 'LogoutCmd'
+                'start' = 'StartCmd'
+                'stop' = 'StopCmd'
+                'reset_cold' = 'ResetColdCmd'
+                'reset_origin' = 'ResetOriginCmd'
+            }
+            if (-not $elementMap.ContainsKey($command)) {
+                throw "Unsupported online command: $command"
+            }
+            $el = $elementMap[$command]
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $xml = "<TreeItem><PlcProjectDef><$el></$el></PlcProjectDef></TreeItem>"
+            try {
+                $item.ConsumeXml($xml)
+            } catch {
+                $xmlError = $null
+                try {
+                    $xmlError = $item.GetLastXmlError()
+                } catch {
+                }
+                if ($xmlError) {
+                    throw "ConsumeXml failed for online command '$command': $xmlError"
+                }
+                throw
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    command = $command
+                    executed = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_link_task' {
+            $treePath = [string]$payload.treePath
+            $taskPath = [string]$payload.taskPath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'treePath is required'
+            }
+            if ([string]::IsNullOrWhiteSpace($taskPath)) {
+                throw 'taskPath is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for plc_project_link_task on this shell'
+            }
+            $linked = $null
+            try {
+                $linked = [Te1000PlcProjectHelper]::SetLinkedTask($item, $taskPath)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcTaskReference (treePath must be the PlcTask reference node under the project instance): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    linkedTask = $linked
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_plcopen_export' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            $selection = if ($payload.selection) { [string]$payload.selection } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject cast is required for plc_project_plcopen_export on this shell'
+            }
+            try {
+                [Te1000PlcProjectHelper]::PlcOpenExport($item, $file, $selection)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject (use the nested project instance node): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    file = $file
+                    selection = $selection
+                    exported = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_plcopen_import' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            if (-not (Test-Path -LiteralPath $file)) {
+                throw "PLCopen XML file not found: $file"
+            }
+            $options = 0
+            if ($null -ne $payload.options) {
+                $options = [int]$payload.options
+            }
+            $selection = if ($payload.selection) { [string]$payload.selection } else { '' }
+            $folderStructure = $true
+            if ($null -ne $payload.folderStructure) {
+                $folderStructure = [bool]$payload.folderStructure
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject cast is required for plc_project_plcopen_import on this shell'
+            }
+            try {
+                [Te1000PlcProjectHelper]::PlcOpenImport($item, $file, $options, $selection, $folderStructure)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject (use the nested project instance node): $($_.Exception.Message)"
+            }
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    file = $file
+                    options = $options
+                    imported = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_project_save_as_library' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required'
+            }
+            $install = $false
+            if ($null -ne $payload.install) {
+                $install = [bool]$payload.install
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $treePath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcIECProject cast is required for plc_project_save_as_library on this shell'
+            }
+            try {
+                [Te1000PlcProjectHelper]::SaveAsLibrary($item, $file, $install)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcIECProject (use the nested project instance node): $($_.Exception.Message)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    file = $file
+                    installed = $install
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_create' {
+            # Offline engineering edit: CreateChild a PLC object (POU/DUT/GVL/etc).
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $child = Invoke-PlcPouCreate -SysManager $sysManager -Entry $payload
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = [string]$payload.parent
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_create_batch' {
+            $creates = $payload.creates
+            if ($null -eq $creates -or @($creates).Count -lt 1) {
+                throw 'creates must be a non-empty array'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+            foreach ($entry in @($creates)) {
+                $p = if ($entry.parent) { [string]$entry.parent } else { '' }
+                $n = if ($entry.name) { [string]$entry.name } else { '' }
+                try {
+                    $child = Invoke-PlcPouCreate -SysManager $sysManager -Entry $entry
+                    $results += @{ parent = $p; name = $n; ok = $true; child = Convert-TreeItem -TreeItem $child }
+                    $succeeded++
+                } catch {
+                    $results += @{ parent = $p; name = $n; ok = $false; error = $_.Exception.Message }
+                    $failed++
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($creates).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_import_template' {
+            $parent = [string]$payload.parent
+            if ([string]::IsNullOrWhiteSpace($parent)) {
+                throw 'parent is required'
+            }
+            Assert-NotSafetyPath -Path $parent
+            $paths = @($payload.paths) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ }
+            if ($null -eq $paths -or @($paths).Count -lt 1) {
+                throw 'paths must be a non-empty array of POU-template file paths'
+            }
+            foreach ($pth in $paths) {
+                if (-not (Test-Path -LiteralPath $pth)) {
+                    throw "POU template file not found: $pth"
+                }
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $parentItem = (Get-TreeItem -SysManager $sysManager -TreePath $parent).Value
+
+            # Snapshot existing child names so we can report only the newly imported objects.
+            $before = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+            $countBefore = Get-TreeItemChildCount -TreeItem $parentItem
+            for ($i = 1; $i -le $countBefore; $i++) {
+                $c = (Get-TreeItemChild -TreeItem $parentItem -Index $i).Value
+                $cn = Normalize-ScalarValue (Get-SafeValue { [string]$c.Name })
+                if (-not [string]::IsNullOrWhiteSpace($cn)) { [void]$before.Add($cn) }
+            }
+
+            # subType 58 = POU template import; vInfo = single path string or [string[]].
+            $vInfo = if (@($paths).Count -eq 1) { [string]$paths[0] } else { [string[]]$paths }
+            $null = $parentItem.CreateChild($null, 58, '', $vInfo)
+
+            $imported = @()
+            $countAfter = Get-TreeItemChildCount -TreeItem $parentItem
+            for ($i = 1; $i -le $countAfter; $i++) {
+                $c = (Get-TreeItemChild -TreeItem $parentItem -Index $i).Value
+                $cn = Normalize-ScalarValue (Get-SafeValue { [string]$c.Name })
+                if (-not [string]::IsNullOrWhiteSpace($cn) -and -not $before.Contains($cn)) {
+                    $imported += $cn
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parent = $parent
+                    imported = @($imported)
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_get_decl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $declText = [Te1000PlcPouHelper]::GetDeclaration($item)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    declText = $declText
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_get_impl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $implText = [Te1000PlcPouHelper]::GetImplementation($item)
+            $language = $null
+            try { $language = [Te1000PlcPouHelper]::GetImplementationLanguage($item) } catch { }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    language = $language
+                    implText = $implText
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_get_document' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $documentXml = [Te1000PlcPouHelper]::GetDocumentXml($item)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    xml = $documentXml
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_decl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.declText) { throw 'declText is required' }
+            Assert-NotSafetyPath -Path $path
+            $declText = [string]$payload.declText
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            [Te1000PlcPouHelper]::SetDeclaration($item, $declText)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    set = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_decl_batch' {
+            $items = $payload.items
+            if ($null -eq $items -or @($items).Count -lt 1) {
+                throw 'items must be a non-empty array'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+            foreach ($entry in @($items)) {
+                $p = if ($entry.path) { [string]$entry.path } else { '' }
+                try {
+                    if ([string]::IsNullOrWhiteSpace($p)) { throw 'path is required' }
+                    if ($null -eq $entry.declText) { throw 'declText is required' }
+                    Assert-NotSafetyPath -Path $p
+                    $item = (Get-TreeItem -SysManager $sysManager -TreePath $p).Value
+                    [Te1000PlcPouHelper]::SetDeclaration($item, [string]$entry.declText)
+                    $results += @{ path = $p; ok = $true }
+                    $succeeded++
+                } catch {
+                    $results += @{ path = $p; ok = $false; error = $_.Exception.Message }
+                    $failed++
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($items).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_impl' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            Assert-NotSafetyPath -Path $path
+            $hasText = $null -ne $payload.implText
+            $hasXml = $null -ne $payload.implXml
+            if (($hasText -and $hasXml) -or (-not $hasText -and -not $hasXml)) {
+                throw 'exactly one of implText / implXml is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            $via = if ($hasText) { 'text' } else { 'xml' }
+            if ($hasText) {
+                [Te1000PlcPouHelper]::SetImplementationText($item, [string]$payload.implText)
+            } else {
+                [Te1000PlcPouHelper]::SetImplementationXml($item, [string]$payload.implXml)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    set = $true
+                    via = $via
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_impl_batch' {
+            $items = $payload.items
+            if ($null -eq $items -or @($items).Count -lt 1) {
+                throw 'items must be a non-empty array'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+            foreach ($entry in @($items)) {
+                $p = if ($entry.path) { [string]$entry.path } else { '' }
+                try {
+                    if ([string]::IsNullOrWhiteSpace($p)) { throw 'path is required' }
+                    $hasText = $null -ne $entry.implText
+                    $hasXml = $null -ne $entry.implXml
+                    if (($hasText -and $hasXml) -or (-not $hasText -and -not $hasXml)) {
+                        throw 'exactly one of implText / implXml is required'
+                    }
+                    Assert-NotSafetyPath -Path $p
+                    $item = (Get-TreeItem -SysManager $sysManager -TreePath $p).Value
+                    if ($hasText) {
+                        [Te1000PlcPouHelper]::SetImplementationText($item, [string]$entry.implText)
+                        $results += @{ path = $p; ok = $true; via = 'text' }
+                    } else {
+                        [Te1000PlcPouHelper]::SetImplementationXml($item, [string]$entry.implXml)
+                        $results += @{ path = $p; ok = $true; via = 'xml' }
+                    }
+                    $succeeded++
+                } catch {
+                    $results += @{ path = $p; ok = $false; error = $_.Exception.Message }
+                    $failed++
+                }
+            }
+
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($items).Count
+                    succeeded = $succeeded
+                    failed = $failed
+                    results = $results
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_set_document' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.documentXml) { throw 'documentXml is required' }
+            Assert-NotSafetyPath -Path $path
+            $documentXml = [string]$payload.documentXml
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            if (-not (Ensure-TcPlcPouHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcPouHelper could not be loaded)'
+            }
+            [Te1000PlcPouHelper]::SetDocumentXml($item, $documentXml)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    set = $true
+                }
+            }
+            exit 0
+        }
+
+        'plc_pou_check_objects' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $plcPath = [string]$payload.plcPath
+            if ([string]::IsNullOrWhiteSpace($plcPath)) {
+                $tipc = $sysManager.LookupTreeItem('TIPC')
+                if ([int]$tipc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $plcPath = "TIPC^$([string]$tipc.Child(1).Name)"
+            }
+            $root = (Get-TreeItem -SysManager $sysManager -TreePath $plcPath).Value
+            # CheckAllObjects lives on ITcPlcIECProject2, which is implemented by the
+            # nested IEC PROJECT node (e.g. '<plcName> Project') -- NOT the TcCOM
+            # project INSTANCE node ('<plcName> Instance'). The instance node is what
+            # tree-child enumeration surfaces under the PLC root, but it does NOT QI to
+            # ITcPlcIECProject2 (E_NOINTERFACE). The IEC project node is reachable by
+            # name via LookupTreeItem at '<plcPath>^<rootName> Project'. Resolve it the
+            # same way plc_project_check does -- a direct LookupTreeItem + a single
+            # Te1000PlcProjectHelper::CheckAll on the freshly resolved RCW (looping over
+            # cached RCWs stored in a collection was observed to QI-fail E_NOINTERFACE).
+            if (-not (Ensure-TcPlcProjectHelper)) {
+                throw 'typed PLC cast unavailable on this shell (TCatSysManagerLib.dll / Te1000PlcProjectHelper could not be loaded)'
+            }
+            $rootName = Normalize-ScalarValue (Get-SafeValue { [string]$root.Name })
+
+            # Build the ordered list of candidate tree PATHS (strings, not cached RCWs).
+            $candidatePaths = New-Object System.Collections.ArrayList
+            if (-not [string]::IsNullOrWhiteSpace($rootName)) {
+                [void]$candidatePaths.Add("$plcPath^$rootName Project")
+            }
+            $childCount = Get-TreeItemChildCount -TreeItem $root
+            for ($ci = 1; $ci -le $childCount; $ci++) {
+                $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $root -Index $ci).Value })
+                if ($null -ne $childNode) {
+                    $cn = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+                    if (-not [string]::IsNullOrWhiteSpace($cn)) {
+                        $cp = "$plcPath^$cn"
+                        if (-not $candidatePaths.Contains($cp)) { [void]$candidatePaths.Add($cp) }
+                    }
+                }
+            }
+            if (-not $candidatePaths.Contains($plcPath)) { [void]$candidatePaths.Add($plcPath) }
+
+            $valid = $null
+            $instancePath = $plcPath
+            $lastErr = $null
+            $resolved = $false
+            foreach ($candPath in $candidatePaths) {
+                try {
+                    # Resolve a FRESH RCW per attempt (mirrors plc_project_check exactly).
+                    $node = (Get-TreeItem -SysManager $sysManager -TreePath $candPath).Value
+                    $valid = [Te1000PlcProjectHelper]::CheckAll($node)
+                    $instancePath = $candPath
+                    $resolved = $true
+                    break
+                } catch {
+                    $lastErr = $_.Exception.Message
+                }
+            }
+            if (-not $resolved) {
+                throw "could not find a node implementing ITcPlcIECProject2 (CheckAllObjects) under '$plcPath'. Tried the '<name> Project' instance node and the PLC root's children. Last error: $lastErr"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    plcPath = $plcPath
+                    instancePath = $instancePath
+                    allObjectsValid = [bool]$valid
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_list_references' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            $rows = [Te1000PlcLibraryHelper]::ListReferences($resolved.item)
+            $refs = @()
+            foreach ($r in $rows) {
+                $refs += @{
+                    name = $r[0]
+                    kind = $r[1]
+                    displayName = $r[2]
+                    distributor = $r[3]
+                    version = $r[4]
+                }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    referencesPath = $resolved.path
+                    count = $refs.Count
+                    references = $refs
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_scan' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            $rows = [Te1000PlcLibraryHelper]::ScanLibraries($resolved.item)
+            $libs = @()
+            foreach ($r in $rows) {
+                $libs += @{
+                    name = $r[0]
+                    version = $r[1]
+                    distributor = $r[2]
+                    displayName = $r[3]
+                }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $libs.Count
+                    libraries = $libs
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_list_repositories' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            $rows = [Te1000PlcLibraryHelper]::ListRepositories($resolved.item)
+            $repos = @()
+            foreach ($r in $rows) {
+                $repos += @{ name = $r[0]; folder = $r[1] }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $repos.Count
+                    repositories = $repos
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_add_library' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $version = if ($null -ne $payload.version) { [string]$payload.version } else { '' }
+            $company = if ($null -ne $payload.company) { [string]$payload.company } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::AddLibrary($resolved.item, $name, $version, $company)
+            $saved = $false
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'add_library'
+                    name = $name
+                    version = $version
+                    company = $company
+                    referencesPath = $resolved.path
+                    saved = $saved
+                    note = $script:PlcLibraryRefNote
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_add_placeholder' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $defLib = if ($null -ne $payload.defLib) { [string]$payload.defLib } else { '' }
+            $defVer = if ($null -ne $payload.defVer) { [string]$payload.defVer } else { '' }
+            $defDist = if ($null -ne $payload.defDist) { [string]$payload.defDist } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            if (-not [string]::IsNullOrWhiteSpace($defLib)) {
+                [Te1000PlcLibraryHelper]::AddPlaceholder($resolved.item, $name, $defLib, $defVer, $defDist)
+            } else {
+                [Te1000PlcLibraryHelper]::AddPlaceholderNameOnly($resolved.item, $name)
+            }
+            $saved = $false
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'add_placeholder'
+                    name = $name
+                    defLib = $defLib
+                    defVer = $defVer
+                    defDist = $defDist
+                    referencesPath = $resolved.path
+                    saved = $saved
+                    note = $script:PlcLibraryRefNote
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_set_resolution' {
+            $placeholder = [string]$payload.placeholder
+            $lib = [string]$payload.lib
+            if ([string]::IsNullOrWhiteSpace($placeholder)) { throw 'placeholder is required' }
+            if ([string]::IsNullOrWhiteSpace($lib)) { throw 'lib is required' }
+            $version = if ($null -ne $payload.version) { [string]$payload.version } else { '' }
+            $dist = if ($null -ne $payload.dist) { [string]$payload.dist } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::SetEffectiveResolution($resolved.item, $placeholder, $lib, $version, $dist)
+            $saved = $false
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'set_resolution'
+                    placeholder = $placeholder
+                    lib = $lib
+                    version = $version
+                    dist = $dist
+                    referencesPath = $resolved.path
+                    saved = $saved
+                    note = $script:PlcLibraryRefNote
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_freeze_placeholder' {
+            $name = if ($null -ne $payload.name) { [string]$payload.name } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                [Te1000PlcLibraryHelper]::FreezePlaceholder($resolved.item, $name)
+            } else {
+                [Te1000PlcLibraryHelper]::FreezePlaceholderAll($resolved.item)
+            }
+            $saved = $false
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'freeze'
+                    name = if ([string]::IsNullOrWhiteSpace($name)) { '(all)' } else { $name }
+                    referencesPath = $resolved.path
+                    saved = $saved
+                    note = $script:PlcLibraryRefNote
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_remove_reference' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::RemoveReference($resolved.item, $name)
+            $saved = $false
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'remove_reference'
+                    name = $name
+                    referencesPath = $resolved.path
+                    saved = $saved
+                    note = ($script:PlcLibraryRefNote + ' (Project-local edit only; does NOT uninstall from the repository.)')
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_install_library' {
+            Assert-PlcLibraryRepoConfirm -Confirm ([string]$payload.confirm)
+            $repo = [string]$payload.repo
+            $libPath = [string]$payload.libPath
+            if ([string]::IsNullOrWhiteSpace($repo)) { throw 'repo is required' }
+            if ([string]::IsNullOrWhiteSpace($libPath)) { throw 'libPath is required' }
+            $overwrite = $false
+            if ($null -ne $payload.overwrite) { $overwrite = [bool]$payload.overwrite }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::InstallLibrary($resolved.item, $repo, $libPath, $overwrite)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'install_library'
+                    repo = $repo
+                    libPath = $libPath
+                    overwrite = $overwrite
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_uninstall_library' {
+            Assert-PlcLibraryRepoConfirm -Confirm ([string]$payload.confirm)
+            $repo = [string]$payload.repo
+            $lib = [string]$payload.lib
+            if ([string]::IsNullOrWhiteSpace($repo)) { throw 'repo is required' }
+            if ([string]::IsNullOrWhiteSpace($lib)) { throw 'lib is required' }
+            $version = if ($null -ne $payload.version) { [string]$payload.version } else { '' }
+            $dist = if ($null -ne $payload.dist) { [string]$payload.dist } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::UninstallLibrary($resolved.item, $repo, $lib, $version, $dist)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'uninstall_library'
+                    repo = $repo
+                    lib = $lib
+                    version = $version
+                    dist = $dist
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_insert_repository' {
+            Assert-PlcLibraryRepoConfirm -Confirm ([string]$payload.confirm)
+            $name = [string]$payload.name
+            $folder = [string]$payload.folder
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($folder)) { throw 'folder is required' }
+            $index = 0
+            if ($null -ne $payload.index) { $index = [int]$payload.index }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::InsertRepository($resolved.item, $name, $folder, $index)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'insert_repository'
+                    name = $name
+                    folder = $folder
+                    index = $index
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_remove_repository' {
+            Assert-PlcLibraryRepoConfirm -Confirm ([string]$payload.confirm)
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::RemoveRepository($resolved.item, $name)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'remove_repository'
+                    name = $name
+                }
+            }
+            exit 0
+        }
+
+        'plc_library_move_repository' {
+            Assert-PlcLibraryRepoConfirm -Confirm ([string]$payload.confirm)
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            if ($null -eq $payload.index) { throw 'index is required' }
+            $index = [int]$payload.index
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $resolved = Get-PlcLibraryReferencesItem -SysManager $sysManager -ReferencesPath ([string]$payload.referencesPath)
+            [Te1000PlcLibraryHelper]::MoveRepository($resolved.item, $name, $index)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    action = 'move_repository'
+                    name = $name
+                    index = $index
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_list' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tirt = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRT').Value
+            $count = Get-TreeItemChildCount -TreeItem $tirt
+            $tasks = @()
+            for ($i = 1; $i -le $count; $i++) {
+                $child = (Get-TreeItemChild -TreeItem $tirt -Index $i).Value
+                if ($null -eq $child) { continue }
+                $tasks += Convert-TreeItem -TreeItem $child
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $count
+                    tasks = $tasks
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_get' {
+            $treePath = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'path is required'
+            }
+            $summary = $false
+            if ($payload.PSObject.Properties.Name -contains 'summary') {
+                $summary = [bool]$payload.summary
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $xml = Strip-TreeImage $item.ProduceXml($false)
+
+            if (-not $summary) {
+                Write-JsonResult @{
+                    ok = $true
+                    data = @{
+                        treePath = $treePath
+                        xml = $xml
+                    }
+                }
+                exit 0
+            }
+
+            # Compact summary: identity + parsed TaskDef child tags. The exact
+            # TaskDef tag names for cycle/priority/affinity are not in the cited AI
+            # docs, so emit the full <TaskDef> as a name->text map (best-effort) plus
+            # a couple of well-known reads; the caller uses this to confirm tag names.
+            $identity = Convert-TreeItem -TreeItem $item
+            $taskDef = @{}
+            if (-not [string]::IsNullOrEmpty($xml)) {
+                try {
+                    [xml]$doc = $xml
+                    $node = $doc.SelectSingleNode('//TaskDef')
+                    if ($null -ne $node) {
+                        foreach ($childNode in $node.ChildNodes) {
+                            if ($childNode.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                            if ($childNode.HasChildNodes -and $childNode.ChildNodes.Count -gt 1) { continue }
+                            $taskDef[[string]$childNode.Name] = [string]$childNode.InnerText
+                        }
+                    }
+                } catch {
+                    $taskDef = @{}
+                }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    identity = $identity
+                    taskDef = $taskDef
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                throw 'name is required'
+            }
+            $subType = 0
+            if ($payload.PSObject.Properties.Name -contains 'withImage' -and $payload.withImage -eq $false) {
+                $subType = 1
+            }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tirt = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRT').Value
+            $child = $tirt.CreateChild($name, $subType, $before, $null)
+            Assert-WellFormedChild -Parent $tirt -Child $child -RequestedName $name -SubType $subType -ParentPath 'TIRT'
+
+            $paramsApplied = $false
+            $hasCycle = ($payload.PSObject.Properties.Name -contains 'cycleTimeUs') -and ($null -ne $payload.cycleTimeUs)
+            $hasPriority = ($payload.PSObject.Properties.Name -contains 'priority') -and ($null -ne $payload.priority)
+            if ($hasCycle -or $hasPriority) {
+                $frag = ''
+                if ($hasCycle) {
+                    $ticks = [int64]([double]$payload.cycleTimeUs * 10)
+                    $frag += "<CycleTime>$ticks</CycleTime>"
+                }
+                if ($hasPriority) {
+                    $frag += "<Priority>$([int]$payload.priority)</Priority>"
+                }
+                $x = "<TreeItem><TaskDef>$frag</TaskDef></TreeItem>"
+                try {
+                    $child.ConsumeXml($x)
+                } catch {
+                    $xmlError = $null
+                    try { $xmlError = $child.GetLastXmlError() } catch {}
+                    if ($xmlError) { throw "ConsumeXml failed applying task params: $xmlError" }
+                    throw
+                }
+                $paramsApplied = $true
+            }
+
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIRT'
+                    child = Convert-TreeItem -TreeItem $child
+                    paramsApplied = $paramsApplied
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_set_params' {
+            $treePath = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'path is required'
+            }
+            $hasXml = ($payload.PSObject.Properties.Name -contains 'xml') -and (-not [string]::IsNullOrWhiteSpace([string]$payload.xml))
+            if ($hasXml) {
+                $x = [string]$payload.xml
+            } else {
+                $frag = ''
+                if (($payload.PSObject.Properties.Name -contains 'cycleTimeUs') -and ($null -ne $payload.cycleTimeUs)) {
+                    $ticks = [int64]([double]$payload.cycleTimeUs * 10)
+                    $frag += "<CycleTime>$ticks</CycleTime>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'priority') -and ($null -ne $payload.priority)) {
+                    $frag += "<Priority>$([int]$payload.priority)</Priority>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'autoStart') -and ($null -ne $payload.autoStart)) {
+                    $frag += "<AutoStart>$(([bool]$payload.autoStart).ToString().ToLowerInvariant())</AutoStart>"
+                }
+                if ([string]::IsNullOrEmpty($frag)) {
+                    throw 'set_params requires xml, or at least one of cycleTimeUs / priority / autoStart'
+                }
+                $x = "<TreeItem><TaskDef>$frag</TaskDef></TreeItem>"
+            }
+            $returnXml = $false
+            if ($payload.PSObject.Properties.Name -contains 'returnXml') {
+                $returnXml = [bool]$payload.returnXml
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $treePath -Xml $x
+            $data = @{ treePath = $treePath }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml($false)
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'tc_task_add_image_var' {
+            $treePath = [string]$payload.path
+            $varName = [string]$payload.varName
+            $dataType = [string]$payload.dataType
+            if ([string]::IsNullOrWhiteSpace($treePath)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($varName)) { throw 'varName is required' }
+            if ([string]::IsNullOrWhiteSpace($dataType)) { throw 'dataType is required' }
+            $start = -1
+            if (($payload.PSObject.Properties.Name -contains 'startAddress') -and ($null -ne $payload.startAddress)) {
+                $start = [int]$payload.startAddress
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $child = $node.CreateChild($varName, $start, '', $dataType)
+            Assert-WellFormedChild -Parent $node -Child $child -RequestedName $varName -SubType $start -ParentPath $treePath
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $treePath
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_get_rt_settings' {
+            $summary = $false
+            if ($payload.PSObject.Properties.Name -contains 'summary') {
+                $summary = [bool]$payload.summary
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tirs = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRS').Value
+            $xml = Strip-TreeImage $tirs.ProduceXml($false)
+            if (-not $summary) {
+                Write-JsonResult @{
+                    ok = $true
+                    data = @{
+                        treePath = 'TIRS'
+                        xml = $xml
+                    }
+                }
+                exit 0
+            }
+            $maxCPUs = $null
+            $affinity = $null
+            $cpus = @()
+            if (-not [string]::IsNullOrEmpty($xml)) {
+                try {
+                    [xml]$doc = $xml
+                    $def = $doc.SelectSingleNode('//RTimeSetDef')
+                    if ($null -ne $def) {
+                        $mc = $def.SelectSingleNode('MaxCPUs')
+                        if ($null -ne $mc) { $maxCPUs = [string]$mc.InnerText }
+                        $af = $def.SelectSingleNode('Affinity')
+                        if ($null -ne $af) { $affinity = [string]$af.InnerText }
+                        foreach ($cpuNode in $def.SelectNodes('.//CPU')) {
+                            $entry = @{}
+                            $idAttr = $cpuNode.Attributes['id']
+                            if ($null -ne $idAttr) { $entry['id'] = [string]$idAttr.Value }
+                            foreach ($cn in $cpuNode.ChildNodes) {
+                                if ($cn.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                                $entry[[string]$cn.Name] = [string]$cn.InnerText
+                            }
+                            $cpus += $entry
+                        }
+                    }
+                } catch {
+                    $maxCPUs = $null; $affinity = $null; $cpus = @()
+                }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = 'TIRS'
+                    maxCPUs = $maxCPUs
+                    affinity = $affinity
+                    cpus = $cpus
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_set_rt_settings' {
+            # CONFIG-ONLY: edits the project RT settings, not the running target.
+            $hasXml = ($payload.PSObject.Properties.Name -contains 'xml') -and (-not [string]::IsNullOrWhiteSpace([string]$payload.xml))
+            if ($hasXml) {
+                $x = [string]$payload.xml
+            } else {
+                $frag = ''
+                if (($payload.PSObject.Properties.Name -contains 'maxCPUs') -and ($null -ne $payload.maxCPUs)) {
+                    $frag += "<MaxCPUs>$([int]$payload.maxCPUs)</MaxCPUs>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'affinity') -and (-not [string]::IsNullOrWhiteSpace([string]$payload.affinity))) {
+                    $frag += "<Affinity>$(ConvertTo-XmlText ([string]$payload.affinity))</Affinity>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'cpus') -and ($null -ne $payload.cpus)) {
+                    $cpuFrag = ''
+                    foreach ($cpu in @($payload.cpus)) {
+                        if ($null -eq $cpu) { continue }
+                        $idVal = if ($null -ne $cpu.id) { [int]$cpu.id } else { throw 'each cpus entry requires id' }
+                        $inner = ''
+                        if ($null -ne $cpu.loadLimit) { $inner += "<LoadLimit>$([int]$cpu.loadLimit)</LoadLimit>" }
+                        if ($null -ne $cpu.baseTimeNs) { $inner += "<BaseTime>$([int64]$cpu.baseTimeNs)</BaseTime>" }
+                        if ($null -ne $cpu.latencyWarningUs) { $inner += "<LatencyWarning>$([int]$cpu.latencyWarningUs)</LatencyWarning>" }
+                        $cpuFrag += "<CPU id=`"$idVal`">$inner</CPU>"
+                    }
+                    if (-not [string]::IsNullOrEmpty($cpuFrag)) {
+                        $frag += "<CPUs>$cpuFrag</CPUs>"
+                    }
+                }
+                if ([string]::IsNullOrEmpty($frag)) {
+                    throw 'set_rt_settings requires xml, or at least one of maxCPUs / affinity / cpus'
+                }
+                $x = "<TreeItem><RTimeSetDef>$frag</RTimeSetDef></TreeItem>"
+            }
+            $returnXml = $false
+            if ($payload.PSObject.Properties.Name -contains 'returnXml') {
+                $returnXml = [bool]$payload.returnXml
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRS' -Xml $x
+            $data = @{ treePath = 'TIRS' }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml($false)
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'tc_task_bind_cpu' {
+            $treePath = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($treePath)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace([string]$payload.affinity)) { throw 'affinity is required' }
+            $token = Convert-CpuAffinity -Affinity ([string]$payload.affinity)
+            $x = "<TreeItem><TaskDef><CpuAffinity>$token</CpuAffinity></TaskDef></TreeItem>"
+            $returnXml = $false
+            if ($payload.PSObject.Properties.Name -contains 'returnXml') {
+                $returnXml = [bool]$payload.returnXml
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $treePath -Xml $x
+            $data = @{
+                treePath = $treePath
+                affinity = $token
+            }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml($false)
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'tc_task_get_linked_task' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            if (-not (Ensure-TcPlcTaskRefHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for tc_task get_linked_task on this shell'
+            }
+            # ITcPlcTaskReference is NOT on the PLC root -- resolve the task-reference
+            # sub-node (e.g. PlcTask). Try each candidate PATH with a FRESH RCW per
+            # attempt (cached RCWs QI-fail E_NOINTERFACE); first that reads wins.
+            $candidatePaths = Resolve-PlcTaskRefCandidates -SysManager $sysManager -Path ([string]$payload.path)
+            $treePath = $null
+            $lt = $null
+            $resolved = $false
+            $lastErr = $null
+            foreach ($candPath in $candidatePaths) {
+                try {
+                    $node = (Get-TreeItem -SysManager $sysManager -TreePath $candPath).Value
+                    $lt = [Te1000PlcTaskRefHelper]::GetLinkedTask($node)
+                    $treePath = $candPath
+                    $resolved = $true
+                    break
+                } catch {
+                    $lastErr = $_.Exception.Message
+                }
+            }
+            if (-not $resolved) {
+                throw "could not find a node implementing ITcPlcTaskReference (GetLinkedTask) under the PLC project. Tried: $($candidatePaths -join ', '). Last error: $lastErr"
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    linkedTask = $lt
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_set_linked_task' {
+            $linkedTask = [string]$payload.linkedTask
+            if ([string]::IsNullOrWhiteSpace($linkedTask)) {
+                throw 'linkedTask is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            if (-not (Ensure-TcPlcTaskRefHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for tc_task set_linked_task on this shell'
+            }
+            # Same resolution as get_linked_task: ITcPlcTaskReference is on the
+            # task-reference sub-node (e.g. PlcTask), NOT the PLC root. Feature-detect
+            # the node with a GetLinkedTask read (proves the QI), then write on a FRESH
+            # RCW for the same path (cached RCWs QI-fail E_NOINTERFACE).
+            $candidatePaths = Resolve-PlcTaskRefCandidates -SysManager $sysManager -Path ([string]$payload.path)
+            $treePath = $null
+            $resolved = $false
+            $lastErr = $null
+            foreach ($candPath in $candidatePaths) {
+                try {
+                    $probe = (Get-TreeItem -SysManager $sysManager -TreePath $candPath).Value
+                    $null = [Te1000PlcTaskRefHelper]::GetLinkedTask($probe)
+                    $treePath = $candPath
+                    $resolved = $true
+                    break
+                } catch {
+                    $lastErr = $_.Exception.Message
+                }
+            }
+            if (-not $resolved) {
+                throw "could not find a node implementing ITcPlcTaskReference (SetLinkedTask) under the PLC project. Tried: $($candidatePaths -join ', '). Last error: $lastErr"
+            }
+            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            try {
+                [Te1000PlcTaskRefHelper]::SetLinkedTask($node, $linkedTask)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcTaskReference: $($_.Exception.Message)"
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    linkedTask = $linkedTask
+                    set = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_produce_mapping_info' {
+            # Read-only: serialize ALL current variable links/mappings of the loaded
+            # .tsproj to one XML blob (the IDE's "Export Mapping Information"). Called
+            # late-bound on the aggregated project COM object (same surface that answers
+            # ActivateConfiguration / LinkVariables / SetTargetNetId), so no QI/cast helper
+            # is needed. No tree path: operates on the whole project.
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $xml = $null
+            try {
+                $xml = $sysManager.ProduceMappingInfo()
+            } catch {
+                Fail "ProduceMappingInfo failed: $($_.Exception.Message) ($(Get-ErrorCode $_.Exception))"
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    xml = ([string]$xml)
+                }
+            }
+            exit 0
+        }
+
+        'twincat_consume_mapping_info' {
+            # Re-apply/merge a previously produced mapping-info XML blob into the current
+            # project. MUTATES the offline config (adds links); no effect on the live cell
+            # until a later twincat_activate_configuration. ConsumeMappingInfo is on the
+            # aggregated project COM object; no GetLastXmlError here (that is an
+            # ITcSmTreeItem member) so just surface the COM message on failure.
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($xml)) {
+                throw 'xml is required'
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.ConsumeMappingInfo($xml)
+            } catch {
+                Fail "ConsumeMappingInfo failed: $($_.Exception.Message) ($(Get-ErrorCode $_.Exception))"
+            }
+            if ($save) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    consumed = $true
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
+        'twincat_clear_mapping_info' {
+            # Destructive: removes ALL variable links project-wide. MUTATES the offline
+            # config; no effect on the live cell until a later twincat_activate_configuration.
+            # The confirm token (ALLOW_TWINCAT_DELETE) is enforced in index.js, mirroring
+            # twincat_activate_configuration / plc_download which gate in JS.
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.ClearMappingInfo()
+            } catch {
+                Fail "ClearMappingInfo failed: $($_.Exception.Message) ($(Get-ErrorCode $_.Exception))"
+            }
+            if ($save) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    cleared = $true
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
+        'twincat_list_routes' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRR').Value
+
+            $routes = @()
+            $xml = Get-SafeValue { $item.ProduceXml() }
+            if (-not [string]::IsNullOrEmpty($xml)) {
+                try {
+                    [xml]$doc = $xml
+                    foreach ($n in $doc.SelectNodes('//TreeItem/RoutePrj/RemoteConnections/*')) {
+                        $rName = Get-SafeValue { [string]$n.Name }
+                        $rNetId = Get-SafeValue { [string]$n.NetId }
+                        if ([string]::IsNullOrWhiteSpace($rNetId)) { $rNetId = Get-SafeValue { [string]$n.AmsNetId } }
+                        $rAddr = Get-SafeValue { [string]$n.Address }
+                        if ([string]::IsNullOrWhiteSpace($rAddr)) { $rAddr = Get-SafeValue { [string]$n.IpAddr } }
+                        $routes += @{
+                            name = $rName
+                            netId = $rNetId
+                            address = $rAddr
+                            type = [string]$n.LocalName
+                        }
+                    }
+                } catch {
+                    $routes = @()
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $routes.Count
+                    routes = $routes
+                }
+            }
+            exit 0
+        }
+
+        'twincat_route_broadcast_search' {
+            $timeoutMs = if ($payload.timeoutMs) { [int]$payload.timeoutMs } else { 4000 }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRR').Value
+
+            $trigger = '<TreeItem><RoutePrj><TargetList><BroadcastSearch>true</BroadcastSearch></TargetList></RoutePrj></TreeItem>'
+            try {
+                $item.ConsumeXml($trigger)
+            } catch {
+                $e = Get-SafeValue { $item.GetLastXmlError() }
+                if ($e) { throw "ConsumeXml failed: $e" } else { throw }
+            }
+            Start-Sleep -Milliseconds $timeoutMs
+
+            $targets = @()
+            $res = Get-SafeValue { $item.ProduceXml() }
+            if (-not [string]::IsNullOrEmpty($res)) {
+                try {
+                    [xml]$doc = $res
+                    foreach ($t in $doc.SelectNodes('//TreeItem/RoutePrj/TargetList/Target')) {
+                        $targets += @{
+                            name = [string]$t.Name
+                            netId = [string]$t.NetId
+                            ipAddr = [string]$t.IpAddr
+                        }
+                    }
+                } catch {
+                    $targets = @()
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $targets.Count
+                    targets = $targets
+                }
+            }
+            exit 0
+        }
+
+        'twincat_route_search_host' {
+            $searchHost = [string]$payload.host
+            if ([string]::IsNullOrWhiteSpace($searchHost)) {
+                throw 'host is required'
+            }
+            $timeoutMs = if ($payload.timeoutMs) { [int]$payload.timeoutMs } else { 4000 }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRR').Value
+
+            $h = ConvertTo-XmlText $searchHost
+            $trigger = "<TreeItem><RoutePrj><TargetList><Search>$h</Search></TargetList></RoutePrj></TreeItem>"
+            try {
+                $item.ConsumeXml($trigger)
+            } catch {
+                $e = Get-SafeValue { $item.GetLastXmlError() }
+                if ($e) { throw "ConsumeXml failed: $e" } else { throw }
+            }
+            Start-Sleep -Milliseconds $timeoutMs
+
+            $target = $null
+            $found = $false
+            $res = Get-SafeValue { $item.ProduceXml() }
+            if (-not [string]::IsNullOrEmpty($res)) {
+                try {
+                    [xml]$doc = $res
+                    $t = $doc.SelectSingleNode('//TreeItem/RoutePrj/TargetList/Target')
+                    if ($t) {
+                        $target = @{
+                            name = [string]$t.Name
+                            netId = [string]$t.NetId
+                            ipAddr = [string]$t.IpAddr
+                            version = [string]$t.Version
+                            os = [string]$t.OS
+                        }
+                        $found = $true
+                    }
+                } catch {
+                    $target = $null
+                    $found = $false
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    host = $searchHost
+                    found = $found
+                    target = $target
+                }
+            }
+            exit 0
+        }
+
+        'twincat_add_route' {
+            if ([string]$payload.confirm -ne 'ALLOW_TWINCAT_ROUTE_WRITE') {
+                throw 'Blocked: confirm=ALLOW_TWINCAT_ROUTE_WRITE required to write an ADS route.'
+            }
+            $remoteName = [string]$payload.remoteName
+            $remoteNetId = [string]$payload.remoteNetId
+            $remoteIpAddr = [string]$payload.remoteIpAddr
+            $remoteHostName = [string]$payload.remoteHostName
+            if ([string]::IsNullOrWhiteSpace($remoteName)) { throw 'remoteName is required' }
+            if ([string]::IsNullOrWhiteSpace($remoteNetId)) { throw 'remoteNetId is required' }
+            if ([string]::IsNullOrWhiteSpace($remoteIpAddr) -and [string]::IsNullOrWhiteSpace($remoteHostName)) {
+                throw 'one of remoteIpAddr / remoteHostName is required'
+            }
+
+            $sb = '<AddRoute>'
+            $sb += "<RemoteName>$(ConvertTo-XmlText $remoteName)</RemoteName>"
+            $sb += "<RemoteNetId>$(ConvertTo-XmlText $remoteNetId)</RemoteNetId>"
+            if (-not [string]::IsNullOrWhiteSpace($remoteIpAddr)) {
+                $sb += "<RemoteIpAddr>$(ConvertTo-XmlText $remoteIpAddr)</RemoteIpAddr>"
+            } elseif (-not [string]::IsNullOrWhiteSpace($remoteHostName)) {
+                $sb += "<RemoteHostName>$(ConvertTo-XmlText $remoteHostName)</RemoteHostName>"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$payload.userName)) {
+                $sb += "<UserName>$(ConvertTo-XmlText ([string]$payload.userName))</UserName>"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$payload.password)) {
+                $sb += "<Password>$(ConvertTo-XmlText ([string]$payload.password))</Password>"
+            }
+            if (($payload.PSObject.Properties.Name -contains 'noEncryption') -and [bool]$payload.noEncryption) {
+                $sb += '<NoEncryption>1</NoEncryption>'
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$payload.localName)) {
+                $sb += "<LocalName>$(ConvertTo-XmlText ([string]$payload.localName))</LocalName>"
+            }
+            $sb += '</AddRoute>'
+            $xml = "<TreeItem><RoutePrj><RemoteConnections>$sb</RemoteConnections></RoutePrj></TreeItem>"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $null = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRR' -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    added = $true
+                    remoteName = $remoteName
+                    remoteNetId = $remoteNetId
+                }
+            }
+            exit 0
+        }
+
+        'twincat_add_project_route' {
+            if ([string]$payload.confirm -ne 'ALLOW_TWINCAT_ROUTE_WRITE') {
+                throw 'Blocked: confirm=ALLOW_TWINCAT_ROUTE_WRITE required to write an ADS route.'
+            }
+            $rName = [string]$payload.name
+            $rNetId = [string]$payload.netId
+            $rIpAddr = [string]$payload.ipAddr
+            $rHostName = [string]$payload.hostName
+            if ([string]::IsNullOrWhiteSpace($rName)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($rNetId)) { throw 'netId is required' }
+            if ([string]::IsNullOrWhiteSpace($rIpAddr) -and [string]::IsNullOrWhiteSpace($rHostName)) {
+                throw 'one of ipAddr / hostName is required'
+            }
+
+            $sb = '<AddProjectRoute>'
+            $sb += "<Name>$(ConvertTo-XmlText $rName)</Name>"
+            $sb += "<NetId>$(ConvertTo-XmlText $rNetId)</NetId>"
+            if (-not [string]::IsNullOrWhiteSpace($rIpAddr)) {
+                $sb += "<IpAddr>$(ConvertTo-XmlText $rIpAddr)</IpAddr>"
+            } elseif (-not [string]::IsNullOrWhiteSpace($rHostName)) {
+                $sb += "<HostName>$(ConvertTo-XmlText $rHostName)</HostName>"
+            }
+            $sb += '</AddProjectRoute>'
+            $xml = "<TreeItem><RoutePrj><RemoteConnections>$sb</RemoteConnections></RoutePrj></TreeItem>"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $null = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRR' -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    added = $true
+                    name = $rName
+                    netId = $rNetId
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_silent_mode' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $settings = Get-AutomationSettings -Dte $dte
+            $silent = [bool](Get-SafeValue { [bool]$settings.SilentMode })
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    silentMode = $silent
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_silent_mode' {
+            if (-not ($payload.PSObject.Properties.Name -contains 'enabled')) {
+                throw "'enabled' is required (boolean)"
+            }
+            $enabled = [bool]$payload.enabled
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $settings = Get-AutomationSettings -Dte $dte
+            $prev = [bool]$settings.SilentMode
+            $settings.SilentMode = $enabled
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    silentMode = $enabled
+                    previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_target_platform' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $platform = $null
+            try {
+                $cfg = $sysManager.ConfigurationManager
+                $platform = [string]$cfg.ActiveTargetPlatform
+            } catch {
+                if (-not (Ensure-TcSettingsHelper)) { throw }
+                $platform = [Te1000SettingsHelper]::GetActiveTargetPlatform($sysManager)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    activeTargetPlatform = $platform
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_target_platform' {
+            $platform = [string]$payload.platform
+            $allowed = @('TwinCAT RT (x86)', 'TwinCAT RT (x64)')
+            if ($allowed -notcontains $platform) {
+                throw "platform must be exactly one of: '$($allowed -join "', '")'"
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $prev = $null
+            try {
+                $cfg = $sysManager.ConfigurationManager
+                $prev = [string]$cfg.ActiveTargetPlatform
+                $cfg.ActiveTargetPlatform = $platform
+            } catch {
+                if (-not (Ensure-TcSettingsHelper)) { throw }
+                $prev = [Te1000SettingsHelper]::GetActiveTargetPlatform($sysManager)
+                [Te1000SettingsHelper]::SetActiveTargetPlatform($sysManager, $platform)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    activeTargetPlatform = $platform
+                    previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        'twincat_save_solution_archive' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required (absolute path ending in .tszip)'
+            }
+            if (-not $file.ToLowerInvariant().EndsWith('.tszip')) {
+                throw "file must end in .tszip: $file"
+            }
+            $parent = Split-Path -Parent $file
+            if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent)) {
+                throw "parent directory does not exist (not created automatically): $parent"
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.SaveAsArchive($file)
+            } catch {
+                if (-not (Ensure-TcSettingsHelper)) { throw }
+                [Te1000SettingsHelper]::SaveAsArchive($sysManager, $file)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    file = $file
+                    saved = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_save_plc_archive' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) {
+                throw 'file is required (absolute path ending in .tpzip)'
+            }
+            if (-not $file.ToLowerInvariant().EndsWith('.tpzip')) {
+                throw "file must end in .tpzip: $file"
+            }
+            $parent = Split-Path -Parent $file
+            if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent)) {
+                throw "parent directory does not exist (not created automatically): $parent"
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $plc = (Get-TreeItem -SysManager $sysManager -TreePath 'TIPC').Value
+
+            $childName = if ($payload.name) { [string]$payload.name } else { $null }
+            if ([string]::IsNullOrWhiteSpace($childName)) {
+                if ([int]$plc.ChildCount -lt 1) {
+                    throw 'No PLC project found under TIPC'
+                }
+                $childName = [string]$plc.Child(1).Name
+            }
+
+            $plc.ExportChild($childName, $file)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIPC'
+                    childName = $childName
+                    file = $file
+                    saved = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_independent_file' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $value = $null
+            $raw = Get-SafeValue { [bool]$item.SaveInOwnFile }
+            if ($null -ne $raw) {
+                $value = [bool]$raw
+            } else {
+                if (-not (Ensure-TcSettingsHelper)) { throw 'SaveInOwnFile is not accessible (late-bound) and the typed helper could not be loaded' }
+                $value = [Te1000SettingsHelper]::GetSaveInOwnFile($item)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    saveInOwnFile = $value
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_independent_file' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            Assert-NotSafetyPath -Path $path
+            if (-not ($payload.PSObject.Properties.Name -contains 'enabled')) {
+                throw "'enabled' is required (boolean)"
+            }
+            $enabled = [bool]$payload.enabled
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            $prev = $null
+            $raw = Get-SafeValue { [bool]$item.SaveInOwnFile }
+            if ($null -ne $raw) {
+                $prev = [bool]$raw
+                $item.SaveInOwnFile = $enabled
+            } else {
+                if (-not (Ensure-TcSettingsHelper)) { throw 'SaveInOwnFile is not accessible (late-bound) and the typed helper could not be loaded' }
+                $prev = [Te1000SettingsHelper]::GetSaveInOwnFile($item)
+                [Te1000SettingsHelper]::SetSaveInOwnFile($item, $enabled)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    saveInOwnFile = $enabled
+                    previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        'twincat_get_node_disabled' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            $DISABLED_STATE = @{ 0 = 'SMDS_NOT_DISABLED'; 1 = 'SMDS_DISABLED'; 2 = 'SMDS_PARENT_DISABLED' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $raw = [int](Get-SafeValue { [int]$item.Disabled })
+            $state = if ($DISABLED_STATE.ContainsKey($raw)) { $DISABLED_STATE[$raw] } else { "UNKNOWN($raw)" }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    disabled = $raw
+                    state = $state
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_node_disabled' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            Assert-NotSafetyPath -Path $path
+            if (-not ($payload.PSObject.Properties.Name -contains 'disabled')) {
+                throw "'disabled' is required (boolean)"
+            }
+            $disabled = [bool]$payload.disabled
+            $DISABLED_STATE = @{ 0 = 'SMDS_NOT_DISABLED'; 1 = 'SMDS_DISABLED'; 2 = 'SMDS_PARENT_DISABLED' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $prev = [int](Get-SafeValue { [int]$item.Disabled })
+            $newVal = if ($disabled) { 1 } else { 0 }
+            $item.Disabled = $newVal
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    disabled = $newVal
+                    state = $DISABLED_STATE[$newVal]
+                    previous = $prev
+                }
+            }
+            exit 0
+        }
+
+        # --- tc_fieldbus: NON-EtherCAT fieldbus config (OFFLINE only) ----------
+        # PROFINET / PROFIBUS / CANopen / DeviceNet / EAP masters, slaves, boxes.
+        # Every verb edits the in-memory project (CreateChild / ClaimResources /
+        # ConsumeXml) — NONE push to the live cell, so no confirm token. Safety
+        # (TISC) paths are rejected by Assert-NotSafetyPath.
+        'fieldbus_create_device' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $created = Invoke-FieldbusCreateDevice -SysManager $sysManager -Entry $payload
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $created.parentPath
+                    child = $created.child
+                    claimed = $created.claimed
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_create_devices' {
+            $creates = $payload.creates
+            if ($null -eq $creates -or @($creates).Count -eq 0) {
+                throw 'creates is required'
+            }
+            $save = $false
+            if ($payload.PSObject.Properties.Name -contains 'save') {
+                $save = [bool]$payload.save
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $results = @()
+            $succeeded = 0
+            $failed = 0
+
+            foreach ($entry in $creates) {
+                $entryParent = if ($entry.PSObject.Properties.Name -contains 'parent' -and -not [string]::IsNullOrWhiteSpace([string]$entry.parent)) { [string]$entry.parent } else { 'TIID' }
+                $entryName = if ($entry.PSObject.Properties.Name -contains 'name') { [string]$entry.name } else { $null }
+                try {
+                    $created = Invoke-FieldbusCreateDevice -SysManager $sysManager -Entry $entry
+                    $succeeded++
+                    $results += @{
+                        parent = $created.parentPath
+                        name = $entryName
+                        ok = $true
+                        child = $created.child
+                        claimed = $created.claimed
+                    }
+                } catch {
+                    $failed++
+                    $results += @{
+                        parent = $entryParent
+                        name = $entryName
+                        ok = $false
+                        error = [string]$_.Exception.Message
+                    }
+                }
+            }
+
+            $data = @{
+                count = @($creates).Count
+                succeeded = $succeeded
+                failed = $failed
+                results = $results
+            }
+            if ($save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+                $data.saved = $saved
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'fieldbus_list_resources' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            # Beckhoff pages disagree on the property name (PROFIBUS page cites
+            # ResourcesCount returning a string; CANopen page cites ResourceCount).
+            # Probe both via Get-SafeValue and report which one answered.
+            $count = Normalize-ScalarValue (Get-SafeValue { $item.ResourcesCount })
+            $prop = 'ResourcesCount'
+            if ($null -eq $count) {
+                $count = Normalize-ScalarValue (Get-SafeValue { $item.ResourceCount })
+                $prop = 'ResourceCount'
+            }
+            if ($null -eq $count) {
+                $prop = $null
+            } else {
+                # Coerce to int when parseable; otherwise keep the raw value.
+                $parsed = 0
+                if ([int]::TryParse([string]$count, [ref]$parsed)) {
+                    $count = $parsed
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    resourcesCount = $count
+                    property = $prop
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_claim_resources' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            if ($null -eq $payload.index) {
+                throw 'index is required'
+            }
+            $index = [int]$payload.index
+            Assert-NotSafetyPath -Path $path
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            try {
+                $item.ClaimResources($index)
+            } catch {
+                $xmlError = Get-SafeValue { [string]$item.GetLastXmlError() }
+                if (-not [string]::IsNullOrWhiteSpace($xmlError)) {
+                    throw "ClaimResources failed: $xmlError"
+                }
+                throw
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    index = $index
+                    claimed = $true
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_create_gsd_box' {
+            $controllerPath = [string]$payload.controllerPath
+            $name = [string]$payload.name
+            $gsdPath = [string]$payload.gsdPath
+            $moduleIdentNumber = [string]$payload.moduleIdentNumber
+            if ([string]::IsNullOrWhiteSpace($controllerPath)) { throw 'controllerPath is required' }
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($gsdPath)) { throw 'gsdPath is required' }
+            if ([string]::IsNullOrWhiteSpace($moduleIdentNumber)) { throw 'moduleIdentNumber is required' }
+            # GSD box SubType depends on the PROFINET controller variant (PN device
+            # 115/118/142/143) and is NOT auto-defaulted — caller must pass it.
+            if ($null -eq $payload.subType) {
+                throw 'subType is required for create_gsd_box (PROFINET device subType, e.g. 115/118/142/143; depends on the controller variant). Confirm against the GSD how-to before use.'
+            }
+            $subType = [int]$payload.subType
+            Assert-NotSafetyPath -Path $controllerPath
+
+            $flags = if ($payload.PSObject.Properties.Name -contains 'boxFlags' -and $null -ne $payload.boxFlags) { [int]$payload.boxFlags } else { 0 }
+            $dap = if ($payload.PSObject.Properties.Name -contains 'dapNumber' -and -not [string]::IsNullOrWhiteSpace([string]$payload.dapNumber)) { [string]$payload.dapNumber } else { '' }
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            # Beckhoff GSD vInfo syntax: PathToGSDfile#ModuleIdentNumber#BoxFlags#DAPNumber
+            $vInfo = "$gsdPath#$moduleIdentNumber#$flags#$dap"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $controller = (Get-TreeItem -SysManager $sysManager -TreePath $controllerPath).Value
+            $box = $controller.CreateChild($name, $subType, $before, $vInfo)
+            Assert-WellFormedChild -Parent $controller -Child $box -RequestedName $name -SubType $subType -ParentPath $controllerPath
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    controllerPath = $controllerPath
+                    box = Convert-TreeItem -TreeItem $box
+                    vInfo = $vInfo
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_add_netvar' {
+            $boxPath = [string]$payload.boxPath
+            $name = [string]$payload.name
+            $dataType = [string]$payload.dataType
+            if ([string]::IsNullOrWhiteSpace($boxPath)) { throw 'boxPath is required' }
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($dataType)) { throw 'dataType is required' }
+            Assert-NotSafetyPath -Path $boxPath
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $box = (Get-TreeItem -SysManager $sysManager -TreePath $boxPath).Value
+            # EAP pub/sub variable: SubType 0, dataType passed as vInfo. Resulting
+            # ItemType is 35 (publisher) / 36 (subscriber) — informational read-back.
+            $var = $box.CreateChild($name, 0, $before, $dataType)
+            Assert-WellFormedChild -Parent $box -Child $var -RequestedName $name -SubType 0 -ParentPath $boxPath
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    boxPath = $boxPath
+                    var = Convert-TreeItem -TreeItem $var
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_set_station_address' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            if ($null -eq $payload.address) {
+                throw 'address is required'
+            }
+            $address = [int]$payload.address
+            Assert-NotSafetyPath -Path $path
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            # The exact station-address XML element is not pinned in the docs (the
+            # summarized bare ConsumeXml("44") form is suspect), so discover it first:
+            # ProduceXml(false), locate an element whose name contains "Station" and an
+            # "Address"/"No"/"Number" sibling, then ConsumeXml a minimal envelope.
+            $current = Get-SafeValue { [string]$item.ProduceXml($false) }
+            $element = $null
+            if (-not [string]::IsNullOrWhiteSpace($current)) {
+                $m = [regex]::Match($current, '<(?<el>\w*Station(Address|No|Number)\w*)>')
+                if ($m.Success) {
+                    $element = $m.Groups['el'].Value
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($element)) {
+                throw "Could not discover the station-address XML element from ProduceXml for '$path'. Use tc_fieldbus get_xml to inspect the node and set_xml to apply the correct element (the bare ConsumeXml(number) form is unverified and is not shipped)."
+            }
+
+            $xml = "<TreeItem><$element>$address</$element></TreeItem>"
+            try {
+                $item.ConsumeXml($xml)
+            } catch {
+                $xmlError = Get-SafeValue { [string]$item.GetLastXmlError() }
+                if (-not [string]::IsNullOrWhiteSpace($xmlError)) {
+                    throw "ConsumeXml failed: $xmlError"
+                }
+                throw
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    address = $address
+                    element = $element
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_import_dbc' {
+            $masterPath = [string]$payload.masterPath
+            $fileName = [string]$payload.fileName
+            if ([string]::IsNullOrWhiteSpace($masterPath)) { throw 'masterPath is required' }
+            if ([string]::IsNullOrWhiteSpace($fileName)) { throw 'fileName is required' }
+            Assert-NotSafetyPath -Path $masterPath
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $masterPath).Value
+
+            # CanOpenMaster/ImportDbcFile config import (topic 1095735435, needs
+            # TC3.1 build >= 4018 — cannot easily detect, documented). OFFLINE.
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.Append('<TreeItem><CanOpenMaster><ImportDbcFile>')
+            [void]$sb.Append("<FileName>$(ConvertTo-XmlText $fileName)</FileName>")
+            foreach ($flag in @('importExtendedMessages', 'importMultiplexedDataMessages', 'keepUnchangedMessages', 'communicateWithSlavesFromDbcFile')) {
+                if ($payload.PSObject.Properties.Name -contains $flag -and $null -ne $payload.$flag) {
+                    $tag = switch ($flag) {
+                        'importExtendedMessages' { 'ImportExtendedMessages' }
+                        'importMultiplexedDataMessages' { 'ImportMultiplexedDataMessages' }
+                        'keepUnchangedMessages' { 'KeepUnchangedMessages' }
+                        'communicateWithSlavesFromDbcFile' { 'CommunicateWithSlavesFromDbcFile' }
+                    }
+                    $val = if ([bool]$payload.$flag) { 'true' } else { 'false' }
+                    [void]$sb.Append("<$tag>$val</$tag>")
+                }
+            }
+            [void]$sb.Append('</ImportDbcFile></CanOpenMaster></TreeItem>')
+            $xml = $sb.ToString()
+
+            try {
+                $item.ConsumeXml($xml)
+            } catch {
+                $xmlError = Get-SafeValue { [string]$item.GetLastXmlError() }
+                if (-not [string]::IsNullOrWhiteSpace($xmlError)) {
+                    throw "ImportDbcFile ConsumeXml failed: $xmlError (requires TC3.1 build >= 4018)"
+                }
+                throw
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    masterPath = $masterPath
+                    fileName = $fileName
+                    imported = $true
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'fieldbus_get_xml' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $xml = [string]$item.ProduceXml($false)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ path = $path; xml = $xml }
+            }
+            exit 0
+        }
+
+        'fieldbus_set_xml' {
+            $path = [string]$payload.path
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($xml)) { throw 'xml is required' }
+            Assert-NotSafetyPath -Path $path
+            $returnXml = $payload.PSObject.Properties.Name -contains 'returnXml' -and [bool]$payload.returnXml
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $path -Xml $xml
+
+            $echo = $null
+            if ($returnXml) {
+                $echo = Normalize-ScalarValue (Get-SafeValue { [string]$item.ProduceXml($false) })
+            }
+
+            $saved = $null
+            if ($payload.PSObject.Properties.Name -contains 'save' -and [bool]$payload.save) {
+                $saved = $false
+                try { Save-Solution -Dte $dte; $saved = $true } catch { $saved = $false }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $path
+                    applied = $true
+                    xml = $echo
+                    saved = $saved
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_list' {
+            if (-not (Ensure-Te1000ModuleHelper)) {
+                Fail('TCatSysManagerLib.dll could not be loaded; the typed ITcModuleManager3 enumeration is required to list TcCOM modules on this shell')
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $tuples = [Te1000ModuleHelper]::List($sysManager)
+            $modules = @()
+            foreach ($t in $tuples) {
+                $modules += @{
+                    moduleTypeName = Normalize-ScalarValue $t[0]
+                    moduleInstanceName = Normalize-ScalarValue $t[1]
+                    classId = Normalize-ScalarValue $t[2]
+                    oid = Normalize-ScalarValue $t[3]
+                    objectId = Normalize-ScalarValue $t[4]
+                    parentOid = Normalize-ScalarValue $t[5]
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = @($modules).Count
+                    modules = $modules
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_create' {
+            $parentPath = 'TIRC^TcCOM Objects'
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $by = [string]$payload.by
+            if ($by -ne 'classid' -and $by -ne 'name') { throw "by must be 'classid' or 'name'" }
+            $id = [string]$payload.id
+            if ([string]::IsNullOrWhiteSpace($id)) { throw 'id is required' }
+            $subType = if ($by -eq 'classid') { 0 } else { 1 }
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $parent = (Get-TreeItem -SysManager $sysManager -TreePath $parentPath).Value
+            $child = $parent.CreateChild($name, $subType, $before, $id)
+            Assert-WellFormedChild -Parent $parent -Child $child -RequestedName $name -SubType $subType -ParentPath $parentPath
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $parentPath
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_get_xml' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+            $xml = Strip-TreeImage $item.ProduceXml()
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ treePath = $path; xml = $xml }
+            }
+            exit 0
+        }
+
+        'twincat_module_set_xml' {
+            $path = [string]$payload.path
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($xml)) { throw 'xml is required' }
+            $returnXml = $payload.PSObject.Properties.Name -contains 'returnXml' -and [bool]$payload.returnXml
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $path -Xml $xml
+
+            $data = @{ treePath = $path }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml()
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'twincat_module_enable_symbols' {
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            $doParams = $payload.PSObject.Properties.Name -contains 'parameters' -and [bool]$payload.parameters
+            $doAreas = $payload.PSObject.Properties.Name -contains 'dataAreas' -and [bool]$payload.dataAreas
+            $returnXml = $payload.PSObject.Properties.Name -contains 'returnXml' -and [bool]$payload.returnXml
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            [xml]$doc = $item.ProduceXml()
+            $changed = $false
+            if ($doParams) {
+                foreach ($n in $doc.SelectNodes('//Parameters//Parameter')) {
+                    $n.SetAttribute('CreateSymbol', 'true')
+                    $changed = $true
+                }
+            }
+            if ($doAreas) {
+                foreach ($n in $doc.SelectNodes('//DataAreas//DataArea/AreaNo')) {
+                    $n.SetAttribute('CreateSymbols', 'true')
+                    $changed = $true
+                }
+            }
+            if ($changed) {
+                try {
+                    $item.ConsumeXml($doc.OuterXml)
+                } catch {
+                    $xmlError = $null
+                    try { $xmlError = $item.GetLastXmlError() } catch { }
+                    if ($xmlError) { throw "ConsumeXml failed: $xmlError" }
+                    throw
+                }
+            }
+
+            $data = @{
+                treePath = $path
+                parameters = $doParams
+                dataAreas = $doAreas
+                changed = $changed
+            }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml()
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'twincat_module_set_context' {
+            if (-not (Ensure-Te1000ModuleHelper)) {
+                Fail('TCatSysManagerLib.dll could not be loaded; the typed ITcModuleInstance2.SetModuleContext call is required to set a module context on this shell')
+            }
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ($null -eq $payload.taskObjectId) { throw 'taskObjectId is required' }
+            $taskObjectId = [int]$payload.taskObjectId
+            $contextId = if ($payload.PSObject.Properties.Name -contains 'contextId' -and $null -ne $payload.contextId) { [int]$payload.contextId } else { 0 }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $path).Value
+
+            [Te1000ModuleHelper]::SetContext($item, $contextId, $taskObjectId)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $path
+                    contextId = $contextId
+                    taskObjectId = $taskObjectId
+                    contextSet = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_module_link_variables' {
+            $producer = [string]$payload.a
+            $consumer = [string]$payload.b
+            $autoResolve = $true
+            if ($payload.PSObject.Properties.Name -contains 'autoResolve') {
+                $autoResolve = [bool]$payload.autoResolve
+            }
+            if ([string]::IsNullOrWhiteSpace($producer) -or [string]::IsNullOrWhiteSpace($consumer)) {
+                throw 'a and b are required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            $result = Link-Variables -SysManager $sysManager -Producer $producer -Consumer $consumer -AutoResolve $autoResolve
+
+            Write-JsonResult @{
+                ok = $true
+                data = $result
+            }
+            exit 0
+        }
+
+        'twincat_module_unlink_variables' {
+            $variableA = [string]$payload.a
+            $variableB = if ($payload.PSObject.Properties.Name -contains 'b') { [string]$payload.b } else { $null }
+            if ([string]::IsNullOrWhiteSpace($variableA)) {
+                throw 'a is required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+
+            if ([string]::IsNullOrWhiteSpace($variableB)) {
+                $sysManager.UnlinkVariables($variableA)
+            } else {
+                $sysManager.UnlinkVariables($variableA, $variableB)
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    variableA = $variableA
+                    variableB = $variableB
+                    unlinked = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_cpp_create_project' {
+            $parentPath = 'TIXC'
+            $name = [string]$payload.name
+            $template = [string]$payload.template
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            if ([string]::IsNullOrWhiteSpace($template)) { throw 'template is required' }
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $cpp = (Get-TreeItem -SysManager $sysManager -TreePath $parentPath).Value
+            $child = $cpp.CreateChild($name, 0, $before, $template)
+            Assert-WellFormedChild -Parent $cpp -Child $child -RequestedName $name -SubType 0 -ParentPath $parentPath
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $parentPath
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'twincat_cpp_create_module' {
+            $parentPath = [string]$payload.projectPath
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($parentPath)) { throw 'projectPath is required' }
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            Assert-NotSafetyPath -Path $parentPath
+            $template = if ($payload.PSObject.Properties.Name -contains 'template' -and -not [string]::IsNullOrWhiteSpace([string]$payload.template)) { [string]$payload.template } else { 'TwinCAT Class Wizard' }
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $proj = (Get-TreeItem -SysManager $sysManager -TreePath $parentPath).Value
+            $child = $proj.CreateChild($name, 0, $before, $template)
+            Assert-WellFormedChild -Parent $proj -Child $child -RequestedName $name -SubType 0 -ParentPath $parentPath
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $parentPath
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'twincat_cpp_open' {
+            $file = [string]$payload.file
+            if ([string]::IsNullOrWhiteSpace($file)) { throw 'file is required' }
+            if (-not (Test-Path -LiteralPath $file)) { throw "C++ project file not found: $file" }
+            $subType = if ($null -ne $payload.subType) { [int]$payload.subType } else { 0 }
+            if ($subType -notin 0, 1, 2) { throw 'subType must be 0, 1, or 2' }
+            $before = if ($payload.PSObject.Properties.Name -contains 'before' -and $payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $cpp = (Get-TreeItem -SysManager $sysManager -TreePath 'TIXC').Value
+            # NOTE: name MUST be '' — C++ projects cannot be renamed on open, so
+            # Assert-WellFormedChild (which requires a matching requested name) is
+            # intentionally bypassed; a manual non-null/non-blank check replaces it.
+            $child = $cpp.CreateChild('', $subType, $before, $file)
+            if ($null -eq $child) { throw 'CreateChild returned null opening C++ project' }
+            $actualName = Get-SafeValue { [string]$child.Name }
+            if ([string]::IsNullOrWhiteSpace([string]$actualName)) {
+                throw "open produced a ghost (blank name) - check the .vcxproj/.tczip path and subType ($file, subType=$subType)"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIXC'
+                    file = $file
+                    subType = $subType
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'twincat_cpp_consume_xml' {
+            $projectPath = [string]$payload.projectPath
+            if ([string]::IsNullOrWhiteSpace($projectPath)) { throw 'projectPath is required' }
+            Assert-NotSafetyPath -Path $projectPath
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $xml = '<TreeItem><CppProjectDef><StartTmcCodeGenerator><Active>true</Active></StartTmcCodeGenerator></CppProjectDef></TreeItem>'
+            $null = Set-TreeItemXml -SysManager $sysManager -TargetPath $projectPath -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    projectPath = $projectPath
+                    tmcCodeGenerated = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_cpp_set_props' {
+            $projectPath = [string]$payload.projectPath
+            if ([string]::IsNullOrWhiteSpace($projectPath)) { throw 'projectPath is required' }
+            Assert-NotSafetyPath -Path $projectPath
+
+            $inner = ''
+            if ($payload.PSObject.Properties.Name -contains 'bootProjectEncryption' -and -not [string]::IsNullOrWhiteSpace([string]$payload.bootProjectEncryption)) {
+                $v = [string]$payload.bootProjectEncryption
+                if ($v -notin 'None', 'Target') { throw 'bootProjectEncryption must be None or Target' }
+                $inner += "<BootProjectEncryption>$v</BootProjectEncryption>"
+            }
+            if ($payload.PSObject.Properties.Name -contains 'saveProjectSources' -and $null -ne $payload.saveProjectSources) {
+                $b = ([bool]$payload.saveProjectSources).ToString().ToLower()
+                $inner += "<TargetArchiveSettings><SaveProjectSources>$b</SaveProjectSources></TargetArchiveSettings><FileArchiveSettings><SaveProjectSources>$b</SaveProjectSources></FileArchiveSettings>"
+            }
+            if ([string]::IsNullOrEmpty($inner)) {
+                throw 'set_props needs at least one of bootProjectEncryption / saveProjectSources'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $xml = "<TreeItem><CppProjectDef>$inner</CppProjectDef></TreeItem>"
+            $null = Set-TreeItemXml -SysManager $sysManager -TargetPath $projectPath -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    projectPath = $projectPath
+                    propsApplied = $true
+                }
+            }
+            exit 0
+        }
+
+        'twincat_cpp_build_project' {
+            $projectName = [string]$payload.projectName
+            if ([string]::IsNullOrWhiteSpace($projectName)) { throw 'projectName is required' }
+            $config = if ($payload.PSObject.Properties.Name -contains 'config' -and -not [string]::IsNullOrWhiteSpace([string]$payload.config)) { [string]$payload.config } else { 'Release|TwinCAT RT (x64)' }
+            $wait = if ($null -ne $payload.waitForFinish) { [bool]$payload.waitForFinish } else { $true }
+            $timeoutMs = if ($null -ne $payload.timeoutMs) { [int]$payload.timeoutMs } else { 1800000 }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $solution = Get-SolutionInfo -Dte $dte
+            if (-not $solution.isOpen) { throw 'No solution is open in XAE' }
+
+            # BuildProject wants the project UniqueName, not the display name; resolve
+            # it by scanning Solution.Projects.
+            $unique = $null
+            $projects = $dte.Solution.Projects
+            for ($i = 1; $i -le $projects.Count; $i++) {
+                $proj = $projects.Item($i)
+                if ($null -eq $proj) { continue }
+                $pName = Get-SafeValue { [string]$proj.Name }
+                $pUnique = Get-SafeValue { [string]$proj.UniqueName }
+                if ($pName -eq $projectName -or $pUnique -eq $projectName) {
+                    $unique = if (-not [string]::IsNullOrWhiteSpace([string]$pUnique)) { [string]$pUnique } else { [string]$pName }
+                    break
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($unique)) { throw "C++ project not found in solution: $projectName" }
+
+            $solutionBuild = $dte.Solution.SolutionBuild
+            $solutionBuild.BuildProject($config, $unique, $wait)
+
+            if ($wait) {
+                $build = Wait-ForBuildFinish -SolutionBuild $solutionBuild -TimeoutMs $timeoutMs
+            } else {
+                $build = @{
+                    buildState = [int]$solutionBuild.BuildState
+                    lastBuildInfo = Get-SafeValue { [int]$solutionBuild.LastBuildInfo }
+                }
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    projectName = $projectName
+                    uniqueName = $unique
+                    config = $config
+                    waited = $wait
+                    build = $build
+                }
+            }
+            exit 0
+        }
+
+        'twincat_cpp_publish' {
+            # Confirm token is enforced in index.js before bridgeCall (matching
+            # twincat_activate_configuration, which receives confirm but does not
+            # re-verify here).
+            $projectPath = [string]$payload.projectPath
+            if ([string]::IsNullOrWhiteSpace($projectPath)) { throw 'projectPath is required' }
+            Assert-NotSafetyPath -Path $projectPath
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $xml = '<TreeItem><CppProjectDef><PublishModules><Active>true</Active></PublishModules></CppProjectDef></TreeItem>'
+            $null = Set-TreeItemXml -SysManager $sysManager -TargetPath $projectPath -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    projectPath = $projectPath
+                    published = $true
+                    note = 'Modules built for all platforms and exported. Does not activate/restart the runtime.'
+                }
+            }
+            exit 0
+        }
+
+        'measurement_scope_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $solution = $dte.Solution
+            if ($null -eq $solution -or -not [bool]$solution.IsOpen) { throw 'No solution is open' }
+
+            $destination = if ($payload.destination) { [string]$payload.destination } else { [System.IO.Path]::GetDirectoryName([string]$solution.FullName) }
+
+            $template = if ($payload.template) { [string]$payload.template } else { Get-ScopeTemplatePath }
+            if ([string]::IsNullOrWhiteSpace($template)) {
+                throw 'Scope project template not found — TE130X Scope View tooling may not be installed. Pass template explicitly (a full .tcmproj path).'
+            }
+            if (-not (Test-Path -LiteralPath $template)) { throw "Scope template not found: $template" }
+
+            $proj = $solution.AddFromTemplate($template, $destination, $name)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    created = $true
+                    name = $name
+                    kind = 'scope'
+                    projectFullName = (Get-SafeValue { [string]$proj.FullName })
+                }
+            }
+            exit 0
+        }
+
+        'measurement_scope_add_child' {
+            $project = [string]$payload.project
+            if ([string]::IsNullOrWhiteSpace($project)) { throw 'project is required' }
+            $name = if ($payload.PSObject.Properties.Name -contains 'name' -and $null -ne $payload.name) { [string]$payload.name } else { '' }
+            $elementType = if ($null -ne $payload.elementType) { [int]$payload.elementType } else { 0 }
+            $parentPath = if ($payload.parentPath) { [string]$payload.parentPath } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            if (-not (Ensure-MeasurementScopeHelper)) {
+                throw 'TE130X Scope automation assembly not found (TwinCAT.Measurement.AutomationInterface.dll). Scope tooling is not installed.'
+            }
+            $obj = Get-ScopeProjectObject -Dte $dte -ProjectName $project
+            if (-not [Te1000MeasurementHelper]::Is($obj)) {
+                throw "Project '$project' is not a Measurement/Scope project (object is not IMeasurementScope)."
+            }
+            $parent = Resolve-ScopeElement -Root $obj -ElementPath $parentPath
+            $child = $null
+            $rc = [Te1000MeasurementHelper]::CreateChild($parent, [ref]$child, $name, $elementType)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    project = $project
+                    parentPath = $parentPath
+                    created = $true
+                    name = $name
+                    elementType = $elementType
+                    rc = $rc
+                }
+            }
+            exit 0
+        }
+
+        'measurement_scope_rename' {
+            $project = [string]$payload.project
+            $path = [string]$payload.path
+            $newName = [string]$payload.newName
+            if ([string]::IsNullOrWhiteSpace($project)) { throw 'project is required' }
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($newName)) { throw 'newName is required' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            if (-not (Ensure-MeasurementScopeHelper)) {
+                throw 'TE130X Scope automation assembly not found (TwinCAT.Measurement.AutomationInterface.dll). Scope tooling is not installed.'
+            }
+            $obj = Get-ScopeProjectObject -Dte $dte -ProjectName $project
+            if (-not [Te1000MeasurementHelper]::Is($obj)) {
+                throw "Project '$project' is not a Measurement/Scope project (object is not IMeasurementScope)."
+            }
+            $element = Resolve-ScopeElement -Root $obj -ElementPath $path
+            $rc = [Te1000MeasurementHelper]::ChangeName($element, $newName)
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ project = $project; path = $path; newName = $newName; rc = $rc }
+            }
+            exit 0
+        }
+
+        'measurement_scope_record' {
+            $project = [string]$payload.project
+            $state = [string]$payload.state
+            if ([string]::IsNullOrWhiteSpace($project)) { throw 'project is required' }
+            if ($state -ne 'start' -and $state -ne 'stop') { throw "state must be 'start' or 'stop'" }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            if (-not (Ensure-MeasurementScopeHelper)) {
+                throw 'TE130X Scope automation assembly not found (TwinCAT.Measurement.AutomationInterface.dll). Scope tooling is not installed.'
+            }
+            $obj = Get-ScopeProjectObject -Dte $dte -ProjectName $project
+            if (-not [Te1000MeasurementHelper]::Is($obj)) {
+                throw "Project '$project' is not a Measurement/Scope project (object is not IMeasurementScope)."
+            }
+            $rc = if ($state -eq 'start') { [Te1000MeasurementHelper]::StartRecord($obj) } else { [Te1000MeasurementHelper]::StopRecord($obj) }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ project = $project; state = $state; rc = $rc }
+            }
+            exit 0
+        }
+
+        'measurement_analytics_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $solution = $dte.Solution
+            if ($null -eq $solution -or -not [bool]$solution.IsOpen) { throw 'No solution is open' }
+
+            $destination = if ($payload.destination) { [string]$payload.destination } else { [System.IO.Path]::GetDirectoryName([string]$solution.FullName) }
+
+            $template = if ($payload.template) { [string]$payload.template } else { Get-AnalyticsTemplatePath }
+            if ([string]::IsNullOrWhiteSpace($template)) {
+                throw 'Analytics project template not found — pass template explicitly (TwinCAT Analytics tooling may not be installed).'
+            }
+            if (-not (Test-Path -LiteralPath $template)) { throw "Analytics template not found: $template" }
+
+            $proj = $solution.AddFromTemplate($template, $destination, $name)
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    created = $true
+                    name = $name
+                    kind = 'analytics'
+                    projectFullName = (Get-SafeValue { [string]$proj.FullName })
+                }
+            }
+            exit 0
+        }
+
+        'analytics_logger_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+            # subType 1 = DataLogger (infosys 12562942987).
+            $child = $tian.CreateChild($name, 1, $before, $null)
+            Assert-WellFormedChild -Parent $tian -Child $child -RequestedName $name -SubType 1 -ParentPath 'TIAN'
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ parentPath = 'TIAN'; child = Convert-TreeItem -TreeItem $child }
+            }
+            exit 0
+        }
+
+        'analytics_stream_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+            # subType 0 = StreamHelper (infosys 12563004555).
+            $child = $tian.CreateChild($name, 0, $before, $null)
+            Assert-WellFormedChild -Parent $tian -Child $child -RequestedName $name -SubType 0 -ParentPath 'TIAN'
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{ parentPath = 'TIAN'; child = Convert-TreeItem -TreeItem $child }
+            }
+            exit 0
+        }
+
+        'analytics_logger_delete' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $dryRun = [bool]$payload.dryRun
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+
+            if ($dryRun) {
+                $exists = $false
+                $count = Get-TreeItemChildCount -TreeItem $tian
+                for ($i = 1; $i -le $count; $i++) {
+                    $c = (Get-TreeItemChild -TreeItem $tian -Index $i).Value
+                    if ($null -eq $c) { continue }
+                    $cn = Get-SafeValue { [string]$c.Name }
+                    if ($cn -eq $name) { $exists = $true; break }
+                }
+                Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; exists = $exists; deleted = $false } }
+                exit 0
+            }
+
+            $tian.DeleteChild($name)
+            Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; deleted = $true } }
+            exit 0
+        }
+
+        'analytics_stream_delete' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) { throw 'name is required' }
+            $deleteName = $name + '_Obj1 (StreamHelper)'
+            $dryRun = [bool]$payload.dryRun
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tian = (Get-TreeItem -SysManager $sysManager -TreePath 'TIAN').Value
+
+            if ($dryRun) {
+                $exists = $false
+                $count = Get-TreeItemChildCount -TreeItem $tian
+                for ($i = 1; $i -le $count; $i++) {
+                    $c = (Get-TreeItemChild -TreeItem $tian -Index $i).Value
+                    if ($null -eq $c) { continue }
+                    $cn = Get-SafeValue { [string]$c.Name }
+                    if ($cn -eq $deleteName) { $exists = $true; break }
+                }
+                Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; deleteName = $deleteName; exists = $exists; deleted = $false } }
+                exit 0
+            }
+
+            $tian.DeleteChild($deleteName)
+            Write-JsonResult @{ ok = $true; data = @{ parentPath = 'TIAN'; name = $name; deleteName = $deleteName; deleted = $true } }
+            exit 0
+        }
+
+        'twincat_license_list_devices' {
+            # Read-only: discover available dongle license devices under TIRC^License
+            # via ProduceXml. No ConsumeXml. Requires TC3.1 >= 4022.4; on older
+            # targets the License node has no device support and the blob is empty.
+            $rawFlag = ($payload.PSObject.Properties.Name -contains 'raw') -and [bool]$payload.raw
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $license = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRC^License').Value
+            $xmlText = $license.ProduceXml()
+
+            $devices = @()
+            try {
+                [xml]$doc = $xmlText
+                foreach ($d in $doc.SelectNodes('//LicenseDevice')) {
+                    $devices += @{
+                        name = [string]$d.Name
+                        pathName = [string]$d.PathName
+                        typeName = [string]$d.TypeName
+                        objectId = [string]$d.ObjectID
+                    }
+                }
+            } catch {
+                $devices = @()
+            }
+
+            $data = @{ treePath = 'TIRC^License'; devices = $devices }
+            if ($rawFlag) { $data.xml = Strip-TreeImage $xmlText }
+
+            Write-JsonResult @{ ok = $true; data = $data }
+            exit 0
+        }
+
+        'twincat_license_add_device' {
+            # Offline config edit: CreateChild a license-device node under
+            # TIRC^License bound to a dongle that already exists in the I/O tree.
+            # vInfo = the device display-name OR ObjectID string from the list
+            # action. Not a runtime write -> not confirm-gated (mirrors create).
+            $name = [string]$payload.name
+            $device = [string]$payload.device
+            if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($device)) {
+                throw 'name and device are required'
+            }
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $license = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRC^License').Value
+            $child = $license.CreateChild($name, 0, '', $device)
+
+            # Validate the created child; a ghost (blank/mismatched name, wrong
+            # parent) throws with best-effort cleanup instead of a false success.
+            Assert-WellFormedChild -Parent $license -Child $child -RequestedName $name -SubType 0 -ParentPath 'TIRC^License'
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIRC^License'
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'twincat_license_activate_response' {
+            # License-activation state change (GUARDED in index.js before the
+            # bridge spawns). ConsumeXml the ActivateResponseFile command on the
+            # TIRC^License node. Set-TreeItemXml surfaces GetLastXmlError; the
+            # outer try/catch reports the HRESULT (e.g. NTE_BAD_SIGNATURE).
+            $path = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                throw 'path is required'
+            }
+            $oemGuid = if ($payload.PSObject.Properties.Name -contains 'oemGuid' -and -not [string]::IsNullOrWhiteSpace([string]$payload.oemGuid)) { [string]$payload.oemGuid } else { '0' }
+
+            # Defense-in-depth: re-check the confirm token even though index.js gates it.
+            if (([string]$payload.confirm) -ne 'ALLOW_LICENSE_ACTIVATE') {
+                throw 'Blocked. license activate_response requires confirm="ALLOW_LICENSE_ACTIVATE".'
+            }
+
+            $escPath = $path.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+            $escGuid = $oemGuid.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+            $xml = "<TreeItem><ItemName>License</ItemName><PathName>TIRC^License</PathName><ItemType>59</ItemType><LicenseDef><Commands><ActivateResponseFile><Path>$escPath</Path><OemGuid>$escGuid</OemGuid></ActivateResponseFile></Commands></LicenseDef></TreeItem>"
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRC^License' -Xml $xml
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = 'TIRC^License'
+                    path = $path
+                    activated = $true
+                }
+            }
+            exit 0
+        }
+
+        # --- tc_variant: project variant management (OFFLINE config only) ------
+        # ProjectVariantConfig / CurrentProjectVariant live on iTcSysManager14
+        # (TCatSysManagerLib >= 3.3.0.0); PvDisable / Disabled-for-variants on
+        # ITcSmTreeItem9. All accessed late-bound on the __ComObject (no CLR QI).
+        # Every verb edits the open solution's variant definition / active variant
+        # / per-item disable flag — NONE activate/download/touch the runtime, so no
+        # confirm token. The per-item disable verb refuses TISC (safety) paths.
+        'twincat_get_variant_config' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $xml = Get-SafeValue { [string]$sysManager.ProjectVariantConfig }
+            Write-JsonResult @{
+                ok = $true
+                data = @{ xml = $xml }
+            }
+            exit 0
+        }
+
+        'twincat_get_current_variant' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $cur = Get-SafeValue { [string]$sysManager.CurrentProjectVariant }
+            Write-JsonResult @{
+                ok = $true
+                data = @{ current = $cur }
+            }
+            exit 0
+        }
+
+        'twincat_set_variant_config' {
+            $xml = [string]$payload.xml
+            if ([string]::IsNullOrWhiteSpace($xml)) {
+                throw 'xml is required'
+            }
+            $save = ($payload.PSObject.Properties.Name -contains 'save') -and [bool]$payload.save
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            try {
+                $sysManager.ProjectVariantConfig = $xml
+            } catch {
+                throw "Setting ProjectVariantConfig failed: $($_.Exception.Message)"
+            }
+            if ($save) { Save-Solution -Dte $dte }
+            $readback = Get-SafeValue { [string]$sysManager.ProjectVariantConfig }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    defined = $true
+                    xml = $readback
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_current_variant' {
+            $variant = [string]$payload.variant
+            if ([string]::IsNullOrWhiteSpace($variant)) {
+                throw 'variant is required'
+            }
+            $save = ($payload.PSObject.Properties.Name -contains 'save') -and [bool]$payload.save
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $sysManager.CurrentProjectVariant = $variant
+            if ($save) { Save-Solution -Dte $dte }
+            $cur = [string]$sysManager.CurrentProjectVariant
+            if ($cur -ne $variant) {
+                throw "CurrentProjectVariant is '$cur' after setting '$variant' - variant/group may not exist in the variant config"
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    current = $cur
+                    saved = $save
+                }
+            }
+            exit 0
+        }
+
+        'twincat_set_item_variant_disable' {
+            $treePath = [string]$payload.treePath
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'treePath is required'
+            }
+            # Safety policy: never address the TISC safety project.
+            if ($treePath -match '^\s*TISC(\^|$)') {
+                throw "Refused: variant operations on the safety project (TISC) are disallowed by policy."
+            }
+            # Default true; index.js sends disable:false for the enable action.
+            $disable = -not (($payload.PSObject.Properties.Name -contains 'disable') -and ($payload.disable -eq $false))
+            $save = ($payload.PSObject.Properties.Name -contains 'save') -and [bool]$payload.save
+
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $item.PvDisable = $disable
+            $item.Disabled = if ($disable) { 1 } else { 0 }
+            if ($save) { Save-Solution -Dte $dte }
+            $state = [int](Get-SafeValue { [int]$item.Disabled })
+            $pv = [bool](Get-SafeValue { [bool]$item.PvDisable })
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    path = $treePath
+                    pvDisable = $pv
+                    disabled = $state
+                    saved = $save
                 }
             }
             exit 0

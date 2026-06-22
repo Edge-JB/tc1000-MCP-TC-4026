@@ -5,6 +5,71 @@ on real TwinCAT projects. Newest first.
 
 ---
 
+## 2026-06-22 — AI-surface buildout: 13 new tools close almost all of `features.md §17` — branch `feature/ai-surface-buildout`
+
+Added **13 noun-grouped MCP tools** (one commit each) that wrap the automatable
+gaps catalogued in `features.md §17`, taking the registered surface from 12 to
+**25 tools**. The PowerShell bridge gained matching dispatch verbs (143 distinct
+action verbs are referenced from `index.js`, every one resolves to a bridge
+case); no pre-existing tool (`xae` / `xae_build` / `xae_command` / `tc_tree` /
+`tc_link` / `tc_system` / `createIO` / `plc_download` / `plc_session` / `nc` /
+`twincat_activate_configuration` / `twincat_restart_runtime`) was removed or
+altered (diff vs branch point: 5221 insertions, 9 deletions, none touching a
+pre-existing tool registration).
+
+**New tools:** `plc_project`, `plc_pou`, `plc_library`, `tc_task`, `tc_mapping`,
+`tc_route`, `tc_settings`, `tc_fieldbus`, `tc_module`, `tc_cpp`,
+`tc_measurement`, `tc_license`, `tc_variant`.
+
+**§17 gaps now covered** (was "automatable but not yet wrapped"):
+
+- PLC project authoring (§7.1) + POUs/DUTs/GVLs + decl/impl edit + PLCopen
+  import/export + `CheckAllObjects` + boot-flags/online → `plc_project`,
+  `plc_pou`.
+- Library refs / placeholders / resolution / freeze / scan / repository admin
+  (`ITcPlcLibraryManager`) (§7.2) → `plc_library`.
+- Mapping bulk ops `Produce/Consume/ClearMappingInfo` (§5) → `tc_mapping`.
+- RT tasks (with/without image, cycle/priority), CPU-core bind, LinkedTask (§5)
+  → `tc_task`.
+- Silent-mode toggle, target platform x86/x64, solution/PLC archives (§4, §7.1)
+  → `tc_settings`.
+- ADS routes — add route / broadcast search via `TIRR` (§6) → `tc_route`.
+- Non-EtherCAT fieldbuses — PROFINET/PROFIBUS/CANopen/DeviceNet/EAP create +
+  claim resources + GSD box + netvar + DBC import (§8) → `tc_fieldbus`.
+- TcCOM — add module by GUID/name, get/set XML, enable symbols, set context,
+  link/unlink (§9) → `tc_module`.
+- TwinCAT C++ — create project/module, open, TMC codegen, set props, build,
+  publish (§10) → `tc_cpp`.
+- Measurement/Scope + Analytics Logger/Stream (TIAN) (§11) → `tc_measurement`.
+- Licensing — dongle config + OEM response-file activation (§13) → `tc_license`.
+- Variant management via `iTcSysManager14` (§14) → `tc_variant`.
+
+**Safety (§15) was intentionally excluded by project policy.** Nothing in the
+toolchain may write toward the safety system; every authoring/write verb refuses
+any `TISC`-rooted path (`Assert-NotSafetyPath`), and `tc_variant` additionally
+refuses variant ops on the safety project. This is the one §17 item left
+uncovered, by design — not a gap.
+
+**Guarding.** Every cell-impacting / runtime / remote-write / license action is
+`confirm`-token gated in `index.js` (and re-checked in the bridge):
+`ALLOW_PLC_DOWNLOAD` (boot/online), `ALLOW_PLC_LIBRARY_REPO`,
+`ALLOW_TWINCAT_ROUTE_WRITE`, `ALLOW_TWINCAT_MODULE_CONTEXT`, `ALLOW_CPP_PUBLISH`,
+`ALLOW_MEASUREMENT_RECORD`, `ALLOW_TWINCAT_DELETE`, `ALLOW_LICENSE_ACTIVATE`
+(joining the pre-existing `ALLOW_TWINCAT_ACTIVATE` / `_RESTART` /
+`ALLOW_XAE_COMMAND_EXEC` / `ALLOW_PLC_LOGOUT`).
+
+**Integration fix (safety net).** During final verification, the PowerShell
+`Parser::ParseFile` check on `te1000-bridge.ps1` failed where Windows
+PowerShell 5.1 reads the BOM-less file as ANSI: two em-dashes (`—`, U+2014)
+sat **inside double-quoted strings** (`twincat_cpp_open` ghost-error and
+`twincat_set_current_variant` mismatch-error) and corrupted those string
+literals under the ANSI read. Replaced both with ASCII hyphens; `node --check
+index.js` and `ParseFile` both pass clean. (Em-dashes in *comments* parse fine
+and were left alone.) `features.md` (the design source for this work) is now
+tracked in git.
+
+---
+
 ## 2026-06-22 — `createIO`: two polish items found during the full-rack (R03.CNC) test — TODO
 
 Both surfaced while building an entire CNC rack (EK1100 coupler + EL1904/EL2904/EL1008/EL2008/EL9011)

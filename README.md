@@ -26,13 +26,23 @@ This server uses the locally verified TwinCAT XAE Shell COM ProgID and calls it 
 - activate configuration
 - start or restart the TwinCAT runtime
 
-## v2 Tool Surface (2026-06-11)
+## v2 Tool Surface (2026-06-11, AI-surface buildout 2026-06-22)
 
 The MCP surface was consolidated for agent-context efficiency: 36 tools -> 10,
 grouped by noun with `action` enums, compact outputs (raw XML, pruned compact
 JSON). The PowerShell bridge is unchanged and still answers the original
 fine-grained action names; `index.js` maps onto them (the original v1 tool
-surface is preserved in this repo's git history). Old tool names appearing later in this README map as:
+surface is preserved in this repo's git history).
+
+The **2026-06-22 AI-surface buildout** then added **13 noun-grouped tools**
+(see "AI-surface tools" below) that close nearly every automatable gap in
+`features.md §17` — PLC project/POU authoring, libraries, tasks, mapping bulk
+ops, ADS routes, engineering settings & archives, non-EtherCAT fieldbuses,
+TcCOM modules, TwinCAT C++, Measurement/Scope/Analytics, licensing, and variant
+management. Safety (§15) is **deliberately left out** by project policy — the
+toolchain never writes toward the safety system. Total registered tools: **25**.
+
+Old tool names appearing later in this README map as:
 `twincat_*_tree_item*`/`twincat_*_child` -> `tc_tree`, `twincat_link/unlink/
 resolve_variable*` -> `tc_link`, netid/errors/rescan/scan tools -> `tc_system`,
 `nc_*` -> `nc`, `xae_solution_build` -> `xae_build`, `xae_execute_command` ->
@@ -190,6 +200,100 @@ High-impact tools are guarded:
 - `twincat_restart_runtime` requires `confirm="ALLOW_TWINCAT_RESTART"`
 - `xae_command` requires `confirm="ALLOW_XAE_COMMAND_EXEC"`
 - `plc_download` requires `confirm="ALLOW_PLC_DOWNLOAD"` (it deploys a boot project to the live target)
+- `plc_session action:logout` requires `confirm="ALLOW_PLC_LOGOUT"`
+
+## AI-surface tools (2026-06-22)
+
+Thirteen noun-grouped tools added to cover `features.md §17`. All authoring/write
+verbs reject the safety project (any `TISC`-rooted path is refused by
+`Assert-NotSafetyPath`), and every cell-impacting / runtime / remote-write /
+license action is `confirm`-token gated (see "Guards" at the end of this list).
+
+- **`plc_project`** — PLC project lifecycle (§7.1). Actions: `create_from_template`,
+  `open`, `info`, `check`, `set_boot_flags`, `generate_boot_project`, `online`,
+  `link_task`, `plcopen_export`, `plcopen_import`, `save_as_library`.
+  `generate_boot_project` and `online` (Login/Start/Stop/Reset) require
+  `confirm="ALLOW_PLC_DOWNLOAD"` (they touch the live runtime/boot dir).
+- **`plc_pou`** — PLC object authoring + code edit (§7.3). Actions: `create`,
+  `create_batch`, `import_template`, `get_decl`, `get_impl`, `get_document`,
+  `set_decl`, `set_decl_batch`, `set_impl`, `set_impl_batch`, `set_document`,
+  `check_objects`. Refuses TISC paths.
+- **`plc_library`** — library refs / placeholders / repos via `ITcPlcLibraryManager`
+  (§7.2). Actions: `list`, `scan`, `repos`, `add_library`, `add_placeholder`,
+  `set_resolution`, `freeze`, `remove_reference`, `install_library`,
+  `uninstall_library`, `insert_repository`, `remove_repository`,
+  `move_repository`. Repository administration (the machine-wide store) requires
+  `confirm="ALLOW_PLC_LIBRARY_REPO"`. Note: `.plcproj` reference edits need a
+  solution close + reopen in XAE to take effect.
+- **`tc_task`** — RT task / RT-core / linked-task config (§5). Actions: `list`,
+  `get`, `create`, `set_params`, `add_image_var`, `get_rt_settings`,
+  `set_rt_settings`, `bind_cpu`, `get_linked_task`, `set_linked_task`.
+- **`tc_mapping`** — bulk variable-mapping (§5) via `ProduceMappingInfo` /
+  `ConsumeMappingInfo` / `ClearMappingInfo`. Actions: `produce`, `consume`,
+  `clear`.
+- **`tc_route`** — ADS routes via `TIRR` (§6). Actions: `list`, `broadcast_search`,
+  `search_host`, `add_route`, `add_project_route`. Route writes require
+  `confirm="ALLOW_TWINCAT_ROUTE_WRITE"`.
+- **`tc_settings`** — XAE engineering settings & packaging (§4, §7.1). Actions:
+  `get_silent_mode`, `set_silent_mode`, `get_target_platform`,
+  `set_target_platform`, `save_solution_archive`, `save_plc_archive`,
+  `get_independent_file`, `set_independent_file`, `get_disabled`, `set_disabled`.
+- **`tc_fieldbus`** — NON-EtherCAT fieldbus config (§8): PROFINET / PROFIBUS /
+  CANopen / DeviceNet / EAP. Actions: `create_device`, `create_batch`,
+  `list_resources`, `claim_resources`, `create_gsd_box`, `add_netvar`,
+  `set_station_address`, `import_dbc`, `get_xml`, `set_xml`. Refuses TISC paths.
+- **`tc_module`** — TcCOM module objects (§9). Actions: `list`, `create`,
+  `get_xml`, `set_xml`, `enable_symbols`, `set_context`, `link`, `unlink`.
+  `set_context` (changes the activated task/runtime context) requires
+  `confirm="ALLOW_TWINCAT_MODULE_CONTEXT"`. Refuses TISC paths.
+- **`tc_cpp`** — TwinCAT C++ projects/modules (§10). Actions: `create_project`,
+  `create_module`, `open`, `tmc_codegen`, `set_props`, `build`, `publish`.
+  `publish` (builds all platforms + exports deployable driver artifacts)
+  requires `confirm="ALLOW_CPP_PUBLISH"`. Refuses TISC paths.
+- **`tc_measurement`** — Scope + Analytics (TIAN) (§11). Actions: `scope_create`,
+  `scope_add_child`, `scope_rename`, `scope_record`, `analytics_create`,
+  `logger_create`, `logger_delete`, `stream_create`, `stream_delete`. For raw
+  `ProduceXml`/`ConsumeXml` on a TIAN logger/stream node, use `tc_tree get_xml`/
+  `set_xml` (the former `node_get_xml`/`node_set_xml` aliases were removed as
+  redundant). `scope_record state:"start"` (live acquisition
+  against the running target) requires `confirm="ALLOW_MEASUREMENT_RECORD"`;
+  `logger_delete` / `stream_delete` require `dryRun:true` or
+  `confirm="ALLOW_TWINCAT_DELETE"`.
+- **`tc_license`** — TwinCAT licensing on `TIRC^License` (§13). Actions: `list`,
+  `add`, `activate_response`. `activate_response` (activates an OEM response
+  file — a license state change) requires `confirm="ALLOW_LICENSE_ACTIVATE"`.
+- **`tc_variant`** — project variant management via `iTcSysManager14` /
+  `ITcSmTreeItem9` (§14). Actions: `get_config`, `get_current`, `set_config`,
+  `select`, `disable`, `enable`. Variant ops on the safety project (TISC) are
+  refused.
+
+**Guards (confirm tokens) introduced/used by the AI-surface tools:**
+`ALLOW_PLC_DOWNLOAD` (boot/online), `ALLOW_PLC_LIBRARY_REPO`,
+`ALLOW_TWINCAT_ROUTE_WRITE`, `ALLOW_TWINCAT_MODULE_CONTEXT`, `ALLOW_CPP_PUBLISH`,
+`ALLOW_MEASUREMENT_RECORD`, `ALLOW_TWINCAT_DELETE` (node deletes),
+`ALLOW_LICENSE_ACTIVATE`. Tokens are enforced in `index.js` and re-checked
+defensively in the bridge.
+
+## §17 coverage note (refreshed 2026-06-22)
+
+Against `features.md §17`, the MCP now covers **every gap that was "automatable
+but not yet wrapped"**:
+
+| §17 gap | Now covered by |
+|---|---|
+| PLC project authoring (§7.1, §7.3) | `plc_project` + `plc_pou` |
+| Library management (§7.2) | `plc_library` |
+| Mapping bulk ops (§5) | `tc_mapping` |
+| Tasks / RT cores / LinkedTask (§5) | `tc_task` |
+| Silent mode / target platform / archives (§4, §7.1) | `tc_settings` |
+| ADS routes (§6) | `tc_route` |
+| Other fieldbuses (§8) | `tc_fieldbus` |
+| TcCOM (§9) | `tc_module` |
+| TwinCAT C++ (§10) | `tc_cpp` |
+| Measurement / Analytics (§11) | `tc_measurement` |
+| Licensing (§13) | `tc_license` |
+| Variant management (§14) | `tc_variant` |
+| **Safety (§15)** | **Intentionally NOT covered — project policy: nothing writes toward safety.** Safety remains import-only/read-only outside this toolchain. |
 
 ## Requirements
 
