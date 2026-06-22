@@ -849,6 +849,93 @@ public static class Te1000PlcProjectHelper {
     return $null -ne ('Te1000PlcProjectHelper' -as [type])
 }
 
+function Ensure-TcPlcTaskRefHelper {
+    # ITcPlcTaskReference is a vtable (IUnknown) interface; PowerShell cannot QI a
+    # __ComObject to it ([Interface]$obj is not a CLR QI in PS), so the LinkedTask
+    # get/set is done in a compiled C# helper, exactly as Te1000PlcProjectHelper does
+    # for ITcPlcProject. The interface lives on the PLC project root/instance node
+    # (TIPC^<name>); QI/marshaling also requires the interface registered in the
+    # 64-bit registry view. Returns $false if TCatSysManagerLib.dll is unavailable.
+    if ('Te1000PlcTaskRefHelper' -as [type]) {
+        return $true
+    }
+    $libPath = Get-TcSysManagerLibPath
+    if (-not $libPath) {
+        return $false
+    }
+    $null = [System.Reflection.Assembly]::LoadFrom($libPath)
+    Add-Type -ReferencedAssemblies $libPath -TypeDefinition @'
+using System;
+using TCatSysManagerLib;
+public static class Te1000PlcTaskRefHelper {
+    public static string GetLinkedTask(object n) {
+        return ((ITcPlcTaskReference)n).LinkedTask;
+    }
+    public static void SetLinkedTask(object n, string t) {
+        ((ITcPlcTaskReference)n).LinkedTask = t;
+    }
+}
+'@
+    return $null -ne ('Te1000PlcTaskRefHelper' -as [type])
+}
+
+# Resolve the PLC project root node path under TIPC. Defaults to the first child
+# of TIPC (TIPC^<name>). Shared by tc_task get/set_linked_task.
+function Resolve-PlcRootPath {
+    param(
+        [Parameter(Mandatory = $true)] $SysManager,
+        [AllowNull()][string]$Path
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        return $Path
+    }
+    $tipc = $SysManager.LookupTreeItem('TIPC')
+    if ([int]$tipc.ChildCount -lt 1) {
+        throw 'No PLC project found under TIPC'
+    }
+    return "TIPC^$([string]$tipc.Child(1).Name)"
+}
+
+# Map a CpuAffinity name (or pass through a raw #x.. hex token) to a TwinCAT
+# affinity token #x{16 hex}. Used by tc_task_bind_cpu.
+function Convert-CpuAffinity {
+    param([Parameter(Mandatory = $true)][string]$Affinity)
+    $a = $Affinity.Trim()
+    if ($a -match '^#x') {
+        return $a
+    }
+    $cpu1 = [uint64]0x1; $cpu2 = [uint64]0x2; $cpu3 = [uint64]0x4; $cpu4 = [uint64]0x8
+    $cpu5 = [uint64]0x10; $cpu6 = [uint64]0x20; $cpu7 = [uint64]0x40; $cpu8 = [uint64]0x80
+    $mask = $null
+    switch ($a.ToUpperInvariant()) {
+        'NONE'      { $mask = [uint64]0 }
+        'CPU1'      { $mask = $cpu1 }
+        'CPU2'      { $mask = $cpu2 }
+        'CPU3'      { $mask = $cpu3 }
+        'CPU4'      { $mask = $cpu4 }
+        'CPU5'      { $mask = $cpu5 }
+        'CPU6'      { $mask = $cpu6 }
+        'CPU7'      { $mask = $cpu7 }
+        'CPU8'      { $mask = $cpu8 }
+        'MASKSINGLE' { $mask = $cpu1 }
+        'MASKDUAL'  { $mask = $cpu1 -bor $cpu2 }
+        'MASKQUAD'  { $mask = $cpu1 -bor $cpu2 -bor $cpu3 -bor $cpu4 }
+        'MASKHEXA'  { $mask = $cpu1 -bor $cpu2 -bor $cpu3 -bor $cpu4 -bor $cpu5 -bor $cpu6 }
+        'MASKOCT'   { $mask = $cpu1 -bor $cpu2 -bor $cpu3 -bor $cpu4 -bor $cpu5 -bor $cpu6 -bor $cpu7 -bor $cpu8 }
+        'MASKALL'   { $mask = [uint64]::MaxValue }
+        default {
+            throw "Unrecognized affinity '$Affinity'. Use a name (CPU1..CPU8, MaskSingle/Dual/Quad/Hexa/Oct/All, None) or a raw #x.. hex token."
+        }
+    }
+    return ('#x{0:x16}' -f $mask)
+}
+
+# XML-escape a scalar value for safe inclusion in a ConsumeXml envelope.
+function ConvertTo-XmlText([AllowNull()]$Value) {
+    if ($null -eq $Value) { return '' }
+    return ([string]$Value).Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+}
+
 function Ensure-TcPlcPouHelper {
     # ITcPlcPou / ITcPlcDeclaration / ITcPlcImplementation / ITcPlcIECProject2 are
     # vtable (IUnknown) interfaces; PowerShell cannot QI a __ComObject to them
@@ -5021,6 +5108,411 @@ try {
                     action = 'move_repository'
                     name = $name
                     index = $index
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_list' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tirt = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRT').Value
+            $count = Get-TreeItemChildCount -TreeItem $tirt
+            $tasks = @()
+            for ($i = 1; $i -le $count; $i++) {
+                $child = (Get-TreeItemChild -TreeItem $tirt -Index $i).Value
+                if ($null -eq $child) { continue }
+                $tasks += Convert-TreeItem -TreeItem $child
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    count = $count
+                    tasks = $tasks
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_get' {
+            $treePath = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'path is required'
+            }
+            $summary = $false
+            if ($payload.PSObject.Properties.Name -contains 'summary') {
+                $summary = [bool]$payload.summary
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $xml = Strip-TreeImage $item.ProduceXml($false)
+
+            if (-not $summary) {
+                Write-JsonResult @{
+                    ok = $true
+                    data = @{
+                        treePath = $treePath
+                        xml = $xml
+                    }
+                }
+                exit 0
+            }
+
+            # Compact summary: identity + parsed TaskDef child tags. The exact
+            # TaskDef tag names for cycle/priority/affinity are not in the cited AI
+            # docs, so emit the full <TaskDef> as a name->text map (best-effort) plus
+            # a couple of well-known reads; the caller uses this to confirm tag names.
+            $identity = Convert-TreeItem -TreeItem $item
+            $taskDef = @{}
+            if (-not [string]::IsNullOrEmpty($xml)) {
+                try {
+                    [xml]$doc = $xml
+                    $node = $doc.SelectSingleNode('//TaskDef')
+                    if ($null -ne $node) {
+                        foreach ($childNode in $node.ChildNodes) {
+                            if ($childNode.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                            if ($childNode.HasChildNodes -and $childNode.ChildNodes.Count -gt 1) { continue }
+                            $taskDef[[string]$childNode.Name] = [string]$childNode.InnerText
+                        }
+                    }
+                } catch {
+                    $taskDef = @{}
+                }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    identity = $identity
+                    taskDef = $taskDef
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_create' {
+            $name = [string]$payload.name
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                throw 'name is required'
+            }
+            $subType = 0
+            if ($payload.PSObject.Properties.Name -contains 'withImage' -and $payload.withImage -eq $false) {
+                $subType = 1
+            }
+            $before = if ($payload.before) { [string]$payload.before } else { '' }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tirt = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRT').Value
+            $child = $tirt.CreateChild($name, $subType, $before, $null)
+            Assert-WellFormedChild -Parent $tirt -Child $child -RequestedName $name -SubType $subType -ParentPath 'TIRT'
+
+            $paramsApplied = $false
+            $hasCycle = ($payload.PSObject.Properties.Name -contains 'cycleTimeUs') -and ($null -ne $payload.cycleTimeUs)
+            $hasPriority = ($payload.PSObject.Properties.Name -contains 'priority') -and ($null -ne $payload.priority)
+            if ($hasCycle -or $hasPriority) {
+                $frag = ''
+                if ($hasCycle) {
+                    $ticks = [int64]([double]$payload.cycleTimeUs * 10)
+                    $frag += "<CycleTime>$ticks</CycleTime>"
+                }
+                if ($hasPriority) {
+                    $frag += "<Priority>$([int]$payload.priority)</Priority>"
+                }
+                $x = "<TreeItem><TaskDef>$frag</TaskDef></TreeItem>"
+                try {
+                    $child.ConsumeXml($x)
+                } catch {
+                    $xmlError = $null
+                    try { $xmlError = $child.GetLastXmlError() } catch {}
+                    if ($xmlError) { throw "ConsumeXml failed applying task params: $xmlError" }
+                    throw
+                }
+                $paramsApplied = $true
+            }
+
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = 'TIRT'
+                    child = Convert-TreeItem -TreeItem $child
+                    paramsApplied = $paramsApplied
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_set_params' {
+            $treePath = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($treePath)) {
+                throw 'path is required'
+            }
+            $hasXml = ($payload.PSObject.Properties.Name -contains 'xml') -and (-not [string]::IsNullOrWhiteSpace([string]$payload.xml))
+            if ($hasXml) {
+                $x = [string]$payload.xml
+            } else {
+                $frag = ''
+                if (($payload.PSObject.Properties.Name -contains 'cycleTimeUs') -and ($null -ne $payload.cycleTimeUs)) {
+                    $ticks = [int64]([double]$payload.cycleTimeUs * 10)
+                    $frag += "<CycleTime>$ticks</CycleTime>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'priority') -and ($null -ne $payload.priority)) {
+                    $frag += "<Priority>$([int]$payload.priority)</Priority>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'autoStart') -and ($null -ne $payload.autoStart)) {
+                    $frag += "<AutoStart>$(([bool]$payload.autoStart).ToString().ToLowerInvariant())</AutoStart>"
+                }
+                if ([string]::IsNullOrEmpty($frag)) {
+                    throw 'set_params requires xml, or at least one of cycleTimeUs / priority / autoStart'
+                }
+                $x = "<TreeItem><TaskDef>$frag</TaskDef></TreeItem>"
+            }
+            $returnXml = $false
+            if ($payload.PSObject.Properties.Name -contains 'returnXml') {
+                $returnXml = [bool]$payload.returnXml
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $treePath -Xml $x
+            $data = @{ treePath = $treePath }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml($false)
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'tc_task_add_image_var' {
+            $treePath = [string]$payload.path
+            $varName = [string]$payload.varName
+            $dataType = [string]$payload.dataType
+            if ([string]::IsNullOrWhiteSpace($treePath)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace($varName)) { throw 'varName is required' }
+            if ([string]::IsNullOrWhiteSpace($dataType)) { throw 'dataType is required' }
+            $start = -1
+            if (($payload.PSObject.Properties.Name -contains 'startAddress') -and ($null -ne $payload.startAddress)) {
+                $start = [int]$payload.startAddress
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            $child = $node.CreateChild($varName, $start, '', $dataType)
+            Assert-WellFormedChild -Parent $node -Child $child -RequestedName $varName -SubType $start -ParentPath $treePath
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    parentPath = $treePath
+                    child = Convert-TreeItem -TreeItem $child
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_get_rt_settings' {
+            $summary = $false
+            if ($payload.PSObject.Properties.Name -contains 'summary') {
+                $summary = [bool]$payload.summary
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $tirs = (Get-TreeItem -SysManager $sysManager -TreePath 'TIRS').Value
+            $xml = Strip-TreeImage $tirs.ProduceXml($false)
+            if (-not $summary) {
+                Write-JsonResult @{
+                    ok = $true
+                    data = @{
+                        treePath = 'TIRS'
+                        xml = $xml
+                    }
+                }
+                exit 0
+            }
+            $maxCPUs = $null
+            $affinity = $null
+            $cpus = @()
+            if (-not [string]::IsNullOrEmpty($xml)) {
+                try {
+                    [xml]$doc = $xml
+                    $def = $doc.SelectSingleNode('//RTimeSetDef')
+                    if ($null -ne $def) {
+                        $mc = $def.SelectSingleNode('MaxCPUs')
+                        if ($null -ne $mc) { $maxCPUs = [string]$mc.InnerText }
+                        $af = $def.SelectSingleNode('Affinity')
+                        if ($null -ne $af) { $affinity = [string]$af.InnerText }
+                        foreach ($cpuNode in $def.SelectNodes('.//CPU')) {
+                            $entry = @{}
+                            $idAttr = $cpuNode.Attributes['id']
+                            if ($null -ne $idAttr) { $entry['id'] = [string]$idAttr.Value }
+                            foreach ($cn in $cpuNode.ChildNodes) {
+                                if ($cn.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                                $entry[[string]$cn.Name] = [string]$cn.InnerText
+                            }
+                            $cpus += $entry
+                        }
+                    }
+                } catch {
+                    $maxCPUs = $null; $affinity = $null; $cpus = @()
+                }
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = 'TIRS'
+                    maxCPUs = $maxCPUs
+                    affinity = $affinity
+                    cpus = $cpus
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_set_rt_settings' {
+            # CONFIG-ONLY: edits the project RT settings, not the running target.
+            $hasXml = ($payload.PSObject.Properties.Name -contains 'xml') -and (-not [string]::IsNullOrWhiteSpace([string]$payload.xml))
+            if ($hasXml) {
+                $x = [string]$payload.xml
+            } else {
+                $frag = ''
+                if (($payload.PSObject.Properties.Name -contains 'maxCPUs') -and ($null -ne $payload.maxCPUs)) {
+                    $frag += "<MaxCPUs>$([int]$payload.maxCPUs)</MaxCPUs>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'affinity') -and (-not [string]::IsNullOrWhiteSpace([string]$payload.affinity))) {
+                    $frag += "<Affinity>$(ConvertTo-XmlText ([string]$payload.affinity))</Affinity>"
+                }
+                if (($payload.PSObject.Properties.Name -contains 'cpus') -and ($null -ne $payload.cpus)) {
+                    $cpuFrag = ''
+                    foreach ($cpu in @($payload.cpus)) {
+                        if ($null -eq $cpu) { continue }
+                        $idVal = if ($null -ne $cpu.id) { [int]$cpu.id } else { throw 'each cpus entry requires id' }
+                        $inner = ''
+                        if ($null -ne $cpu.loadLimit) { $inner += "<LoadLimit>$([int]$cpu.loadLimit)</LoadLimit>" }
+                        if ($null -ne $cpu.baseTimeNs) { $inner += "<BaseTime>$([int64]$cpu.baseTimeNs)</BaseTime>" }
+                        if ($null -ne $cpu.latencyWarningUs) { $inner += "<LatencyWarning>$([int]$cpu.latencyWarningUs)</LatencyWarning>" }
+                        $cpuFrag += "<CPU id=`"$idVal`">$inner</CPU>"
+                    }
+                    if (-not [string]::IsNullOrEmpty($cpuFrag)) {
+                        $frag += "<CPUs>$cpuFrag</CPUs>"
+                    }
+                }
+                if ([string]::IsNullOrEmpty($frag)) {
+                    throw 'set_rt_settings requires xml, or at least one of maxCPUs / affinity / cpus'
+                }
+                $x = "<TreeItem><RTimeSetDef>$frag</RTimeSetDef></TreeItem>"
+            }
+            $returnXml = $false
+            if ($payload.PSObject.Properties.Name -contains 'returnXml') {
+                $returnXml = [bool]$payload.returnXml
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath 'TIRS' -Xml $x
+            $data = @{ treePath = 'TIRS' }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml($false)
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'tc_task_bind_cpu' {
+            $treePath = [string]$payload.path
+            if ([string]::IsNullOrWhiteSpace($treePath)) { throw 'path is required' }
+            if ([string]::IsNullOrWhiteSpace([string]$payload.affinity)) { throw 'affinity is required' }
+            $token = Convert-CpuAffinity -Affinity ([string]$payload.affinity)
+            $x = "<TreeItem><TaskDef><CpuAffinity>$token</CpuAffinity></TaskDef></TreeItem>"
+            $returnXml = $false
+            if ($payload.PSObject.Properties.Name -contains 'returnXml') {
+                $returnXml = [bool]$payload.returnXml
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $item = Set-TreeItemXml -SysManager $sysManager -TargetPath $treePath -Xml $x
+            $data = @{
+                treePath = $treePath
+                affinity = $token
+            }
+            if ($returnXml) {
+                $data.xml = Strip-TreeImage $item.ProduceXml($false)
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = $data
+            }
+            exit 0
+        }
+
+        'tc_task_get_linked_task' {
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = Resolve-PlcRootPath -SysManager $sysManager -Path ([string]$payload.path)
+            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcTaskRefHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for tc_task get_linked_task on this shell'
+            }
+            $lt = $null
+            try {
+                $lt = [Te1000PlcTaskRefHelper]::GetLinkedTask($node)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcTaskReference: $($_.Exception.Message)"
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    linkedTask = $lt
+                }
+            }
+            exit 0
+        }
+
+        'tc_task_set_linked_task' {
+            $linkedTask = [string]$payload.linkedTask
+            if ([string]::IsNullOrWhiteSpace($linkedTask)) {
+                throw 'linkedTask is required'
+            }
+            $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
+            $sysManager = (Get-SysManager -Dte $dte).Value
+            $treePath = Resolve-PlcRootPath -SysManager $sysManager -Path ([string]$payload.path)
+            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
+            if (-not (Ensure-TcPlcTaskRefHelper)) {
+                throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for tc_task set_linked_task on this shell'
+            }
+            try {
+                [Te1000PlcTaskRefHelper]::SetLinkedTask($node, $linkedTask)
+            } catch {
+                throw "node '$treePath' does not implement ITcPlcTaskReference: $($_.Exception.Message)"
+            }
+            if ($payload.save -eq $true) {
+                Save-Solution -Dte $dte
+            }
+            Write-JsonResult @{
+                ok = $true
+                data = @{
+                    treePath = $treePath
+                    linkedTask = $linkedTask
+                    set = $true
                 }
             }
             exit 0

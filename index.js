@@ -557,6 +557,90 @@ server.registerTool(
 );
 
 server.registerTool(
+  "tc_task",
+  {
+    description:
+      "RT tasks under TIRT (+ RT-core settings under TIRS, + a PLC project's LinkedTask under TIPC). CONFIG-ONLY: every action edits project config; nothing here touches the live runtime or the safety system, so no confirm token is needed (the guarded step is a later twincat_activate_configuration / twincat_restart_runtime). " +
+      "Tree paths use ^ separators (e.g. TIRT^PlcTask). Actions: " +
+      "list (tasks under TIRT); get (path; summary:true -> identity + parsed TaskDef tags instead of full XML); " +
+      "create (name; withImage default true = SubType 0 / false = SubType 1 no image; before?; cycleTimeUs?/priority? applied after create via ConsumeXml; save?); " +
+      "set_params (path; cycleTimeUs [us, converted to 100ns ticks = us*10] / priority [0-255] / autoStart; OR xml = raw <TreeItem>..</TreeItem> escape hatch [mutually exclusive with the typed fields]; returnXml?; save?). CAVEAT: the TaskDef tag names for cycle/priority/autostart are UNCONFIRMED against the AI docs — prefer the xml escape hatch and verify with get(summary) before trusting the typed fields; " +
+      "add_image_var (path = a with-image task's Inputs/Outputs node; varName; dataType e.g. BOOL/INT/DINT; startAddress? default -1 = append; save?); " +
+      "get_rt_settings (TIRS; summary:true -> parsed MaxCPUs/Affinity/per-CPU LoadLimit/BaseTime/LatencyWarning); " +
+      "set_rt_settings (maxCPUs / affinity [TwinCAT hex token e.g. #x0000000000000007] / cpus [{id,loadLimit?,baseTimeNs?,latencyWarningUs?}]; OR xml escape hatch; returnXml?; save?); " +
+      "bind_cpu (path; affinity = a name [CPU1..CPU8, MaskSingle/Dual/Quad/Hexa/Oct/All, None] OR a raw #x.. token; returnXml?; save?); " +
+      "get_linked_task (path? = PLC root under TIPC, default first child of TIPC); " +
+      "set_linked_task (path? = PLC root; linkedTask = XAE tree path of the RT task, e.g. TIRT^PlcTask; save?).",
+    inputSchema: {
+      action: z.enum([
+        "list", "get", "create", "set_params", "add_image_var",
+        "get_rt_settings", "set_rt_settings", "bind_cpu",
+        "get_linked_task", "set_linked_task",
+      ]),
+      path: z.string().optional(),
+      name: z.string().optional(),
+      withImage: z.boolean().optional(),
+      before: z.string().optional().describe("insert before this sibling task"),
+      cycleTimeUs: z.number().optional(),
+      priority: z.number().int().min(0).max(255).optional(),
+      autoStart: z.boolean().optional(),
+      summary: z.boolean().optional(),
+      xml: z.string().optional(),
+      returnXml: z.boolean().optional(),
+      varName: z.string().optional(),
+      dataType: z.string().optional(),
+      startAddress: z.number().int().optional(),
+      maxCPUs: z.number().int().optional(),
+      affinity: z.string().optional(),
+      cpus: z.array(z.object({
+        id: z.number().int(),
+        loadLimit: z.number().int().optional(),
+        baseTimeNs: z.number().int().optional(),
+        latencyWarningUs: z.number().int().optional(),
+      })).optional(),
+      linkedTask: z.string().optional(),
+      save: z.boolean().optional(),
+    },
+  },
+  async (p) => {
+    switch (p.action) {
+      case "list":
+        return textResult(await bridgeCall("tc_task_list", {}));
+      case "get":
+        need(p, ["path"], p.action);
+        return textResult(await bridgeCall("tc_task_get", { path: p.path, summary: p.summary === true }));
+      case "create":
+        need(p, ["name"], p.action);
+        return textResult(await bridgeCall("tc_task_create", { name: p.name, withImage: p.withImage, before: p.before, cycleTimeUs: p.cycleTimeUs, priority: p.priority, save: p.save === true }));
+      case "set_params":
+        need(p, ["path"], p.action);
+        if (p.xml !== undefined && (p.cycleTimeUs !== undefined || p.priority !== undefined || p.autoStart !== undefined)) {
+          throw new Error("set_params: xml is mutually exclusive with cycleTimeUs/priority/autoStart.");
+        }
+        return textResult(await bridgeCall("tc_task_set_params", { path: p.path, cycleTimeUs: p.cycleTimeUs, priority: p.priority, autoStart: p.autoStart, xml: p.xml, returnXml: p.returnXml === true, save: p.save === true }));
+      case "add_image_var":
+        need(p, ["path", "varName", "dataType"], p.action);
+        return textResult(await bridgeCall("tc_task_add_image_var", { path: p.path, varName: p.varName, dataType: p.dataType, startAddress: p.startAddress, save: p.save === true }));
+      case "get_rt_settings":
+        return textResult(await bridgeCall("tc_task_get_rt_settings", { summary: p.summary === true }));
+      case "set_rt_settings":
+        if (p.xml !== undefined && (p.maxCPUs !== undefined || p.affinity !== undefined || p.cpus !== undefined)) {
+          throw new Error("set_rt_settings: xml is mutually exclusive with maxCPUs/affinity/cpus.");
+        }
+        return textResult(await bridgeCall("tc_task_set_rt_settings", { maxCPUs: p.maxCPUs, affinity: p.affinity, cpus: p.cpus, xml: p.xml, returnXml: p.returnXml === true, save: p.save === true }));
+      case "bind_cpu":
+        need(p, ["path", "affinity"], p.action);
+        return textResult(await bridgeCall("tc_task_bind_cpu", { path: p.path, affinity: p.affinity, returnXml: p.returnXml === true, save: p.save === true }));
+      case "get_linked_task":
+        return textResult(await bridgeCall("tc_task_get_linked_task", { path: p.path }));
+      case "set_linked_task":
+        need(p, ["linkedTask"], p.action);
+        return textResult(await bridgeCall("tc_task_set_linked_task", { path: p.path, linkedTask: p.linkedTask, save: p.save === true }));
+    }
+  },
+);
+
+server.registerTool(
   "plc_download",
   {
     description: 'Deploy the active PLC project. Guarded: confirm="ALLOW_PLC_DOWNLOAD" (deploys a boot project to the live target). method "bootproject" (default): headless via ITcPlcProject — writes the boot project to the target boot dir; twincat_restart_runtime loads and runs it. method "command": legacy DTE command route (needs a shell with window automation). autoLogout (default true): if the IDE is logged into the PLC, log out first via UI Automation so any source edits deferred by the online lock are applied before deploy. Never logs back in.',
