@@ -1176,6 +1176,88 @@ function Resolve-PlcRootPath {
     return "TIPC^$([string]$tipc.Child(1).Name)"
 }
 
+# Build the ordered list of candidate tree PATHS (strings, NOT cached RCWs) that
+# might implement ITcPlcTaskReference (GetLinkedTask/SetLinkedTask). That interface
+# is NOT on the PLC ROOT (TIPC^<name>) -- it lives on a task-reference sub-node
+# (e.g. 'PlcTask') under the nested IEC PROJECT node ('<name> Project'). This mirrors
+# the plc_pou check_objects resolution: emit candidate PATHS and let the caller
+# LookupTreeItem a FRESH RCW per attempt (looping over cached RCWs QI-fails
+# E_NOINTERFACE). When $Path is supplied it is used as-is (single candidate).
+function Resolve-PlcTaskRefCandidates {
+    param(
+        [Parameter(Mandatory = $true)] $SysManager,
+        [AllowNull()][string]$Path
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        return , @($Path)
+    }
+    $plcPath = Resolve-PlcRootPath -SysManager $SysManager -Path $null
+    $root = (Get-TreeItem -SysManager $SysManager -TreePath $plcPath).Value
+    $rootName = Normalize-ScalarValue (Get-SafeValue { [string]$root.Name })
+
+    $candidatePaths = New-Object System.Collections.ArrayList
+
+    # The task-reference node lives under the '<name> Project' node. Probe its
+    # children (a 'PlcTask'-named child first, then any other child) before falling
+    # back to the project/instance/root nodes. Paths are resolved by name later.
+    $projectPaths = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace($rootName)) {
+        [void]$projectPaths.Add("$plcPath^$rootName Project")
+    }
+    $rootChildCount = Get-TreeItemChildCount -TreeItem $root
+    for ($ri = 1; $ri -le $rootChildCount; $ri++) {
+        $rc = (Get-SafeValue { (Get-TreeItemChild -TreeItem $root -Index $ri).Value })
+        if ($null -ne $rc) {
+            $rcn = Normalize-ScalarValue (Get-SafeValue { [string]$rc.Name })
+            if (-not [string]::IsNullOrWhiteSpace($rcn)) {
+                $rcp = "$plcPath^$rcn"
+                if (-not $projectPaths.Contains($rcp)) { [void]$projectPaths.Add($rcp) }
+            }
+        }
+    }
+
+    foreach ($projPath in $projectPaths) {
+        $projNode = (Get-SafeValue { (Get-TreeItem -SysManager $SysManager -TreePath $projPath).Value })
+        if ($null -eq $projNode) { continue }
+        $named = New-Object System.Collections.ArrayList
+        $other = New-Object System.Collections.ArrayList
+
+        # Enumerate the project node's children. .Child() enumeration can disagree
+        # with LookupTreeItem-by-name on some shells, so we resolve each candidate by
+        # NAME-PATH later; here we only collect the child names.
+        $childCount = Get-TreeItemChildCount -TreeItem $projNode
+        for ($ci = 1; $ci -le $childCount; $ci++) {
+            $childNode = (Get-SafeValue { (Get-TreeItemChild -TreeItem $projNode -Index $ci).Value })
+            if ($null -eq $childNode) { continue }
+            $cn = Normalize-ScalarValue (Get-SafeValue { [string]$childNode.Name })
+            if ([string]::IsNullOrWhiteSpace($cn)) { continue }
+            $cp = "$projPath^$cn"
+            if ($cn -eq 'PlcTask') { [void]$named.Add($cp) } else { [void]$other.Add($cp) }
+        }
+
+        # Always also probe the well-known task-reference child names by path, in case
+        # .Child() enumeration did not surface them (LookupTreeItem resolves by name).
+        foreach ($wk in @('PlcTask', 'VISU_TASK')) {
+            $wkp = "$projPath^$wk"
+            if ((-not $named.Contains($wkp)) -and (-not $other.Contains($wkp))) {
+                if ($wk -eq 'PlcTask') { [void]$named.Add($wkp) } else { [void]$other.Add($wkp) }
+            }
+        }
+
+        foreach ($p in $named) { if (-not $candidatePaths.Contains($p)) { [void]$candidatePaths.Add($p) } }
+        foreach ($p in $other) { if (-not $candidatePaths.Contains($p)) { [void]$candidatePaths.Add($p) } }
+    }
+
+    # Fall back to the project/instance/root nodes themselves (older layouts).
+    foreach ($p in $projectPaths) { if (-not $candidatePaths.Contains($p)) { [void]$candidatePaths.Add($p) } }
+    if (-not $candidatePaths.Contains($plcPath)) { [void]$candidatePaths.Add($plcPath) }
+
+    if ($candidatePaths.Count -lt 1) {
+        throw "No task-reference node found under PLC project '$plcPath' (nothing implementing ITcPlcTaskReference)"
+    }
+    return , @($candidatePaths.ToArray())
+}
+
 # Map a CpuAffinity name (or pass through a raw #x.. hex token) to a TwinCAT
 # affinity token #x{16 hex}. Used by tc_task_bind_cpu.
 function Convert-CpuAffinity {
@@ -5875,16 +5957,30 @@ try {
         'tc_task_get_linked_task' {
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
-            $treePath = Resolve-PlcRootPath -SysManager $sysManager -Path ([string]$payload.path)
-            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
             if (-not (Ensure-TcPlcTaskRefHelper)) {
                 throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for tc_task get_linked_task on this shell'
             }
+            # ITcPlcTaskReference is NOT on the PLC root -- resolve the task-reference
+            # sub-node (e.g. PlcTask). Try each candidate PATH with a FRESH RCW per
+            # attempt (cached RCWs QI-fail E_NOINTERFACE); first that reads wins.
+            $candidatePaths = Resolve-PlcTaskRefCandidates -SysManager $sysManager -Path ([string]$payload.path)
+            $treePath = $null
             $lt = $null
-            try {
-                $lt = [Te1000PlcTaskRefHelper]::GetLinkedTask($node)
-            } catch {
-                throw "node '$treePath' does not implement ITcPlcTaskReference: $($_.Exception.Message)"
+            $resolved = $false
+            $lastErr = $null
+            foreach ($candPath in $candidatePaths) {
+                try {
+                    $node = (Get-TreeItem -SysManager $sysManager -TreePath $candPath).Value
+                    $lt = [Te1000PlcTaskRefHelper]::GetLinkedTask($node)
+                    $treePath = $candPath
+                    $resolved = $true
+                    break
+                } catch {
+                    $lastErr = $_.Exception.Message
+                }
+            }
+            if (-not $resolved) {
+                throw "could not find a node implementing ITcPlcTaskReference (GetLinkedTask) under the PLC project. Tried: $($candidatePaths -join ', '). Last error: $lastErr"
             }
             Write-JsonResult @{
                 ok = $true
@@ -5903,11 +5999,32 @@ try {
             }
             $dte = Get-Dte -ProgId $progId -Mode $mode -Visible $true
             $sysManager = (Get-SysManager -Dte $dte).Value
-            $treePath = Resolve-PlcRootPath -SysManager $sysManager -Path ([string]$payload.path)
-            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
             if (-not (Ensure-TcPlcTaskRefHelper)) {
                 throw 'TCatSysManagerLib.dll could not be loaded; the typed ITcPlcTaskReference cast is required for tc_task set_linked_task on this shell'
             }
+            # Same resolution as get_linked_task: ITcPlcTaskReference is on the
+            # task-reference sub-node (e.g. PlcTask), NOT the PLC root. Feature-detect
+            # the node with a GetLinkedTask read (proves the QI), then write on a FRESH
+            # RCW for the same path (cached RCWs QI-fail E_NOINTERFACE).
+            $candidatePaths = Resolve-PlcTaskRefCandidates -SysManager $sysManager -Path ([string]$payload.path)
+            $treePath = $null
+            $resolved = $false
+            $lastErr = $null
+            foreach ($candPath in $candidatePaths) {
+                try {
+                    $probe = (Get-TreeItem -SysManager $sysManager -TreePath $candPath).Value
+                    $null = [Te1000PlcTaskRefHelper]::GetLinkedTask($probe)
+                    $treePath = $candPath
+                    $resolved = $true
+                    break
+                } catch {
+                    $lastErr = $_.Exception.Message
+                }
+            }
+            if (-not $resolved) {
+                throw "could not find a node implementing ITcPlcTaskReference (SetLinkedTask) under the PLC project. Tried: $($candidatePaths -join ', '). Last error: $lastErr"
+            }
+            $node = (Get-TreeItem -SysManager $sysManager -TreePath $treePath).Value
             try {
                 [Te1000PlcTaskRefHelper]::SetLinkedTask($node, $linkedTask)
             } catch {
