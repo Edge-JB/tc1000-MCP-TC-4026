@@ -1,0 +1,5 @@
+C:\ProgramData\te1000-mcp-daemon\daemon\obj\x64\Release\Te1000Daemon.csprojResolveAssemblyReference.cache
+C:\ProgramData\te1000-mcp-daemon\daemon\bin\Release\Te1000Daemon.exe
+C:\ProgramData\te1000-mcp-daemon\daemon\bin\Release\Te1000Daemon.pdb
+C:\ProgramData\te1000-mcp-daemon\daemon\obj\x64\Release\Te1000Daemon.exe
+C:\ProgramData\te1000-mcp-daemon\daemon\obj\x64\Release\Te1000Daemon.pdb
