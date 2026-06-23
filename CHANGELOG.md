@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — Unreleased (branch `feat/csharp-daemon`)
+
+A **persistent native C#/.NET daemon** replaces the per-call `powershell.exe` spawn
+model for the hot path. The daemon acquires the DTE + `ITcSysManager` **once**,
+caches them and the project tree, runs the dialog watchdog as an internal thread,
+and serves the Node host over a named pipe. This eliminates the two root causes of
+the old latency: the cold per-call process model (spawn ×2 + ROT walk + Add-Type
+JIT + sysmanager re-acquire every call) and the O(tree-size) full re-walk on every
+`plc_pou.find`/`search`/`tc_tree` call.
+
+### Added
+- `daemon/` — `Te1000Daemon.exe` (net472/x64; builds with the in-box .NET
+  Framework MSBuild, no SDK/NuGet/internet). All **164** bridge actions ported to
+  native C# handlers via late-bound `dynamic` COM, returning byte-identical `data`
+  JSON. Components: persistent cached COM session (ROT probe + `Get-Dte` +
+  `Get-SysManager` + health-check/reconnect), single STA `ComWorker` queue with
+  per-call timeout and modal-dialog-grace recycle, `IOleMessageFilter`, native
+  `DialogWatcher` thread (allowlist auto-dismiss), `TreeCache` (bounded walks +
+  subtree invalidation), self-contained JSON, dependency-free build.
+- `daemonClient.js` — named-pipe client; auto-spawns the daemon (detached,
+  single-instance) and reconnects; maps daemon `errorKind` to the existing
+  user-facing error messages.
+- `daemon/build.ps1`, `daemon/test-ping.js` (no-XAE end-to-end proof).
+- `docs/csharp-daemon-{plan,coverage,validation}.md`.
+
+### Changed
+- `index.js` routes `runBridge` to the daemon by default; the legacy PowerShell
+  bridge is kept intact as a full fallback behind `TE1000_NO_DAEMON=1`, and is also
+  used automatically when no 64-bit TcXaeShell is detected or the daemon can't
+  start. The per-call dialog-watch/preflight spawn is skipped in daemon mode (the
+  daemon watches internally). Server version → 2.1.0.
+
+### Fixed
+- **`plc_pou import_template` Windows-path corruption**: each `paths[]` element is
+  now passed verbatim to `CreateChild(null, 58, "", vInfo)` — never split on `:`.
+- **`plc_pou` find/search/tree + tree walks**: scoped to the requested subtree with
+  a bounded depth and `TreeCache` memoization, replacing the per-call root re-walk.
+
+### Wire contract
+Unchanged. Same 25 tools, action names, payload schemas, result shapes (incl. batch
+roll-ups `{count,succeeded,failed,results}` and guard tokens). The daemon returns the
+same JSON the PowerShell bridge produced. TISC safety-path rejection preserved.
+
 ## [2.0.0]
 
 The tool surface was consolidated for agent-context efficiency and then expanded to cover

@@ -5,6 +5,10 @@ node_modules/
 *.bak
 *.bak-*
 
+# C# daemon build output (rebuild with daemon/build.ps1)
+daemon/bin/
+daemon/obj/
+
 # OS / editor cruft
 Thumbs.db
 Desktop.ini

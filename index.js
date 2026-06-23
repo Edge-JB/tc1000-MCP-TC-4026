@@ -16,6 +16,19 @@ const fs = require("fs");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const z = require("zod/v4");
+const daemonClient = require("./daemonClient.js");
+
+// --- Daemon vs. legacy PowerShell bridge -----------------------------------
+// v2.1: a persistent native C#/.NET daemon (daemon/Te1000Daemon.exe) serves the
+// action surface over a named pipe, acquiring DTE+sysmanager ONCE and watching
+// for modal dialogs on an internal thread — eliminating the per-call
+// powershell.exe spawn (+watcher) and the O(tree-size) re-walk. The legacy PS
+// bridge stays as a full fallback behind TE1000_NO_DAEMON=1.
+//
+// Daemon requires the 64-bit TcXaeShell (DTE.17.0 / x64 exe). On a 32-bit-only
+// shell we auto-fall back to the legacy PS spawn (which already picks SysWOW64).
+const HAS_X64_SHELL = fs.existsSync("C:\\Program Files\\Beckhoff\\TcXaeShell\\Common7\\IDE\\PublicAssemblies\\envdte.dll");
+const USE_DAEMON = process.env.TE1000_NO_DAEMON !== "1" && HAS_X64_SHELL;
 
 const ACTIVATE_CONFIRMATION = "ALLOW_TWINCAT_ACTIVATE";
 const RESTART_CONFIRMATION = "ALLOW_TWINCAT_RESTART";
@@ -145,11 +158,29 @@ function sessionCall(mode) {
 
 async function bridgeCall(action, payload = {}) {
   if (process.env.TE1000_PROGID && !payload.progId) payload.progId = process.env.TE1000_PROGID;
-  await preflightGate(action);
+  // In daemon mode the daemon runs the dialog watcher internally and refuses /
+  // recycles on a persistent modal, so the per-call preflight probe (an extra
+  // powershell.exe spawn) is redundant. Legacy mode keeps the preflight gate.
+  if (!USE_DAEMON) await preflightGate(action);
   return runBridge(action, payload);
 }
 
 function runBridge(action, payload = {}) {
+  if (USE_DAEMON) {
+    return daemonClient.runViaDaemon(action, payload).catch((err) => {
+      // If the daemon is unreachable/failed to start, fall back to the legacy
+      // PowerShell bridge for this call so the MCP stays functional.
+      if (/Te1000Daemon\.exe not found|Timed out connecting to Te1000Daemon/i.test(err.message || "")) {
+        console.error("te1000-mcp: daemon unavailable, falling back to legacy PS bridge:", err.message);
+        return runBridgeLegacy(action, payload);
+      }
+      throw err;
+    });
+  }
+  return runBridgeLegacy(action, payload);
+}
+
+function runBridgeLegacy(action, payload = {}) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(__dirname, "powershell", "te1000-bridge.ps1");
     const watchPath = path.join(__dirname, "powershell", "dialog-watch.ps1");
@@ -307,7 +338,7 @@ function need(params, keys, action) {
   }
 }
 
-const server = new McpServer({ name: "te1000-mcp", version: "2.0.0" });
+const server = new McpServer({ name: "te1000-mcp", version: "2.1.0" });
 
 const XAE_ACTIONS = {
   status: "xae_status",
@@ -1647,7 +1678,12 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("te1000-mcp server running on stdio");
+  console.error(
+    "te1000-mcp server running on stdio (" +
+    (USE_DAEMON ? "native daemon mode" : "legacy PowerShell bridge mode") +
+    (process.env.TE1000_NO_DAEMON === "1" ? "; TE1000_NO_DAEMON=1" : (!HAS_X64_SHELL ? "; no x64 shell detected" : "")) +
+    ")",
+  );
 }
 
 main().catch((error) => {

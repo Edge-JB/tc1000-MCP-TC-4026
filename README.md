@@ -77,6 +77,29 @@ XAE Shell via its verified COM ProgID and calls the Automation Interface
 (`ITcSysManager`, `ITcSmTreeItem`, `ITcPlcProject`, DTE `SolutionBuild`, …). 32-bit
 PowerShell is used because that matches Beckhoff's TE1000 COM requirements.
 
+### Native daemon (default since 2.1, 64-bit shell)
+
+On the 64-bit TcXaeShell, `index.js` instead talks to a **persistent C#/.NET daemon**
+(`daemon/Te1000Daemon.exe`) over a named pipe:
+
+```
+  MCP client (agent)
+        │  stdio (JSON-RPC, MCP)
+        ▼
+  index.js  ──named pipe (JSON)──►  Te1000Daemon.exe  ──COM/DTE──►  XAE Shell (TE1000)
+   (Node 20)   daemonClient.js      (long-lived, x64)               running TwinCAT project
+```
+
+The daemon acquires the DTE + `ITcSysManager` **once**, caches them and the project
+tree, and runs the dialog watchdog on an internal thread — removing the per-call
+`powershell.exe` spawn (×2 with the old watcher), the ROT walk, the `Add-Type` JIT, and
+the O(tree-size) re-walk that made `plc_pou.find`/`search` slow down as the tree grew.
+It implements the **same 164 bridge actions** and returns the **same JSON**, so the tool
+surface is unchanged. Build it with `daemon/build.ps1` (in-box .NET Framework MSBuild —
+no SDK/NuGet). Set `TE1000_NO_DAEMON=1` to use the legacy PowerShell bridge (also used
+automatically on a 32-bit-only shell, or if the daemon can't start). See
+**[docs/csharp-daemon-validation.md](docs/csharp-daemon-validation.md)**.
+
 ## Requirements
 
 | | |
