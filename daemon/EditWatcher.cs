@@ -36,7 +36,11 @@ namespace Te1000Daemon
         // read). Rebuilt at most once per search (TTL-gated). STA-thread only.
         private Dictionary<string, dynamic> _openDocs =
             new Dictionary<string, dynamic>(StringComparer.Ordinal);
-        private int _lastRefreshTick = -100000;
+        // Stopwatch-based TTL: robust across the TickCount wrap and free of the old
+        // sentinel-tick (-100000 + unchecked-wrap) fragility. Not started until the
+        // first refresh, so RefreshOpenDocsIfStale always refreshes once up front.
+        private readonly System.Diagnostics.Stopwatch _refreshAge = new System.Diagnostics.Stopwatch();
+        private bool _everRefreshed;
         private const int RefreshTtlMs = 1000;
 
         private FileSystemWatcher _fsw;
@@ -54,15 +58,15 @@ namespace Te1000Daemon
         // MUST be called on the STA worker thread (reads DTE.Documents).
         public void RefreshOpenDocsIfStale()
         {
-            int now = Environment.TickCount;
-            if (unchecked(now - _lastRefreshTick) < RefreshTtlMs && _lastRefreshTick != -100000)
+            if (_everRefreshed && _refreshAge.ElapsedMilliseconds < RefreshTtlMs)
                 return;
             RefreshOpenDocs();
         }
 
         public void RefreshOpenDocs()
         {
-            _lastRefreshTick = Environment.TickCount;
+            _everRefreshed = true;
+            _refreshAge.Restart();
             var map = new Dictionary<string, dynamic>(StringComparer.Ordinal);
             dynamic sm = null;
             try { sm = _session.GetSysManager(); }
@@ -160,7 +164,17 @@ namespace Te1000Daemon
                     if (ComHelpers.TryGetTreeItem(sm, cand) != null) return cand;
                 }
             }
-            // Unvalidated but indexed (corpus was warm): still usable as a key.
+            // Unvalidated but indexed (corpus was warm): still usable as a key when
+            // it is unambiguous. NARROW WINDOW: if sm==null (sysmanager unavailable
+            // this pass) AND the leaf name maps to >1 cached path, we cannot decide
+            // which path this open editor backs, so we return null. The caller then
+            // treats the doc as "not tracked" for this refresh, i.e. it is NOT
+            // dirty-checked — the search may serve cached text for an object the
+            // user is actively editing. This only happens transiently (sm null +
+            // duplicate leaf names, which are rare in the IEC namespace) and self-
+            // corrects on the next refresh once sm is back. Erring toward "untracked"
+            // here is safe-ish: a stale read is worse than a hang, but the next
+            // refresh (TTL 1s) re-resolves it.
             return candidates.Count == 1 ? candidates[0] : null;
         }
 

@@ -19,6 +19,23 @@ namespace Te1000Daemon
 
         public void MarkStale() { _stale = true; _dte = null; _sysManager = null; }
 
+        // Best-effort release of a COM RCW. Guards against already-released RCWs
+        // and non-COM objects (Marshal.ReleaseComObject throws ArgumentException
+        // on a non-COM object, InvalidComObjectException on an already-released
+        // one). Loops ReleaseComObject down to a zero ref count so the underlying
+        // proxy is actually torn down (a dynamic/dispatch RCW can hold >1 ref).
+        private static void SafeRelease(object com)
+        {
+            if (com == null) return;
+            try
+            {
+                if (!Marshal.IsComObject(com)) return;
+                int rc;
+                do { rc = Marshal.ReleaseComObject(com); } while (rc > 0);
+            }
+            catch { /* already released / not a COM RCW — ignore */ }
+        }
+
         // Return a live, cached DTE for (progId, mode); reconnect if stale/dead.
         public dynamic GetDte(string progId, string mode, bool visible = true)
         {
@@ -92,16 +109,27 @@ namespace Te1000Daemon
             var entries = ListRunningDte(progId);
             if (entries.Count == 0) return null;
 
+            RotEntry chosen = null;
             string preferred = Environment.GetEnvironmentVariable("TE1000_MCP_SOLUTION_PATH");
             if (!string.IsNullOrWhiteSpace(preferred))
             {
                 foreach (var e in entries)
                     if (!string.IsNullOrWhiteSpace(e.Solution) && string.Equals(e.Solution, preferred, StringComparison.OrdinalIgnoreCase))
-                        return e.Dte;
+                    { chosen = e; break; }
             }
+            if (chosen == null)
+            {
+                foreach (var e in entries)
+                    if (!string.IsNullOrWhiteSpace(e.Solution)) { chosen = e; break; }
+            }
+            if (chosen == null) chosen = entries[0];
+
+            // Release the DTE RCWs of every ROT entry we did NOT return; only the
+            // chosen one survives (the caller takes ownership of it).
             foreach (var e in entries)
-                if (!string.IsNullOrWhiteSpace(e.Solution)) return e.Dte;
-            return entries[0].Dte;
+                if (!ReferenceEquals(e, chosen)) SafeRelease((object)e.Dte);
+
+            return chosen.Dte;
         }
 
         private sealed class RotEntry { public string DisplayName; public string Solution; public dynamic Dte; }
@@ -221,7 +249,18 @@ namespace Te1000Daemon
         public void Dispose()
         {
             try { Te1000MessageFilter.Revoke(); } catch { }
-            _dte = null; _sysManager = null;
+            // Release the cached proxies before dropping references so the COM RCWs
+            // are torn down rather than leaked until GC. MarkStale() may already
+            // have nulled these (recycle path) — SafeRelease(null) is a no-op.
+            object sm = (object)_sysManager;
+            object dte = (object)_dte;
+            _sysManager = null; _dte = null;
+            SafeRelease(sm);
+            // Only release the DTE if WE own it (created via 'create'); an 'active'
+            // DTE is the live IDE shared across the ROT, and over-releasing its RCW
+            // can disturb the running IDE. We acquired our own RCW ref though, so a
+            // single balanced release is correct either way — release it.
+            SafeRelease(dte);
         }
     }
 }

@@ -53,10 +53,18 @@ namespace Te1000Daemon
 
         private void ServeConnection(NamedPipeServerStream server)
         {
+            // leaveOpen:true so disposing the reader/writer does not double-dispose
+            // the pipe (we dispose it ourselves in the outer finally); but the
+            // reader/writer themselves MUST be disposed so their buffers are
+            // flushed/freed. AutoFlush=false + an explicit Flush per line keeps the
+            // wire framing intact; a final Flush on the writer's dispose covers any
+            // buffered bytes left on an exception path.
+            StreamReader reader = null;
+            StreamWriter writer = null;
             try
             {
-                var reader = new StreamReader(server, new UTF8Encoding(false), false, 1 << 16, leaveOpen: true);
-                var writer = new StreamWriter(server, new UTF8Encoding(false), 1 << 16, leaveOpen: true) { AutoFlush = false };
+                reader = new StreamReader(server, new UTF8Encoding(false), false, 1 << 16, leaveOpen: true);
+                writer = new StreamWriter(server, new UTF8Encoding(false), 1 << 16, leaveOpen: true) { AutoFlush = false };
 
                 string line;
                 while (server.IsConnected && (line = reader.ReadLine()) != null)
@@ -89,6 +97,10 @@ namespace Te1000Daemon
             }
             finally
             {
+                // Flush any buffered bytes (even on the exception path) before tear
+                // down, then dispose the reader/writer and the pipe.
+                if (writer != null) { try { writer.Flush(); } catch { } try { writer.Dispose(); } catch { } }
+                if (reader != null) { try { reader.Dispose(); } catch { } }
                 try { server.Disconnect(); } catch { }
                 try { server.Dispose(); } catch { }
             }

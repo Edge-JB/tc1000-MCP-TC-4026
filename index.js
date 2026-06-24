@@ -169,22 +169,52 @@ async function bridgeCall(action, payload = {}) {
   // In daemon mode the daemon runs the dialog watcher internally and refuses /
   // recycles on a persistent modal, so the per-call preflight probe (an extra
   // powershell.exe spawn) is redundant. Legacy mode keeps the preflight gate.
+  // (When daemon mode FALLS BACK to the legacy bridge, runBridge re-applies the
+  // preflight gate before the legacy call — see runBridge / runLegacyWithGate.)
   if (!USE_DAEMON) await preflightGate(action);
   return runBridge(action, payload);
 }
 
+// Process-lifetime latch: once the daemon proves unavailable (not found / can't
+// connect / persistently dropping the pipe), route subsequent calls straight to
+// the legacy bridge instead of each paying the full CONNECT_TIMEOUT (~20s). M1.
+let daemonUnavailableLatched = false;
+
+// A daemon error means "fall back to legacy" when: the exe is missing, the
+// connect timed out, or (H4a) the client flagged the call daemon-unavailable
+// (persistent pipe-closed after its one retry, or a per-request timeout).
+function shouldFallBackToLegacy(err) {
+  if (err && err.daemonUnavailable) return true;
+  return /Te1000Daemon\.exe not found|Timed out connecting to Te1000Daemon/i.test(err && err.message || "");
+}
+
+// Run the legacy bridge, but first re-apply the same dialog preflight gate the
+// non-daemon path always runs (H4b). Skipping it on fallback would let a lingering
+// modal corrupt/hang the legacy call.
+async function runLegacyWithGate(action, payload) {
+  await preflightGate(action);
+  return runBridgeLegacy(action, payload);
+}
+
 function runBridge(action, payload = {}) {
-  if (USE_DAEMON) {
+  if (USE_DAEMON && !daemonUnavailableLatched) {
     return daemonClient.runViaDaemon(action, payload).catch((err) => {
-      // If the daemon is unreachable/failed to start, fall back to the legacy
-      // PowerShell bridge for this call so the MCP stays functional.
-      if (/Te1000Daemon\.exe not found|Timed out connecting to Te1000Daemon/i.test(err.message || "")) {
-        console.error("te1000-mcp: daemon unavailable, falling back to legacy PS bridge:", err.message);
-        return runBridgeLegacy(action, payload);
+      // If the daemon is unreachable/failed/persistently dropping, fall back to
+      // the legacy PowerShell bridge for this call so the MCP stays functional,
+      // and latch so future calls skip the connect attempt entirely (M1).
+      if (shouldFallBackToLegacy(err)) {
+        if (!daemonUnavailableLatched) {
+          daemonUnavailableLatched = true;
+          console.error("te1000-mcp: daemon unavailable, latching to legacy PS bridge:", err.message);
+        }
+        return runLegacyWithGate(action, payload);
       }
       throw err;
     });
   }
+  // Latched-unavailable or daemon disabled: legacy path WITH the preflight gate
+  // (the latched-daemon path would otherwise skip it).
+  if (USE_DAEMON && daemonUnavailableLatched) return runLegacyWithGate(action, payload);
   return runBridgeLegacy(action, payload);
 }
 

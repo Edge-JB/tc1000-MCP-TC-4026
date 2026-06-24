@@ -1465,7 +1465,9 @@ namespace Te1000Daemon
             int idx = text.IndexOf('\n');
             if (idx < 0)
             {
-                if (text.IndexOf('\r') >= 0) { e.Name = "LF"; e.Eol = "\r"; return e; }
+                // Lone-CR file (old-Mac style). Report it as "CR" (was mislabeled
+                // "LF"); the round-trip EOL string stays "\r" so behavior is intact.
+                if (text.IndexOf('\r') >= 0) { e.Name = "CR"; e.Eol = "\r"; return e; }
                 e.Name = "CRLF"; e.Eol = "\r\n"; return e;
             }
             if (idx > 0 && text[idx - 1] == '\r') { e.Name = "CRLF"; e.Eol = "\r\n"; return e; }

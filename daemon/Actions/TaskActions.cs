@@ -676,28 +676,37 @@ namespace Te1000Daemon
         // malformed "ghost" do best-effort cleanup and THROW.
         private static void AssertWellFormedChild(dynamic parent, dynamic child, string requestedName, int subType, string parentPath)
         {
-            string childActualName = ComHelpers.SafeStr(delegate { return child.Name; });
-            string childPath = ComHelpers.SafeStr(delegate { return child.PathName; });
-
+            // Null-check FIRST, before dereferencing child.Name / child.PathName.
+            // (Previously these were read first; SafeStr swallowed the NRE so it was
+            // harmless, but reading then checking is backwards — order it properly.)
             string reason = null;
+            string childActualName = null;
+            string childPath = null;
+
             if (child == null)
             {
                 reason = "CreateChild returned null";
             }
-            else if (string.IsNullOrWhiteSpace(childActualName))
-            {
-                reason = "returned child has a blank name";
-            }
-            else if (childActualName != requestedName)
-            {
-                reason = "returned child name '" + childActualName + "' does not match requested name '" + requestedName + "'";
-            }
             else
             {
-                string expectedPath = parentPath + "^" + requestedName;
-                if (!string.IsNullOrWhiteSpace(childPath) && childPath != expectedPath)
+                childActualName = ComHelpers.SafeStr(delegate { return child.Name; });
+                childPath = ComHelpers.SafeStr(delegate { return child.PathName; });
+
+                if (string.IsNullOrWhiteSpace(childActualName))
                 {
-                    reason = "returned child path '" + childPath + "' is not under requested parent (expected '" + expectedPath + "')";
+                    reason = "returned child has a blank name";
+                }
+                else if (childActualName != requestedName)
+                {
+                    reason = "returned child name '" + childActualName + "' does not match requested name '" + requestedName + "'";
+                }
+                else
+                {
+                    string expectedPath = parentPath + "^" + requestedName;
+                    if (!string.IsNullOrWhiteSpace(childPath) && childPath != expectedPath)
+                    {
+                        reason = "returned child path '" + childPath + "' is not under requested parent (expected '" + expectedPath + "')";
+                    }
                 }
             }
 

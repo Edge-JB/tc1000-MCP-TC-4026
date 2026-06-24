@@ -55,7 +55,10 @@ namespace Te1000Daemon
                     watcher.Start();
                 }
 
-                using (var worker = new ComWorker(watcher, defaultTimeoutMs: 0, blockGraceMs: watch ? graceMs : 0))
+                // Finite default ceiling so a wedged non-dialog COM call cannot
+                // hang a request forever (the Dispatcher also passes a per-call
+                // timeout, but this is the floor if a caller ever passes 0).
+                using (var worker = new ComWorker(watcher, defaultTimeoutMs: 180000, blockGraceMs: watch ? graceMs : 0))
                 {
                     var dispatcher = new Dispatcher(worker);
                     Log.Write("Dispatcher ready; " + dispatcher.ActionCount + " actions registered.");

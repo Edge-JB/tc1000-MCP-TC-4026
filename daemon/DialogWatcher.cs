@@ -32,7 +32,22 @@ namespace Te1000Daemon
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessage")] static extern IntPtr SendMessageStr(IntPtr h, uint msg, IntPtr w, StringBuilder l);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeoutMs, out IntPtr result);
         [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr h);
+
+        const uint SMTO_ABORTIFHUNG = 0x0002;
+        const uint ClickTimeoutMs = 1500;
+
+        // Cross-process SendMessage with a short timeout so a wedged dialog owner
+        // cannot stall the watcher thread (which would freeze BlockingForMs and
+        // prevent the grace recycle from ever firing).
+        static void SendTimed(IntPtr h, uint msg, IntPtr w, IntPtr l)
+        {
+            IntPtr res;
+            try { SendMessageTimeout(h, msg, w, l, SMTO_ABORTIFHUNG, ClickTimeoutMs, out res); }
+            catch { }
+        }
 
         const uint GW_OWNER = 4;
         const uint BM_CLICK = 0x00F5;
@@ -109,10 +124,10 @@ namespace Te1000Daemon
             if (btn == IntPtr.Zero) return false;
             IntPtr dlg = (IntPtr)hwnd;
             int id = GetDlgCtrlID(btn);
-            if (id != 0) SendMessage(dlg, WM_COMMAND, (IntPtr)(id & 0xFFFF), btn);
-            SendMessage(btn, WM_LBUTTONDOWN, (IntPtr)1, IntPtr.Zero);
-            SendMessage(btn, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero);
-            SendMessage(btn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+            if (id != 0) SendTimed(dlg, WM_COMMAND, (IntPtr)(id & 0xFFFF), btn);
+            SendTimed(btn, WM_LBUTTONDOWN, (IntPtr)1, IntPtr.Zero);
+            SendTimed(btn, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero);
+            SendTimed(btn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
             return true;
         }
     }
@@ -165,7 +180,7 @@ namespace Te1000Daemon
     // decide a call is hung on a modal dialog.
     public sealed class DialogWatcher
     {
-        private readonly string _processName;
+        private readonly string[] _processNames;
         private readonly int _pollMs;
         private readonly bool _autoDismiss;
         private readonly List<DlgRule> _rules;
@@ -176,9 +191,17 @@ namespace Te1000Daemon
         private DialogSnapshot _latest;
         private long _blockingSinceMs; // 0 when not currently blocking
 
-        public DialogWatcher(string allowlistPath, bool autoDismiss, string processName = "TcXaeShell", int pollMs = 750)
+        // The XAE shell can be hosted under different process names depending on
+        // how TwinCAT is installed (TcXaeShell, the 64-bit TcXaeShell64, or a
+        // VS-hosted devenv). Watch the whole candidate set so the dialog-grace
+        // recycle still triggers when XAE isn't the default TcXaeShell.exe.
+        private static readonly string[] DefaultProcessNames = { "TcXaeShell", "TcXaeShell64", "devenv" };
+
+        public DialogWatcher(string allowlistPath, bool autoDismiss, string processName = null, int pollMs = 750)
         {
-            _processName = processName;
+            _processNames = string.IsNullOrWhiteSpace(processName)
+                ? DefaultProcessNames
+                : new[] { processName };
             _pollMs = pollMs;
             _autoDismiss = autoDismiss;
             _rules = LoadRules(allowlistPath);
@@ -266,14 +289,19 @@ namespace Te1000Daemon
         public DialogSnapshot Probe(bool doDismiss)
         {
             DlgWin dlg = null;
-            foreach (var proc in SafeGetProcesses(_processName))
+            foreach (var name in _processNames)
             {
-                try
+                foreach (var proc in SafeGetProcesses(name))
                 {
-                    var hits = DlgWatch.Find((uint)proc.Id);
-                    if (hits != null && hits.Count > 0) { dlg = hits[0]; break; }
+                    try
+                    {
+                        var hits = DlgWatch.Find((uint)proc.Id);
+                        if (hits != null && hits.Count > 0) { dlg = hits[0]; break; }
+                    }
+                    catch { }
+                    finally { try { proc.Dispose(); } catch { } }
                 }
-                catch { }
+                if (dlg != null) break;
             }
 
             if (dlg == null)

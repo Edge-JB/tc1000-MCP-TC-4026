@@ -46,8 +46,14 @@ namespace Te1000Daemon
             SessionDownloadActions.Register(_handlers);
         }
 
-        // Default per-call timeout (ms); long builds pass their own (0 = no limit).
-        private const int DefaultTimeoutMs = 0; // 0 = wait indefinitely (parity with index.js HARD_TIMEOUT default off)
+        // Default per-call ceiling (ms). The legacy bridge left its wall-clock
+        // backstop OFF by default (TE1000_BRIDGE_TIMEOUT_MS=0), but with budget==0
+        // the daemon's ComWorker.Run loop never trips its timeout branch, so a
+        // wedged non-dialog COM call would hang that request forever. Give a finite,
+        // generous default ceiling so a stuck request eventually recycles the worker
+        // and returns a timeout error. Long-running actions (builds, etc.) still
+        // pass their own larger timeoutMs in the payload, which overrides this.
+        private const int DefaultTimeoutMs = 180000; // 3 min generous ceiling
 
         // Returns the response JObj: {id, ok, result?|error?, errorKind?}.
         public Json.JObj Handle(Json.JObj request)
@@ -143,6 +149,24 @@ namespace Te1000Daemon
         }
 
         // Build/activate/long-running actions may carry their own timeoutMs.
+        // Actions that can legitimately run far longer than the default ceiling
+        // (solution/C++ builds, activate, download, restart, boot-gen, library/IO
+        // scans, rescan, timed scope record, network broadcast search). These keep
+        // the legacy no-limit behavior (budget 0 = wait indefinitely) unless the
+        // caller passes an explicit timeoutMs; the dialog watcher still recovers
+        // them if they wedge on a modal. Without this allowlist the 180 s ceiling
+        // would kill a legitimate multi-minute build/activate and recycle the worker.
+        private static readonly System.Collections.Generic.HashSet<string> LongRunningActions =
+            new System.Collections.Generic.HashSet<string>(System.StringComparer.OrdinalIgnoreCase)
+            {
+                "xae_solution_build", "twincat_cpp_build_project",
+                "twincat_activate_configuration", "twincat_restart_runtime",
+                "plc_download", "plc_login", "plc_project_generate_boot",
+                "measurement_scope_record", "twincat_route_broadcast_search",
+                "plc_library_scan", "twincat_rescan_plc_project",
+                "twincat_scan_io_boxes", "twincat_license_activate_response",
+            };
+
         private static int TimeoutFor(string action, Json.JObj payload)
         {
             if (payload.Has("timeoutMs"))
@@ -150,6 +174,9 @@ namespace Te1000Daemon
                 int t = payload.Int("timeoutMs", 0);
                 if (t > 0) return t;
             }
+            // Long-running ops keep the legacy infinite wait absent an explicit
+            // override; ordinary fast COM calls get the finite safety ceiling.
+            if (action != null && LongRunningActions.Contains(action)) return 0;
             return DefaultTimeoutMs;
         }
 

@@ -22,6 +22,13 @@ const PIPE_NAME = process.env.TE1000_DAEMON_PIPE || "te1000-mcp";
 const PIPE_PATH = "\\\\.\\pipe\\" + PIPE_NAME;
 const EXE_PATH = path.join(__dirname, "daemon", "bin", "Release", "Te1000Daemon.exe");
 const CONNECT_TIMEOUT_MS = Number(process.env.TE1000_DAEMON_CONNECT_MS) || 20000;
+// Per-request ceiling: once a frame is written, the pending id waits for a
+// matching response. Without this, a wedged daemon (or a dropped/malformed reply
+// frame that never matches the id) would hang the request forever. The daemon's
+// own per-call ceiling is ~180s and long actions carry their own larger
+// timeoutMs; keep this Node-side wall comfortably above that so we don't pre-empt
+// a daemon call that is legitimately still running. 0 disables (parity escape).
+const REQUEST_TIMEOUT_MS = Number(process.env.TE1000_DAEMON_REQUEST_MS) || 1900000;
 
 // Watcher/auto-dismiss knobs are honored by the daemon via CLI flags (it runs
 // the watcher internally as a thread). Mirror the index.js env switches.
@@ -70,9 +77,15 @@ function attachSocket(s) {
   });
   const drop = () => {
     if (sock === s) sock = null;
-    // Fail all in-flight requests; callers may retry.
-    for (const [, w] of pending) w.reject(new Error("Daemon pipe closed"));
+    // Fail all in-flight requests; callers may retry. Snapshot the waiters first
+    // (each reject() mutates `pending` via settle()).
+    const waiters = Array.from(pending.values());
     pending.clear();
+    for (const w of waiters) {
+      const e = new Error("Daemon pipe closed");
+      e.pipeClosed = true;
+      w.reject(e);
+    }
   };
   s.on("close", drop);
   s.on("error", drop);
@@ -81,9 +94,17 @@ function attachSocket(s) {
 function connectOnce() {
   return new Promise((resolve, reject) => {
     const s = net.connect(PIPE_PATH);
-    const onErr = (e) => { s.destroy(); reject(e); };
+    const onConnect = () => { s.removeListener("error", onErr); resolve(s); };
+    const onErr = (e) => {
+      // Remove BOTH transient listeners so the pending "connect" handler can't
+      // leak/fire after we've destroyed the socket (L5).
+      s.removeListener("connect", onConnect);
+      s.removeListener("error", onErr);
+      s.destroy();
+      reject(e);
+    };
     s.once("error", onErr);
-    s.once("connect", () => { s.removeListener("error", onErr); resolve(s); });
+    s.once("connect", onConnect);
   });
 }
 
@@ -126,10 +147,37 @@ function sendOnce(action, payload) {
     let s;
     try { s = await ensureConnected(); } catch (e) { return reject(e); }
     const id = String(nextId++);
-    pending.set(id, { resolve, reject });
+
+    // Per-request timer: if no matching-id response arrives within the ceiling,
+    // drop the pending id and reject with a timeout-kind error. This also covers
+    // the "malformed reply line silently dropped → request hangs" case (a dropped
+    // frame never resolves the id, so it now times out instead).
+    let timer = null;
+    const settle = (fn, arg) => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      pending.delete(id);
+      fn(arg);
+    };
+    pending.set(id, {
+      resolve: (msg) => settle(resolve, msg),
+      reject: (err) => settle(reject, err),
+    });
+    if (REQUEST_TIMEOUT_MS > 0) {
+      timer = setTimeout(() => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        const e = new Error(
+          `Te1000Daemon request '${action}' timed out after ${REQUEST_TIMEOUT_MS} ms with no response (daemon may be wedged or the reply was dropped).`,
+        );
+        e.daemonUnavailable = true; // let runBridge fall back to the legacy bridge
+        reject(e);
+      }, REQUEST_TIMEOUT_MS);
+    }
+
     try {
       s.write(JSON.stringify({ id, action, payload }) + "\n");
     } catch (e) {
+      if (timer) { clearTimeout(timer); timer = null; }
       pending.delete(id);
       reject(e);
     }
@@ -159,19 +207,34 @@ function toError(action, resp) {
       `(${resp.error || ""})`.trim(),
     );
   }
-  return new Error(resp.error || "Daemon returned failure");
+  // Parity: the legacy PS bridge path said "Bridge returned failure"; keep the
+  // agent-visible text stable rather than introducing "Daemon returned failure".
+  return new Error(resp.error || "Bridge returned failure");
 }
 
 // Public: run an action via the daemon. Resolves with the `result` (== the PS
 // bridge's `data`), rejects with a mapped Error. One transparent reconnect retry
 // on a dropped pipe.
+function isRetryablePipeError(e) {
+  return !!(e && (e.pipeClosed || /pipe closed|ECONNRESET|EPIPE/i.test(e.message || "")));
+}
+
 async function runViaDaemon(action, payload = {}) {
   let resp;
   try {
     resp = await sendOnce(action, payload);
   } catch (e) {
-    if (/pipe closed|ECONNRESET|EPIPE/i.test(e.message || "")) {
-      resp = await sendOnce(action, payload); // reconnect + retry once
+    if (isRetryablePipeError(e)) {
+      try {
+        resp = await sendOnce(action, payload); // reconnect + retry once
+      } catch (e2) {
+        // The pipe is still dropping after a reconnect attempt (a daemon that
+        // connects but immediately closes every frame). Surface this as a
+        // daemon-unavailable error so index.js can fall back to the legacy
+        // bridge instead of treating it as a hard failure (H4a).
+        if (isRetryablePipeError(e2)) e2.daemonUnavailable = true;
+        throw e2;
+      }
     } else {
       throw e;
     }

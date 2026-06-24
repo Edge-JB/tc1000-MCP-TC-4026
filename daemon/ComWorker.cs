@@ -125,7 +125,9 @@ namespace Te1000Daemon
 
             // Wait loop: poll for completion, the dialog grace window, and the
             // hard timeout. 0/negative budget => wait indefinitely (long builds).
-            long start = Environment.TickCount;
+            // Stopwatch (not Environment.TickCount) so the elapsed comparison is
+            // correct across the ~24.9-day TickCount wrap (no TickCount64 on net472).
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             int pollMs = 100;
             while (true)
             {
@@ -146,7 +148,7 @@ namespace Te1000Daemon
                     };
                 }
 
-                if (budget > 0 && (Environment.TickCount - start) >= budget)
+                if (budget > 0 && sw.ElapsedMilliseconds >= budget)
                 {
                     RecycleAsync();
                     return new WorkResult
@@ -185,11 +187,44 @@ namespace Te1000Daemon
         {
             lock (_lifecycleGate)
             {
-                try { _queue.CompleteAdding(); } catch { }
+                var oldQueue = _queue;
+                try { oldQueue.CompleteAdding(); } catch { }
                 Log.Write("ComWorker: recycling STA thread (abandoning stuck worker)");
+
+                // DRAIN the old queue and FAULT every still-pending WorkItem so any
+                // sibling caller waiting in Run() rejects with a clear error instead
+                // of hanging forever. The item currently executing on the abandoned
+                // STA thread is NOT in the queue (its caller already gets the
+                // timeout/dialog result that triggered this recycle); only the items
+                // still queued behind it need faulting here.
+                try
+                {
+                    WorkItem stuck;
+                    while (oldQueue.TryTake(out stuck))
+                    {
+                        if (stuck == null) continue;
+                        stuck.Result = new WorkResult
+                        {
+                            Ok = false,
+                            Kind = ErrorKind.ComError,
+                            Error = "Worker recycled (a sibling call wedged XAE); this queued call was abandoned. Retry."
+                        };
+                        try { stuck.Done.Set(); } catch { }
+                    }
+                }
+                catch (Exception ex) { Log.Error("ComWorker.RecycleAsync.drain", ex); }
+
                 var oldSession = _session;
                 StartThread();
-                // The new session will re-acquire DTE lazily on next use.
+                // The new session will re-acquire DTE lazily on next use. Only
+                // MarkStale (null the refs) here — do NOT Dispose/release the old
+                // session's COM proxies. Recycle fires because the abandoned STA
+                // thread is wedged INSIDE a COM call still holding the DTE/sysmgr
+                // RCWs; releasing those RCWs to zero from this (different) thread
+                // would race the in-flight call and could tear the proxy out from
+                // under it (AV), not fail benignly. The handful of leaked proxies
+                // per (rare) recycle is negligible vs. that hazard. Clean teardown
+                // still releases them via ComSession.Dispose on process shutdown.
                 try { if (oldSession != null) oldSession.MarkStale(); } catch { }
             }
         }
