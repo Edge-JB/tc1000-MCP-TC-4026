@@ -159,6 +159,25 @@ namespace Te1000Daemon
             }
         }
 
+        // Fire-and-forget: enqueue a job on the STA thread and return immediately.
+        // Used for background pre-warm — the caller does not wait for or read the
+        // result. Exceptions inside `job` are swallowed by the Pump and logged.
+        // If the worker is mid-recycle the add can race a CompleteAdding; that is
+        // benign (the job is simply dropped) and guarded.
+        public void EnqueueBackground(Func<Json.JObj> job)
+        {
+            if (_disposed) return;
+            try
+            {
+                lock (_lifecycleGate)
+                {
+                    var item = new WorkItem { Job = job };
+                    _queue.Add(item);
+                }
+            }
+            catch { /* queue completed/disposed — drop silently */ }
+        }
+
         // Abandon the (likely-stuck-in-a-modal-loop) STA thread and start a fresh
         // one. The old thread is a background thread so it dies with the process
         // if it ever unblocks; we simply stop feeding it.

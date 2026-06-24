@@ -13,10 +13,14 @@ namespace Te1000Daemon
             new Dictionary<string, ActionHandler>(StringComparer.Ordinal);
         private readonly ComWorker _worker;
         private readonly TreeCache _cache = new TreeCache();
+        private readonly EditWatcher _edits;
 
         public Dispatcher(ComWorker worker)
         {
             _worker = worker;
+            // EditWatcher resolves the CURRENT session lazily (it changes after a
+            // worker recycle), so pass a provider rather than a captured instance.
+            _edits = new EditWatcher(delegate { return _worker.Session; }, _cache);
             RegisterAll();
         }
 
@@ -92,7 +96,7 @@ namespace Te1000Daemon
 
             var result = _worker.Run(() =>
             {
-                var ctx = new ActionContext(action, payload, _worker.Session, _cache);
+                var ctx = new ActionContext(action, payload, _worker.Session, _cache, _edits);
                 Json.JObj data = handler(ctx);
                 return data ?? new Json.JObj();
             }, timeout);
@@ -101,6 +105,14 @@ namespace Te1000Daemon
             {
                 resp["ok"] = true;
                 resp["result"] = result.Data;
+                // After a successful solution open, re-arm the save-coverage
+                // FileSystemWatcher for the new project dir and kick a background
+                // corpus pre-warm so the first user search is already cache-warm.
+                // Both run on the STA worker; neither blocks this response.
+                if (action == "xae_open_solution")
+                {
+                    PostOpenSolution();
+                }
             }
             else
             {
@@ -110,6 +122,24 @@ namespace Te1000Daemon
                 if (result.Dialog != null) resp["dialog"] = result.Dialog.ToJson();
             }
             return resp;
+        }
+
+        // Background, fire-and-forget post-open work on the STA thread: re-arm the
+        // FileSystemWatcher and pre-warm the search text cache. Cancellable/safe if
+        // the solution closes (every COM access is wrapped and swallowed).
+        private void PostOpenSolution()
+        {
+            _worker.EnqueueBackground(delegate
+            {
+                try
+                {
+                    var ctx = new ActionContext("__prewarm", new Json.JObj(), _worker.Session, _cache, _edits);
+                    try { _edits.ReinitFileWatcher(); } catch (Exception ex) { Log.Error("EditWatcher.ReinitFileWatcher", ex); }
+                    try { PlcPouActions.PrewarmSearchCache(ctx); } catch (Exception ex) { Log.Error("PrewarmSearchCache", ex); }
+                }
+                catch (Exception ex) { Log.Error("PostOpenSolution", ex); }
+                return new Json.JObj();
+            });
         }
 
         // Build/activate/long-running actions may carry their own timeoutMs.

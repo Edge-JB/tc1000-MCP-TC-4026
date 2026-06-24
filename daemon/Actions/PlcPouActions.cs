@@ -92,6 +92,7 @@ namespace Te1000Daemon
 
             string parent = ctx.Payload.Str("parent");
             ctx.Cache.Invalidate(parent);
+            ctx.Cache.InvalidateEnum(); // structural: tree membership changed
 
             var data = new Json.JObj();
             data["parentPath"] = parent;
@@ -151,6 +152,7 @@ namespace Te1000Daemon
 
             string parent = ctx.Payload.Str("parent");
             ctx.Cache.Invalidate(parent);
+            ctx.Cache.InvalidateEnum(); // structural: tree membership changed
 
             var data = new Json.JObj();
             data["parentPath"] = parent;
@@ -262,6 +264,7 @@ namespace Te1000Daemon
 
             SaveIfRequested(ctx);
             ctx.Cache.Invalidate(parent);
+            ctx.Cache.InvalidateEnum(); // structural: imported objects changed membership
 
             var data = new Json.JObj();
             data["parent"] = parent;
@@ -1050,6 +1053,7 @@ namespace Te1000Daemon
             bool declOnly = ctx.Payload.Has("declOnly") ? ctx.Payload.Bool("declOnly") : false;
             bool implOnly = ctx.Payload.Has("implOnly") ? ctx.Payload.Bool("implOnly") : false;
             if (declOnly && implOnly) throw new BridgeException("declOnly and implOnly are mutually exclusive");
+            bool refresh = ctx.Payload.Has("refresh") ? ctx.Payload.Bool("refresh") : false;
 
             int maxResults = 500;
             if (ctx.Payload.Has("maxResults") && ctx.Payload["maxResults"] != null)
@@ -1070,23 +1074,50 @@ namespace Te1000Daemon
             // Validate the regex once up front so a bad pattern fails fast.
             FindMatchesInText("x", pattern, "decl", "", ignoreCase);
 
-            dynamic startNode = ctx.Cache.LookupItem(sm, startPath);
-            var objects = new List<CodeObject>();
-            CollectCodeObjects(sm, startPath, startNode, new HashSet<string>(StringComparer.Ordinal), objects);
+            // refresh:true forces a full re-pull for the searched scope (escape
+            // hatch for structural ops or paranoia): drop both the text cache and
+            // the enumeration cache so the walk and per-object reads are redone.
+            if (refresh)
+            {
+                ctx.Cache.InvalidateText(startPath);
+                ctx.Cache.InvalidateEnum();
+            }
+
+            // Enumeration: serve the flat descendant-path list from the enum cache
+            // when warm (ZERO COM tree-walk); otherwise do the COM walk ONCE and
+            // cache it. This is the dominant warm-search cost the text cache alone
+            // did not address.
+            List<string> paths = ctx.Cache.GetEnum(startPath);
+            if (paths == null)
+            {
+                dynamic startNode = ctx.Cache.LookupItem(sm, startPath);
+                var objects = new List<CodeObject>();
+                CollectCodeObjects(sm, startPath, startNode, new HashSet<string>(StringComparer.Ordinal), objects);
+                paths = new List<string>(objects.Count);
+                foreach (CodeObject o in objects) paths.Add(o.Path);
+                ctx.Cache.PutEnum(startPath, paths);
+            }
+
+            // Refresh the open-document set ONCE per search (TTL-gated) so the
+            // per-object dirty check is a cheap dictionary lookup, not a re-enum.
+            if (ctx.Edits != null)
+            {
+                try { ctx.Edits.RefreshOpenDocsIfStale(); } catch { }
+            }
 
             int scanned = 0;
             int searched = 0;
             var matches = new Json.JArr();
             bool truncated = false;
-            foreach (CodeObject obj in objects)
+            foreach (string objPath in paths)
             {
                 scanned++;
-                ObjectText txt = SelectPlcObjectText(obj.Item, declOnly, implOnly);
+                ObjectText txt = SelectPlcObjectTextCachedByPath(ctx, sm, objPath, declOnly, implOnly, refresh);
                 bool didSearch = false;
                 if (txt.HasDecl && !implOnly)
                 {
                     didSearch = true;
-                    foreach (Json.JObj m in FindMatchesInText(txt.Decl, pattern, "decl", obj.Path, ignoreCase))
+                    foreach (Json.JObj m in FindMatchesInText(txt.Decl, pattern, "decl", objPath, ignoreCase))
                     {
                         matches.Add(m);
                         if (matches.Count >= maxResults) { truncated = true; break; }
@@ -1095,7 +1126,7 @@ namespace Te1000Daemon
                 if (!truncated && txt.HasImpl && !declOnly)
                 {
                     didSearch = true;
-                    foreach (Json.JObj m in FindMatchesInText(txt.Impl, pattern, "impl", obj.Path, ignoreCase))
+                    foreach (Json.JObj m in FindMatchesInText(txt.Impl, pattern, "impl", objPath, ignoreCase))
                     {
                         matches.Add(m);
                         if (matches.Count >= maxResults) { truncated = true; break; }
@@ -1167,6 +1198,7 @@ namespace Te1000Daemon
 
             parent.DeleteChild(childName);
             ctx.Cache.Invalidate(parentPath);
+            ctx.Cache.InvalidateEnum(); // structural: object removed from tree
 
             var data = new Json.JObj();
             data["parent"] = parentPath;
@@ -1189,6 +1221,7 @@ namespace Te1000Daemon
             dynamic sm = ctx.SysManager();
             string newPath = ObjectRename(sm, path, newName);
             ctx.Cache.Invalidate(path);
+            ctx.Cache.InvalidateEnum(); // structural: path/leaf membership changed
 
             var data = new Json.JObj();
             data["path"] = path;
@@ -1228,6 +1261,7 @@ namespace Te1000Daemon
 
             ctx.Cache.Invalidate(splitInfo.Parent);
             ctx.Cache.Invalidate(newParent);
+            ctx.Cache.InvalidateEnum(); // structural: object moved to a new parent
 
             var data = new Json.JObj();
             data["path"] = path;
@@ -2195,28 +2229,127 @@ namespace Te1000Daemon
 
         private sealed class ObjectText { public bool HasDecl; public string Decl; public bool HasImpl; public string Impl; }
 
-        // Select-PlcObjectText (L2405-2440)
-        private static ObjectText SelectPlcObjectText(dynamic item, bool declOnly, bool implOnly)
+        // Read the FULL decl/impl text + impl language for a code object via COM
+        // (the ~3 typed gets that dominate search latency). Cached unfiltered so a
+        // single entry serves any decl/impl/declOnly/implOnly query later. Returns
+        // a TreeCache.TextEntry suitable for PutText.
+        private static TreeCache.TextEntry ReadFullObjectText(dynamic item)
+        {
+            var e = new TreeCache.TextEntry();
+            e.HasDecl = false; e.HasImpl = false; e.Language = null;
+            try { e.Decl = PouHelper.GetDeclaration((object)item); e.HasDecl = true; }
+            catch { e.HasDecl = false; }
+
+            object lang = null;
+            try { lang = PouHelper.GetImplementationLanguage((object)item); }
+            catch { lang = null; }
+            e.Language = lang;
+            if (lang != null && !IsGraphicalLanguage(lang))
+            {
+                try { e.Impl = PouHelper.GetImplementation((object)item); e.HasImpl = true; }
+                catch { e.HasImpl = false; }
+            }
+            return e;
+        }
+
+        // Project a cached full-text entry down to the requested decl/impl scope.
+        private static ObjectText ProjectObjectText(TreeCache.TextEntry e, bool declOnly, bool implOnly)
         {
             var res = new ObjectText();
-            res.HasDecl = false; res.HasImpl = false;
-            if (!implOnly)
-            {
-                try { res.Decl = PouHelper.GetDeclaration((object)item); res.HasDecl = true; }
-                catch { res.HasDecl = false; }
-            }
-            if (!declOnly)
-            {
-                object lang = null;
-                try { lang = PouHelper.GetImplementationLanguage((object)item); }
-                catch { lang = null; }
-                if (lang != null && !IsGraphicalLanguage(lang))
-                {
-                    try { res.Impl = PouHelper.GetImplementation((object)item); res.HasImpl = true; }
-                    catch { res.HasImpl = false; }
-                }
-            }
+            res.HasDecl = !implOnly && e.HasDecl;
+            if (res.HasDecl) res.Decl = e.Decl;
+            res.HasImpl = !declOnly && e.HasImpl;
+            if (res.HasImpl) res.Impl = e.Impl;
             return res;
+        }
+
+        // Cache-aware per-object text fetch used by Search. On a hit it returns the
+        // cached strings (sub-ms); on a miss it does the COM reads and populates
+        // the cache. CORRECTNESS GATE: for any object whose tree-path is in the
+        // current open-document set, re-check the editor's .Saved (busy-retry,
+        // rejected⇒dirty) and bypass+refresh the cache if dirty. `forceRefresh`
+        // (search refresh:true) always re-pulls live. Closed objects always serve
+        // from cache. Caller is on the STA worker thread.
+        private static ObjectText SelectPlcObjectTextCached(ActionContext ctx, dynamic item, string path,
+            bool declOnly, bool implOnly, bool forceRefresh)
+        {
+            TreeCache.TextEntry cached = forceRefresh ? null : ctx.Cache.GetText(path);
+            if (cached != null && ctx.Edits != null && ctx.Edits.IsOpen(path) && ctx.Edits.IsDirty(path))
+                cached = null; // open + dirty (or busy) → re-pull live
+
+            if (cached == null)
+            {
+                cached = ReadFullObjectText(item);
+                ctx.Cache.PutText(path, cached);
+            }
+            return ProjectObjectText(cached, declOnly, implOnly);
+        }
+
+        // Path-only variant used by Search's warm path. CRITICAL: on a full cache
+        // hit this resolves NO COM tree item — the item is lazily resolved via
+        // ctx.Cache.LookupItem ONLY on a text miss (or a dirty open doc, or
+        // forceRefresh). The open-doc gate is COM-free for closed objects
+        // (IsOpen = dict lookup) and only pays the .Saved COM read for the small
+        // set of actually-open documents. Caller is on the STA worker thread.
+        private static ObjectText SelectPlcObjectTextCachedByPath(ActionContext ctx, dynamic sm, string path,
+            bool declOnly, bool implOnly, bool forceRefresh)
+        {
+            TreeCache.TextEntry cached = forceRefresh ? null : ctx.Cache.GetText(path);
+            if (cached != null && ctx.Edits != null && ctx.Edits.IsOpen(path) && ctx.Edits.IsDirty(path))
+                cached = null; // open + dirty (or busy) → re-pull live
+
+            if (cached == null)
+            {
+                // Text miss / dirty / forceRefresh: NOW (and only now) pay the COM
+                // item resolution and full-text read.
+                dynamic item = ctx.Cache.LookupItem(sm, path);
+                cached = ReadFullObjectText(item);
+                ctx.Cache.PutText(path, cached);
+            }
+            return ProjectObjectText(cached, declOnly, implOnly);
+        }
+
+        // Background corpus pre-warm (Option 3). Walks the whole IEC project once
+        // on the STA thread, populating the text cache so the first user search is
+        // already warm. Fire-and-forget; every COM access tolerates the solution
+        // closing mid-walk. Skips objects already cached so a re-run is cheap.
+        public static void PrewarmSearchCache(ActionContext ctx)
+        {
+            dynamic sm;
+            try { sm = ctx.SysManager(); } catch { return; }
+
+            ProjectNode resolved;
+            try { resolved = GetPlcProjectNodePath(sm, null); }
+            catch { return; }
+            string startPath = resolved.ProjectPath;
+            try { PathUtil.AssertNotSafetyPath(startPath); } catch { return; }
+
+            dynamic startNode;
+            try { startNode = ctx.Cache.LookupItem(sm, startPath); }
+            catch { return; }
+
+            var objects = new List<CodeObject>();
+            try { CollectCodeObjects(sm, startPath, startNode, new HashSet<string>(StringComparer.Ordinal), objects); }
+            catch { return; }
+
+            // Populate the enum cache so the FIRST user search does no COM walk.
+            var paths = new List<string>(objects.Count);
+            foreach (CodeObject po in objects) paths.Add(po.Path);
+            ctx.Cache.PutEnum(startPath, paths);
+
+            int warmed = 0;
+            foreach (CodeObject obj in objects)
+            {
+                if (ctx.Cache.GetText(obj.Path) != null) continue;
+                try
+                {
+                    TreeCache.TextEntry e = ReadFullObjectText(obj.Item);
+                    ctx.Cache.PutText(obj.Path, e);
+                    warmed++;
+                }
+                catch { /* solution closing or transient COM — stop being greedy */ }
+            }
+            Log.Write("PrewarmSearchCache: warmed " + warmed + " of " + objects.Count + " code objects under " + startPath);
         }
 
         // ====================================================================

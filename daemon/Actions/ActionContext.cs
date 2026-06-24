@@ -11,15 +11,17 @@ namespace Te1000Daemon
         public readonly Json.JObj Payload;
         public readonly ComSession Session;
         public readonly TreeCache Cache;
+        public readonly EditWatcher Edits;
         public readonly string ProgId;
         public readonly string Mode;
 
-        public ActionContext(string action, Json.JObj payload, ComSession session, TreeCache cache)
+        public ActionContext(string action, Json.JObj payload, ComSession session, TreeCache cache, EditWatcher edits)
         {
             Action = action;
             Payload = payload ?? new Json.JObj();
             Session = session;
             Cache = cache;
+            Edits = edits;
             ProgId = Payload.Truthy("progId") ? Payload.Str("progId") : "TcXaeShell.DTE.17.0";
             Mode = Payload.Truthy("mode") ? Payload.Str("mode") : "active";
         }

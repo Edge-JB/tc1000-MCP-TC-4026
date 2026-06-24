@@ -76,6 +76,7 @@
     <Compile Include="ComSession.cs" />
     <Compile Include="DialogWatcher.cs" />
     <Compile Include="TreeCache.cs" />
+    <Compile Include="EditWatcher.cs" />
     <Compile Include="PathUtil.cs" />
     <Compile Include="ComHelpers.cs" />
     <Compile Include="PlcProjectHelper.cs" />
