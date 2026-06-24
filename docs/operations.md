@@ -3,6 +3,15 @@
 How `te1000-mcp` stays robust while driving a GUI engineering tool, and the safety model
 behind every guarded action. For the tool list see [tools.md](tools.md).
 
+> **Daemon vs. legacy.** The mechanisms below are described as the **legacy PowerShell bridge**
+> implements them (per-call `dialog-watch.ps1` + pre-flight gate). In the default **daemon**
+> mode the same logic runs **inside** `Te1000Daemon.exe` — the dialog watcher is an internal
+> thread (`DialogWatcher.cs`) reading the same `dialog-allowlist.json`, and a persistent modal
+> recycles the daemon's COM worker instead of killing a per-call process. The
+> agent-visible behavior (auto-dismiss, the "XAE is blocked on a modal dialog…" report, the
+> grace window) is identical. See [architecture.md](architecture.md). The safety/guard model
+> below applies to both paths.
+
 ## Why this matters
 
 Every bridge call drives XAE through a **synchronous DTE/COM call**. If that call causes XAE to

@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Te1000Daemon — persistent native COM bridge for the te1000 MCP.
+
+  Old-style (non-SDK) csproj so it builds with the in-box MSBuild v4
+  (C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe). No .NET SDK,
+  no NuGet, no internet required. Target net472 (the installed targeting pack);
+  the produced x64 exe runs on the net48 runtime too.
+
+  COM interop (EnvDTE/EnvDTE80/TCatSysManagerLib) is consumed late-bound via
+  `dynamic`, so we only need a hard reference to the typed TCatSysManagerLib for
+  the handful of vtable-only (IUnknown) interfaces that IDispatch cannot reach
+  (ITcPlcProject etc., mirroring the PS bridge's Te1000PlcProjectHelper).
+-->
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x64</Platform>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Te1000Daemon</RootNamespace>
+    <AssemblyName>Te1000Daemon</AssemblyName>
+    <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
+    <!-- The in-box compiler (Framework64\v4.0.30319\csc.exe) only supports C#5. -->
+    <LangVersion>5</LangVersion>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x64' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x64' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Xml" />
+    <Reference Include="System.Xml.Linq" />
+    <!-- Microsoft.CSharp is required for late-bound `dynamic` COM dispatch. -->
+    <Reference Include="Microsoft.CSharp" />
+    <!--
+      Typed TwinCAT System Manager interop. Only used for vtable-only IUnknown
+      interfaces (ITcPlcProject / ITcPlcIECProject(2) / ITcProjectRoot /
+      ITcSmTreeItem / ITcPlcTaskReference) that late-bound dynamic cannot QI.
+      EmbedInteropTypes lets us ship without a separate interop assembly.
+      Path is resolved from the TE2000 (HMI Engineering) install; adjust the
+      HintPath if TwinCAT lives elsewhere.
+    -->
+    <Reference Include="TCatSysManagerLib">
+      <HintPath>C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE2000-HMI-Engineering\VisualStudio\2022\TCatSysManagerLib.dll</HintPath>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="Json.cs" />
+    <Compile Include="Log.cs" />
+    <Compile Include="OleMessageFilter.cs" />
+    <Compile Include="ComWorker.cs" />
+    <Compile Include="ComSession.cs" />
+    <Compile Include="DialogWatcher.cs" />
+    <Compile Include="TreeCache.cs" />
+    <Compile Include="EditWatcher.cs" />
+    <Compile Include="PathUtil.cs" />
+    <Compile Include="ComHelpers.cs" />
+    <Compile Include="PlcProjectHelper.cs" />
+    <Compile Include="PipeServer.cs" />
+    <Compile Include="Dispatcher.cs" />
+    <Compile Include="Actions\ActionContext.cs" />
+    <Compile Include="Actions\XaeActions.cs" />
+    <Compile Include="Actions\TreeActions.cs" />
+    <Compile Include="Actions\LinkActions.cs" />
+    <Compile Include="Actions\PlcProjectActions.cs" />
+    <Compile Include="Actions\PlcPouActions.cs" />
+    <Compile Include="Actions\PlcLibraryActions.cs" />
+    <Compile Include="Actions\TaskActions.cs" />
+    <Compile Include="Actions\MappingRouteActions.cs" />
+    <Compile Include="Actions\FieldbusActions.cs" />
+    <Compile Include="Actions\ModuleCppActions.cs" />
+    <Compile Include="Actions\MeasurementActions.cs" />
+    <Compile Include="Actions\LicenseVariantActions.cs" />
+    <Compile Include="Actions\NcActions.cs" />
+    <Compile Include="Actions\SessionDownloadActions.cs" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
