@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [2.2.0] — 2026-06-24
 
+### Added
+- **Interactive watchdog resolution.** An un-allowlisted modal dialog is no longer
+  a dead-end: the blocked-call error now surfaces the dialog's title/text/buttons
+  and instructs the calling agent to **ask the user** which button to press and
+  whether to remember it. A new COM-free meta action **`xae dialog_resolve {button,
+  remember?}`** clicks the chosen button on the live dialog and, with
+  `remember:true`, appends an auto-dismiss rule to `dialog-allowlist.json` **and**
+  hot-applies it to the running watcher (no daemon restart). Destructive prompts
+  (activate config / run-mode / restart / download / boot project / TwinSAFE /
+  safety) are **refused for auto-remember** — the one-time human-chosen click still
+  happens, but no rule is persisted, and the response reports `rememberRefused`
+  with the reason. (`DialogWatcher.AddRule`/`HasRuleFor`/`AllowlistPath`,
+  `Dispatcher.dialog_resolve`.)
+
 ### Removed
 - **Legacy PowerShell COM bridge fallback removed.** Deleted
   `powershell/te1000-bridge.ps1`, `powershell/dialog-watch.ps1`, and the

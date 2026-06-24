@@ -388,6 +388,14 @@ would hang the MCP call and the calling agent indefinitely.
   daemon, so subsequent calls recover once the dialog is cleared. Detection is dialog-driven,
   not a wall-clock timeout, so long legitimate builds are never killed. The allowlist ships
   minimal and must never auto-answer Activate / Run-mode / restart / download / safety prompts.
+- **Interactive resolution.** When a dialog is *not* in the allowlist, the reported error tells
+  the agent to **ask the user** which button to press (and whether to remember it), then call
+  **`xae dialog_resolve {button, remember?}`**. That action clicks the chosen button on the live
+  dialog; with `remember:true` it appends an auto-dismiss rule to `dialog-allowlist.json` and
+  hot-applies it to the running watcher (no restart). Destructive prompts (activate / run-mode /
+  restart / download / boot project / TwinSAFE / safety) are **refused for auto-remember** — the
+  one-time chosen click still happens, but no rule is persisted (`rememberRefused` is reported).
+  Use `xae dialog_probe` (read-only) to inspect the current dialog first.
 - **PLC session control** (`powershell/plc-session.ps1`) uses UI Automation to read and toggle
   the Login/Logout state (the DTE Login/Logout commands are unreachable on the 64-bit shell).
   `plc_download` auto-logs-out first (by default) so deferred source edits compile before the

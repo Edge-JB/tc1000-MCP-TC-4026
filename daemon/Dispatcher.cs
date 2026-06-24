@@ -80,7 +80,7 @@ namespace Te1000Daemon
                 resp["ok"] = true;
                 var arr = new Json.JArr();
                 foreach (var k in _handlers.Keys) arr.Add(k);
-                arr.Add("ping"); arr.Add("list_actions"); arr.Add("dialog_probe");
+                arr.Add("ping"); arr.Add("list_actions"); arr.Add("dialog_probe"); arr.Add("dialog_resolve");
                 var data = new Json.JObj();
                 data["actions"] = arr;
                 data["count"] = arr.Count;
@@ -113,6 +113,15 @@ namespace Te1000Daemon
                 }
                 resp["result"] = data;
                 return resp;
+            }
+            // dialog_resolve: COM-free. Clicks a human-chosen button on the live
+            // modal dialog and (optionally, remember:true) appends an auto-dismiss
+            // rule to dialog-allowlist.json + hot-applies it to the running watcher.
+            // Destructive prompts are refused for auto-remember (the one-time click
+            // is still performed). Mirrors dialog_probe's plumbing (no STA hop).
+            if (action == "dialog_resolve")
+            {
+                return HandleDialogResolve(resp, request);
             }
 
             ActionHandler handler;
@@ -155,6 +164,282 @@ namespace Te1000Daemon
                 if (result.Dialog != null) resp["dialog"] = result.Dialog.ToJson();
             }
             return resp;
+        }
+
+        // dialog_resolve handler. COM-free; runs on the pipe thread (no STA hop),
+        // exactly like dialog_probe. Clicks a chosen button on the live modal and
+        // optionally remembers it (unless the prompt looks destructive).
+        private Json.JObj HandleDialogResolve(Json.JObj resp, Json.JObj request)
+        {
+            try
+            {
+                Json.JObj payload = request.Obj("payload") ?? new Json.JObj();
+                string button = payload.Str("button");
+                bool remember = payload.Bool("remember", false);
+
+                DialogWatcher w = _worker.Watcher;
+                if (w == null)
+                {
+                    resp["ok"] = false;
+                    resp["error"] = "dialog watcher disabled (daemon started with --no-watch)";
+                    resp["errorKind"] = "com_error";
+                    return resp;
+                }
+                if (string.IsNullOrEmpty(button))
+                {
+                    resp["ok"] = false;
+                    resp["error"] = "'button' is required for action=dialog_resolve";
+                    resp["errorKind"] = "com_error";
+                    return resp;
+                }
+
+                // Report-only probe — do NOT auto-dismiss; we click explicitly below.
+                DialogSnapshot snap = w.Probe(false);
+                if (!snap.Found)
+                {
+                    resp["ok"] = true;
+                    var none = new Json.JObj();
+                    none["resolved"] = false;
+                    none["reason"] = "no modal dialog is currently open";
+                    resp["result"] = none;
+                    return resp;
+                }
+
+                // Validate the requested button against the live dialog (case- and
+                // accelerator-insensitive). Reuse the exact label from the snapshot.
+                string want = NormalizeButton(button);
+                string matchedButton = null;
+                if (snap.Buttons != null)
+                {
+                    foreach (var b in snap.Buttons)
+                    {
+                        if (NormalizeButton(b) == want) { matchedButton = b; break; }
+                    }
+                }
+                if (matchedButton == null)
+                {
+                    resp["ok"] = false;
+                    string have = (snap.Buttons != null) ? string.Join(", ", snap.Buttons.ToArray()) : "";
+                    resp["error"] = "button '" + button + "' is not on the dialog. Buttons: " + (have.Length > 0 ? have : "(none detected)");
+                    resp["errorKind"] = "com_error";
+                    return resp;
+                }
+
+                string title = snap.Title ?? "";
+                string text = snap.Text ?? "";
+
+                // Destructive denylist: never auto-remember a prompt that activates
+                // config, changes run-mode, restarts/downloads/boots, or touches
+                // TwinSAFE/safety. The one-time human-chosen click still happens.
+                string hay = title + " " + text;
+                bool looksDestructive = System.Text.RegularExpressions.Regex.IsMatch(
+                    hay,
+                    @"activate.*config|run[\s-]*mode|restart|download|boot\s*project|twinsafe|safety|set.*run|reset.*twincat",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                // Perform the one-time click the human chose.
+                bool clicked = DlgWatch.Click(snap.Hwnd, matchedButton);
+
+                bool remembered = false;
+                bool rememberRefused = false;
+                string refuseReason = null;
+
+                if (remember)
+                {
+                    if (looksDestructive)
+                    {
+                        rememberRefused = true;
+                        refuseReason = "destructive prompt — left out of the auto-dismiss allowlist by policy; the click was performed once";
+                    }
+                    else if (w.HasRuleFor(title, text))
+                    {
+                        refuseReason = "already covered by an existing rule";
+                    }
+                    else
+                    {
+                        string escapedTitle = System.Text.RegularExpressions.Regex.Escape(title);
+                        bool appended = AppendAllowlistRule(w.AllowlistPath, escapedTitle, matchedButton);
+                        // Sync the running watcher's in-memory rules either way so it
+                        // auto-dismisses next time without a daemon restart.
+                        w.AddRule(escapedTitle, null, matchedButton);
+                        remembered = true;
+                        if (!appended)
+                            refuseReason = "rule applied in-memory but the allowlist file could not be updated (see daemon log)";
+                    }
+                }
+
+                resp["ok"] = true;
+                var data = new Json.JObj();
+                data["resolved"] = true;
+                data["clicked"] = clicked;
+                data["button"] = matchedButton;
+                data["remembered"] = remembered;
+                if (rememberRefused) data["rememberRefused"] = true;
+                if (refuseReason != null) data["refuseReason"] = refuseReason;
+                data["title"] = title;
+                resp["result"] = data;
+                return resp;
+            }
+            catch (Exception ex)
+            {
+                Log.Error("dialog_resolve", ex);
+                resp["ok"] = false;
+                resp["error"] = "dialog_resolve failed: " + ex.Message;
+                resp["errorKind"] = "com_error";
+                return resp;
+            }
+        }
+
+        // Lower-case, accelerator-stripped, trimmed button label for comparison.
+        private static string NormalizeButton(string s)
+        {
+            return (s ?? "").Replace("&", "").Trim().ToLowerInvariant();
+        }
+
+        // Append a literal-title rule to dialog-allowlist.json. Prefers a targeted
+        // insertion that preserves the file's hand-readable formatting; falls back
+        // to a parse->add->compact rewrite. Writes atomically. Returns true on
+        // success (file now contains valid JSON with the new rule).
+        private static bool AppendAllowlistRule(string path, string escapedTitle, string button)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) return false;
+                string original = System.IO.File.ReadAllText(path);
+
+                // Validate the current file parses and locate the rules array.
+                Json.JObj root = Json.ParseObject(original);
+                Json.JArr rules = root.Arr("rules");
+                if (rules == null) return false;
+
+                string newText = null;
+
+                // --- Targeted insertion (preserves formatting) -------------------
+                // Find the "rules": [ ... ] block, insert a new object line as the
+                // last element, fixing the previously-last element's trailing comma.
+                int rulesKey = original.IndexOf("\"rules\"", StringComparison.Ordinal);
+                if (rulesKey >= 0)
+                {
+                    int open = original.IndexOf('[', rulesKey);
+                    if (open >= 0)
+                    {
+                        int close = FindMatchingBracket(original, open);
+                        if (close > open)
+                        {
+                            // Detect the indentation of existing rule lines (the
+                            // first non-ws char on the line after '[').
+                            string indent = "    ";
+                            int lineStart = original.IndexOf('\n', open);
+                            if (lineStart >= 0)
+                            {
+                                int p = lineStart + 1;
+                                int ws = p;
+                                while (ws < original.Length && (original[ws] == ' ' || original[ws] == '\t')) ws++;
+                                if (ws > p) indent = original.Substring(p, ws - p);
+                            }
+
+                            string newRule = "{ \"match\": " + Json.Write(escapedTitle) + ", \"button\": " + Json.Write(button) + " }";
+
+                            // Inner content between [ and ] (exclusive).
+                            string before = original.Substring(0, open + 1);
+                            string inner = original.Substring(open + 1, close - open - 1);
+                            string after = original.Substring(close); // starts at ']'
+
+                            string trimmedInner = inner.TrimEnd();
+                            string sb;
+                            if (trimmedInner.Length == 0)
+                            {
+                                // Empty array.
+                                sb = before + "\n" + indent + newRule + "\n" + Indent(after, close, original);
+                            }
+                            else
+                            {
+                                // Append a comma to the last element, then our line.
+                                sb = before + trimmedInner + ",\n" + indent + newRule + "\n" + Indent(after, close, original);
+                            }
+                            newText = sb;
+                        }
+                    }
+                }
+
+                // --- Fallback: parse -> add -> compact rewrite -------------------
+                if (newText == null)
+                {
+                    var ro = new Json.JObj();
+                    ro["match"] = escapedTitle;
+                    ro["button"] = button;
+                    rules.Add(ro);
+                    newText = Json.Write(root);
+                }
+
+                // Re-parse to confirm we produced valid JSON before committing.
+                try { Json.ParseObject(newText); }
+                catch
+                {
+                    // Targeted insertion produced bad JSON — fall back to compact.
+                    Json.JObj root2 = Json.ParseObject(original);
+                    Json.JArr rules2 = root2.Arr("rules");
+                    if (rules2 == null) return false;
+                    var ro = new Json.JObj();
+                    ro["match"] = escapedTitle;
+                    ro["button"] = button;
+                    rules2.Add(ro);
+                    newText = Json.Write(root2);
+                    Json.ParseObject(newText); // throws if still bad
+                }
+
+                // Atomic write: temp file + replace.
+                string tmp = path + ".tmp";
+                System.IO.File.WriteAllText(tmp, newText, new System.Text.UTF8Encoding(false));
+                try { System.IO.File.Delete(path); } catch { }
+                System.IO.File.Move(tmp, path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Error("AppendAllowlistRule", ex);
+                return false;
+            }
+        }
+
+        // Recompute the closing-bracket portion's leading indentation: keep the ']'
+        // (and trailing content) exactly as in the original tail.
+        private static string Indent(string after, int closeIdx, string original)
+        {
+            // 'after' already begins at ']' — find the indentation that preceded it
+            // on its own line and prepend it so the bracket stays aligned.
+            int lineStart = original.LastIndexOf('\n', closeIdx);
+            string pad = "";
+            if (lineStart >= 0)
+            {
+                int p = lineStart + 1;
+                int ws = p;
+                while (ws < closeIdx && (original[ws] == ' ' || original[ws] == '\t')) ws++;
+                pad = original.Substring(p, ws - p);
+            }
+            return pad + after;
+        }
+
+        // Index of the ']' matching the '[' at openIdx, accounting for nested
+        // brackets and bracket chars inside JSON strings.
+        private static int FindMatchingBracket(string s, int openIdx)
+        {
+            int depth = 0;
+            bool inStr = false;
+            for (int i = openIdx; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (inStr)
+                {
+                    if (c == '\\') { i++; continue; }
+                    if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"') { inStr = true; continue; }
+                if (c == '[') depth++;
+                else if (c == ']') { depth--; if (depth == 0) return i; }
+            }
+            return -1;
         }
 
         // Background, fire-and-forget post-open work on the STA thread: re-arm the

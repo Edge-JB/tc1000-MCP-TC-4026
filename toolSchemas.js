@@ -66,13 +66,14 @@ const XAE_ACTIONS = {
   clear_error_list: "xae_clear_error_list",
   list_commands: "xae_list_commands",
   dialog_probe: "dialog_probe",
+  dialog_resolve: "dialog_resolve",
 };
 
 // --- The tool schemas, keyed by tool name. Each entry is the EXACT config object
 // (description + zod inputSchema raw shape) that registerTool consumes. ----------
 const toolSchemas = {
   xae: {
-    description: "XAE shell: status, open_solution (solutionPath; closeExisting:true reopens, discardChanges:true closes the current solution WITHOUT saving before reopening), save_all, active_document, selected_items, error_list, clear_error_list, list_commands (filter regex, limit), dialog_probe (read-only: is a modal dialog blocking XAE right now? returns its title/text/buttons; never clicks anything).",
+    description: "XAE shell: status, open_solution (solutionPath; closeExisting:true reopens, discardChanges:true closes the current solution WITHOUT saving before reopening), save_all, active_document, selected_items, error_list, clear_error_list, list_commands (filter regex, limit), dialog_probe (read-only: is a modal dialog blocking XAE right now? returns its title/text/buttons; never clicks anything), dialog_resolve (button, remember) — click a chosen button on the live modal dialog and optionally remember it in the allowlist; pair with dialog_probe. Destructive prompts (activate/restart/download/safety) are refused for auto-remember (the click still happens once).",
     inputSchema: {
       action: z.enum(Object.keys(XAE_ACTIONS)),
       solutionPath: z.string().optional(),
@@ -80,6 +81,8 @@ const toolSchemas = {
       discardChanges: z.boolean().optional(),
       filter: z.string().optional(),
       limit: z.number().int().positive().max(5000).optional(),
+      button: z.string().optional(),
+      remember: z.boolean().optional(),
       mode: z.enum(["active", "activeOrCreate", "create"]).optional().describe("DTE attach mode; default active (open_solution: activeOrCreate)"),
     },
   },

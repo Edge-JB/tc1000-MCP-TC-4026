@@ -191,14 +191,20 @@ function toError(action, resp) {
   const btns = Array.isArray(d.buttons) && d.buttons.length
     ? d.buttons.map((b) => `[${b}]`).join(" ") : "(none detected)";
   if (kind === "dialog_blocked") {
+    const labels = Array.isArray(d.buttons) && d.buttons.length
+      ? d.buttons.map((b) => `'${b}'`).join(", ") : "(none detected)";
     return new Error(
       `XAE is blocked on a modal dialog, so this '${action}' call cannot complete.\n` +
+      `This dialog is NOT in the auto-dismiss allowlist (dialog-allowlist.json).\n` +
       `  Title:   ${d.title || "(untitled)"}\n` +
       `  Message: ${d.text || "(no text)"}\n` +
       `  Buttons: ${btns}\n` +
-      `The dialog is still open on the machine — clear it there, or add a rule to ` +
-      `dialog-allowlist.json to auto-dismiss this dialog next time. ` +
-      `The operation's result is indeterminate.`,
+      `ASK THE USER which button to press and whether to remember it (add to the ` +
+      `allowlist so this dialog is auto-dismissed next time). The choices are: ${labels}.\n` +
+      `Then call the 'xae' tool with action 'dialog_resolve', e.g. ` +
+      `{action:'dialog_resolve', button:'No', remember:false}. ` +
+      `(remember:true persists a rule, but destructive prompts — activate/restart/download/safety — are refused for auto-remember.) ` +
+      `The operation's result is indeterminate until the dialog is cleared.`,
     );
   }
   if (kind === "timeout") {

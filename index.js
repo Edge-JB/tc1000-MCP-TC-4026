@@ -105,6 +105,16 @@ function prune(v) {
 
 function textResult(data) {
   if (data && typeof data === "object") {
+    if ("resolved" in data) {
+      if (data.resolved === false) return text(`no modal dialog open (${data.reason || "nothing to resolve"})`);
+      const lines = [
+        `${data.clicked ? "clicked" : "FAILED to click"} [${data.button}] on "${data.title || ""}"`,
+      ];
+      if (data.remembered) lines.push("remembered: added an auto-dismiss rule to dialog-allowlist.json (hot-applied to the watcher)");
+      else if (data.rememberRefused) lines.push(`NOT remembered: ${data.refuseReason || "destructive prompt refused for auto-remember"}`);
+      else if (data.refuseReason) lines.push(`NOT remembered: ${data.refuseReason}`);
+      return text(lines.join("\n"));
+    }
     if ("watching" in data && "found" in data) {
       if (!data.watching) return text("dialog watcher is disabled (daemon started with --no-watch)");
       if (!data.found) return text("no modal dialog open in XAE");
@@ -140,12 +150,12 @@ function need(params, keys, action) {
   }
 }
 
-const server = new McpServer({ name: "te1000-mcp", version: "2.1.2" });
+const server = new McpServer({ name: "te1000-mcp", version: "2.2.0" });
 
 server.registerTool(
   "xae",
   toolSchemas.xae,
-  async ({ action, solutionPath, closeExisting, discardChanges, filter, limit, mode }) => {
+  async ({ action, solutionPath, closeExisting, discardChanges, filter, limit, button, remember, mode }) => {
     const payload = { mode };
     if (action === "open_solution") {
       need({ solutionPath }, ["solutionPath"], action);
@@ -153,6 +163,10 @@ server.registerTool(
     }
     if (action === "list_commands") Object.assign(payload, { filter, limit });
     if (action === "error_list") payload.limit = limit;
+    if (action === "dialog_resolve") {
+      need({ button }, ["button"], action);
+      Object.assign(payload, { button, remember: remember === true });
+    }
     return textResult(await bridgeCall(XAE_ACTIONS[action], payload));
   },
 );
