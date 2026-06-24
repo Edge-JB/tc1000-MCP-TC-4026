@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0] — Unreleased (branch `feat/csharp-daemon`)
+## [2.1.0] — 2026-06-24
 
 A **persistent native C#/.NET daemon** replaces the per-call `powershell.exe` spawn
 model for the hot path. The daemon acquires the DTE + `ITcSysManager` **once**,
@@ -132,5 +132,6 @@ nearly the entire automatable TE1000 surface.
   `ProduceXml`/`ConsumeXml`, variable linking, NetId targeting, rescans, NC inspection, and
   guarded activate/restart/download.
 
+[2.1.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases/tag/v2.1.0
 [2.0.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases
 [1.0.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases
