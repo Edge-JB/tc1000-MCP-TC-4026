@@ -482,10 +482,14 @@ namespace Te1000Daemon
         private static ErrorListResult ReadErrorList(ActionContext ctx, int limit, out string error)
         {
             error = null;
-            object rawDte = ctx.Dte(true);
-            IntPtr pUnk = Marshal.GetIUnknownForObject(rawDte);
+            IntPtr pUnk = IntPtr.Zero;
             try
             {
+                // Acquire the DTE inside the try so a dead/absent XAE (ctx.Dte
+                // throws) takes the graceful {available:false, error:...} path
+                // instead of escaping as a hard com_error.
+                object rawDte = ctx.Dte(true);
+                pUnk = Marshal.GetIUnknownForObject(rawDte);
                 EnvDTE80.DTE2 dte = (EnvDTE80.DTE2)Marshal.GetTypedObjectForIUnknown(pUnk, typeof(EnvDTE80.DTE2));
 
                 try { dte.ExecuteCommand("View.ErrorList", " "); }

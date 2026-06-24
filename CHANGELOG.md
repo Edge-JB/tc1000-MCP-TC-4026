@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format is based on
   like the PS bridge's `XaeErrorListProbe`, and again returns the live error/warning
   list. The broad `catch → null` that masked the failure now surfaces the actual
   exception in an `error` field (rendered as `error list unavailable: <reason>`).
+  DTE acquisition (`ctx.Dte` / `GetIUnknownForObject`) is now inside the guarded
+  block, so a dead/absent XAE takes the graceful `{available:false, error:…}`
+  path instead of escaping as a hard `com_error`.
 - Added typed `EnvDTE` / `EnvDTE80` / `Microsoft.VisualStudio.Interop` references
   (resolved at runtime from the TcXaeShell `PublicAssemblies` dir by the new
   `VsInterop` AssemblyResolve handler — not copied local, not GAC-dependent), for
