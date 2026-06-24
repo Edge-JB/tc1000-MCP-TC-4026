@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] — 2026-06-24
+
+### Fixed
+- **`xae error_list` always reported "error list unavailable".** The 2.1.0 daemon
+  port read the Error List through raw IDispatch late binding
+  (`dynamic dte.ToolWindows.ErrorList`), which returns **null** on TcXaeShell —
+  `EnvDTE80.ToolWindows.get_ErrorList` is not reachable that way. `ReadErrorList`
+  now uses the **strongly-typed `DTE2`** cast (`GetTypedObjectForIUnknown`), exactly
+  like the PS bridge's `XaeErrorListProbe`, and again returns the live error/warning
+  list. The broad `catch → null` that masked the failure now surfaces the actual
+  exception in an `error` field (rendered as `error list unavailable: <reason>`).
+  DTE acquisition (`ctx.Dte` / `GetIUnknownForObject`) is now inside the guarded
+  block, so a dead/absent XAE takes the graceful `{available:false, error:…}`
+  path instead of escaping as a hard `com_error`.
+- Added typed `EnvDTE` / `EnvDTE80` / `Microsoft.VisualStudio.Interop` references
+  (resolved at runtime from the TcXaeShell `PublicAssemblies` dir by the new
+  `VsInterop` AssemblyResolve handler — not copied local, not GAC-dependent), for
+  the DTE members raw IDispatch cannot reach. Mirrors the existing typed
+  `TCatSysManagerLib` reference for vtable-only interfaces.
+
 ## [2.1.0] — 2026-06-24
 
 A **persistent native C#/.NET daemon** replaces the per-call `powershell.exe` spawn

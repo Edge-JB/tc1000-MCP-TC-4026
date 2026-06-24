@@ -16,6 +16,10 @@ namespace Te1000Daemon
         [STAThread]
         private static int Main(string[] args)
         {
+            // Install the EnvDTE PIA resolver before any typed-DTE handler is
+            // JIT-compiled (the AssemblyResolve hook is AppDomain-wide).
+            VsInterop.EnsureResolver();
+
             string pipeName = "te1000-mcp";
             bool watch = true;
             bool autoDismiss = true;

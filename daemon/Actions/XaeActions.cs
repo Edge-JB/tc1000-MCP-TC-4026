@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace Te1000Daemon
 {
@@ -355,13 +356,15 @@ namespace Te1000Daemon
             int limit = 200;
             if (ctx.Payload.Has("limit")) limit = ctx.Payload.Int("limit", 200);
 
-            ErrorListResult result = ReadErrorList(ctx, limit);
+            string error;
+            ErrorListResult result = ReadErrorList(ctx, limit, out error);
             if (result == null)
             {
                 var unavailable = new Json.JObj();
                 unavailable["available"] = false;
                 unavailable["count"] = 0;
                 unavailable["items"] = new Json.JArr();
+                if (!string.IsNullOrEmpty(error)) unavailable["error"] = error;
                 return unavailable;
             }
 
@@ -460,48 +463,61 @@ namespace Te1000Daemon
         }
 
         // ---- error-list reading (port of XaeErrorListProbe, bridge L205-260) -
-        // Reads the DTE ToolWindows ErrorList via late-bound dynamic. Returns null
-        // on any failure / when the error list is not reachable (matches the PS
-        // {available:false} path). Item key order matches the PS handler at
-        // L3935-3942: description, fileName, line, column, project, errorLevel.
+        // Reads the DTE ToolWindows ErrorList through the STRONGLY-TYPED DTE2 cast,
+        // exactly like the PS bridge's XaeErrorListProbe. Raw IDispatch late
+        // binding (`dynamic dte.ToolWindows.ErrorList`) returns NULL on TcXaeShell
+        // — EnvDTE80.ToolWindows.get_ErrorList is not reachable that way — so the
+        // earlier dynamic port always reported the list "unavailable". The typed
+        // cast (GetTypedObjectForIUnknown → DTE2) returns a live ErrorList. The
+        // EnvDTE PIAs are loaded at runtime by VsInterop. Returns null + an error
+        // string on failure (matches the PS {available:false} path). Item key order
+        // matches the PS handler at L3935-3942: description, fileName, line, column,
+        // project, errorLevel.
         private sealed class ErrorListResult
         {
             public int TotalCount;
             public Json.JArr Items;
         }
 
-        private static ErrorListResult ReadErrorList(ActionContext ctx, int limit)
+        private static ErrorListResult ReadErrorList(ActionContext ctx, int limit, out string error)
         {
+            error = null;
+            IntPtr pUnk = IntPtr.Zero;
             try
             {
-                dynamic dte = ctx.Dte(true);
+                // Acquire the DTE inside the try so a dead/absent XAE (ctx.Dte
+                // throws) takes the graceful {available:false, error:...} path
+                // instead of escaping as a hard com_error.
+                object rawDte = ctx.Dte(true);
+                pUnk = Marshal.GetIUnknownForObject(rawDte);
+                EnvDTE80.DTE2 dte = (EnvDTE80.DTE2)Marshal.GetTypedObjectForIUnknown(pUnk, typeof(EnvDTE80.DTE2));
+
                 try { dte.ExecuteCommand("View.ErrorList", " "); }
                 catch { }
                 System.Threading.Thread.Sleep(1000);
 
-                dynamic errorList = ComHelpers.Safe<dynamic>(delegate() { return dte.ToolWindows.ErrorList; });
-                if (errorList == null) return null;
+                EnvDTE80.ErrorList errorList = dte.ToolWindows.ErrorList;
+                if (errorList == null) { error = "ToolWindows.ErrorList returned null"; return null; }
 
                 try { errorList.ShowErrors = true; } catch { }
                 try { errorList.ShowWarnings = true; } catch { }
                 try { errorList.ShowMessages = true; } catch { }
 
-                dynamic errorItems = errorList.ErrorItems;
-                int totalCount = (int)errorItems.Count;
+                EnvDTE80.ErrorItems errorItems = errorList.ErrorItems;
+                int totalCount = errorItems.Count;
                 int returnedCount = totalCount < limit ? totalCount : limit;
 
                 var items = new Json.JArr();
                 for (int i = 1; i <= returnedCount; i++)
                 {
-                    dynamic item = errorItems.Item(i);
-                    dynamic it = item;
+                    EnvDTE80.ErrorItem item = errorItems.Item(i);
                     var o = new Json.JObj();
-                    o["description"] = ComHelpers.SafeStr(delegate() { return it.Description; });
-                    o["fileName"] = ComHelpers.SafeStr(delegate() { return it.FileName; });
-                    o["line"] = NullableInt(delegate() { return it.Line; });
-                    o["column"] = NullableInt(delegate() { return it.Column; });
-                    o["project"] = ComHelpers.SafeStr(delegate() { return it.Project; });
-                    o["errorLevel"] = ComHelpers.SafeStr(delegate() { return it.ErrorLevel; });
+                    o["description"] = ComHelpers.SafeStr(delegate() { return item.Description; });
+                    o["fileName"] = ComHelpers.SafeStr(delegate() { return item.FileName; });
+                    o["line"] = NullableInt(delegate() { return item.Line; });
+                    o["column"] = NullableInt(delegate() { return item.Column; });
+                    o["project"] = ComHelpers.SafeStr(delegate() { return item.Project; });
+                    o["errorLevel"] = ComHelpers.SafeStr(delegate() { return item.ErrorLevel; });
                     items.Add(o);
                 }
 
@@ -510,9 +526,15 @@ namespace Te1000Daemon
                 result.Items = items;
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
+                error = ex.GetType().Name + ": " + ex.Message;
+                Log.Error("ReadErrorList failed", ex);
                 return null;
+            }
+            finally
+            {
+                if (pUnk != IntPtr.Zero) Marshal.Release(pUnk);
             }
         }
 

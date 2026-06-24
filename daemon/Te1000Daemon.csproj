@@ -29,6 +29,17 @@
     <PlatformTarget>x64</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
   </PropertyGroup>
+  <!--
+    TcXaeShell PublicAssemblies dir, resolved like build.ps1's TCatSysManagerLib
+    probe (64-bit install first, then x86). Supplies the EnvDTE / EnvDTE80 /
+    Microsoft.VisualStudio.Interop reference metadata at compile time; at runtime
+    the assemblies are loaded from this same dir by VsInterop's AssemblyResolve
+    handler (they are not copied local / not in a reachable GAC view).
+  -->
+  <PropertyGroup>
+    <XaePublicAssemblies Condition="'$(XaePublicAssemblies)' == '' And Exists('C:\Program Files\Beckhoff\TcXaeShell\Common7\IDE\PublicAssemblies\envdte80.dll')">C:\Program Files\Beckhoff\TcXaeShell\Common7\IDE\PublicAssemblies</XaePublicAssemblies>
+    <XaePublicAssemblies Condition="'$(XaePublicAssemblies)' == '' And Exists('C:\Program Files (x86)\Beckhoff\TcXaeShell\Common7\IDE\PublicAssemblies\envdte80.dll')">C:\Program Files (x86)\Beckhoff\TcXaeShell\Common7\IDE\PublicAssemblies</XaePublicAssemblies>
+  </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x64' ">
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
@@ -66,9 +77,33 @@
       <EmbedInteropTypes>true</EmbedInteropTypes>
       <Private>false</Private>
     </Reference>
+    <!--
+      Typed EnvDTE interop for the handful of DTE members that raw IDispatch
+      late binding cannot reach. ToolWindows.ErrorList returns NULL through
+      late-bound `dynamic` on TcXaeShell, but a non-null typed ErrorList through
+      the strongly-typed DTE2 cast (see VsInterop / XaeActions.ReadErrorList).
+      NOT embedded (DTE2 is type-forwarded to Microsoft.VisualStudio.Interop) and
+      NOT copied local; loaded at runtime by VsInterop from $(XaePublicAssemblies).
+    -->
+    <Reference Include="EnvDTE">
+      <HintPath>$(XaePublicAssemblies)\envdte.dll</HintPath>
+      <SpecificVersion>false</SpecificVersion>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="EnvDTE80">
+      <HintPath>$(XaePublicAssemblies)\envdte80.dll</HintPath>
+      <SpecificVersion>false</SpecificVersion>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.VisualStudio.Interop">
+      <HintPath>$(XaePublicAssemblies)\Microsoft.VisualStudio.Interop.dll</HintPath>
+      <SpecificVersion>false</SpecificVersion>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Program.cs" />
+    <Compile Include="VsInterop.cs" />
     <Compile Include="Json.cs" />
     <Compile Include="Log.cs" />
     <Compile Include="OleMessageFilter.cs" />

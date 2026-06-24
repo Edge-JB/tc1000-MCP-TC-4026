@@ -360,7 +360,7 @@ function textResult(data) {
     if (typeof data.xml === "string") return text(data.xml); // raw XML beats JSON-escaped XML
     if (Array.isArray(data.commands)) return text(`${data.count} commands\n${data.commands.join("\n")}`);
     if (Array.isArray(data.items) && "available" in data) {
-      if (!data.available) return text("error list unavailable");
+      if (!data.available) return text(data.error ? `error list unavailable: ${data.error}` : "error list unavailable");
       const lines = data.items.map((it) =>
         `${it.errorLevel || "?"}  ${it.fileName || ""}(${it.line ?? ""}): ${it.description || ""}${it.project ? ` [${it.project}]` : ""}`);
       return text([`${data.returned}/${data.count} items`, ...lines].join("\n"));
@@ -376,7 +376,7 @@ function need(params, keys, action) {
   }
 }
 
-const server = new McpServer({ name: "te1000-mcp", version: "2.1.0" });
+const server = new McpServer({ name: "te1000-mcp", version: "2.1.1" });
 
 server.registerTool(
   "xae",
