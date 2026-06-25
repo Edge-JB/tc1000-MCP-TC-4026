@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] — 2026-06-25
+
+Token-compression pass from an empirical audit of 261 real calls. Every change
+keeps full data reachable via an explicit opt-in; **no capability was removed**.
+
+### Changed
+- **`tc_pou`/`plc_pou` search `maxResults` default 500 → 50.** Most name lookups
+  return well under 50 matches; `truncated:true` + `count` already signal when the
+  cap is hit, and the 5000 ceiling is unchanged. The zod schema now carries a
+  machine-readable `.default(50)` so `tools/list` self-documents it.
+- **Batch roll-ups are failures-only by default.** `tc_link` link_batch/unlink_batch
+  and `plc_pou` create_batch/create_folder_batch/set_decl_batch/set_impl_batch now
+  return `{count, succeeded, failed}` plus **only the failed rows**; pass
+  **`details:true`** for every row (create_batch ok-rows still carry child identity).
+- **Single `tc_link link` and `resolve` are compact on success.** `link` drops the
+  `producerResolution`/`consumerResolution` blobs (the resolved paths are already in
+  `producer`/`consumer`); `resolve` drops the `attempts[]` permutation array. Pass
+  **`verbose:true`** to restore the full shape; failures always keep full detail.
+- **`xae error_list` default cap 200 → 50**, and a new **`severityFilter`**
+  (`all`|`errors`|`warnings`) trims by severity **before** the cap, so an
+  errors-only query is never starved by a leading warning flood. `count` still
+  reports the true matching total. (`list_commands` limit of 250 is unchanged.)
+- **Tool descriptions tightened** (`toolSchemas.js`) to cut the per-session schema
+  tax: cheap-first READ/DISCOVER steering on `plc_pou`, factored boilerplate, and
+  removed implementation-detail noise — every operational landmine preserved.
+
+### Added
+- **`plc_library scan` `filter`** — an optional case-insensitive substring on the
+  library name, applied before building the result, so a targeted scan returns a
+  couple of rows instead of the full installed-library catalogue.
+- **Large-read hint.** A full `get_decl`/`get_impl` read over 80 lines appends a
+  `hint` nudging the next call to slice with `range{}`/`grep{}`. Full text is still
+  returned.
+- **Self-correcting `plc_pou find` error** with concrete examples when neither
+  `name` nor `typeFilter` is supplied.
+
 ## [2.2.0] — 2026-06-24
 
 ### Added

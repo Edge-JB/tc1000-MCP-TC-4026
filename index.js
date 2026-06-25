@@ -155,7 +155,7 @@ function need(params, keys, action) {
   }
 }
 
-const server = new McpServer({ name: "te1000-mcp", version: "2.2.0" });
+const server = new McpServer({ name: "te1000-mcp", version: "2.3.0" });
 
 server.registerTool(
   "xae",
