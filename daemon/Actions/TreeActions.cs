@@ -167,7 +167,20 @@ namespace Te1000Daemon
             if (string.IsNullOrWhiteSpace(variablePath)) throw new BridgeException("variablePath is required");
 
             dynamic sm = ctx.SysManager();
-            return ResolveVariablePathData(ctx, sm, variablePath);
+            Json.JObj full = ResolveVariablePathData(ctx, sm, variablePath);
+            // R5: on success the attempts[] permutation array is diagnostic noise —
+            // drop it unless verbose. Keep it on failure (needed to diagnose) so the
+            // caller can see which candidates were tried.
+            bool verbose = ctx.Payload.Has("verbose") && ctx.Payload.Bool("verbose");
+            if (!verbose && full.Bool("resolved"))
+            {
+                var compact = new Json.JObj();
+                compact["originalPath"] = full["originalPath"];
+                compact["resolvedPath"] = full["resolvedPath"];
+                compact["resolved"] = true;
+                return compact;
+            }
+            return full;
         }
 
         private static Json.JObj ResolveVariablePathData(ActionContext ctx, dynamic sm, string variablePath)

@@ -37,6 +37,18 @@ namespace Te1000Daemon
 
             dynamic sm = ctx.SysManager();
             Json.JObj result = LinkVariablesCore(ctx, sm, producer, consumer, autoResolve);
+            // R5: producer/consumer in the result ARE the resolved paths, so the
+            // producerResolution/consumerResolution blobs are redundant on success.
+            // Drop them unless verbose. Failures throw (never reach here).
+            bool verbose = ctx.Payload.Has("verbose") && ctx.Payload.Bool("verbose");
+            if (!verbose && result.Bool("linked"))
+            {
+                var compact = new Json.JObj();
+                compact["producer"] = result["producer"];
+                compact["consumer"] = result["consumer"];
+                compact["linked"] = true;
+                return compact;
+            }
             return result;
         }
 
@@ -102,7 +114,9 @@ namespace Te1000Daemon
             data["count"] = links.Count;
             data["succeeded"] = succeeded;
             data["failed"] = failed;
-            data["results"] = results;
+            // R4: failures-only by default (drop the ok:true resolvedA/resolvedB
+            // echo); details:true restores every row. Counters always reported.
+            data["results"] = FilterBatchRows(results, ctx.Payload);
             if (save)
             {
                 bool saved = false;
@@ -111,6 +125,22 @@ namespace Te1000Daemon
                 data["saved"] = saved;
             }
             return data;
+        }
+
+        // R4 helper (mirrors PlcPouActions.FilterBatchRows): keep only ok:false rows
+        // unless details:true. tc_link batches build their rollup inline, so this
+        // lives here too rather than reaching across action classes.
+        private static Json.JArr FilterBatchRows(Json.JArr results, Json.JObj payload)
+        {
+            bool details = payload != null && payload.Has("details") && payload.Bool("details");
+            if (details) return results;
+            var failures = new Json.JArr();
+            foreach (object o in results)
+            {
+                Json.JObj row = o as Json.JObj;
+                if (row != null && !row.Bool("ok", true)) failures.Add(row);
+            }
+            return failures;
         }
 
         // --- twincat_unlink_variables (L4606-4631) ---------------------------
@@ -201,7 +231,7 @@ namespace Te1000Daemon
             data["count"] = links.Count;
             data["succeeded"] = succeeded;
             data["failed"] = failed;
-            data["results"] = results;
+            data["results"] = FilterBatchRows(results, ctx.Payload); // R4: failures-only unless details:true
             if (save)
             {
                 bool saved = false;

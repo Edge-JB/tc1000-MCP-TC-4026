@@ -353,11 +353,16 @@ namespace Te1000Daemon
         // xae_get_error_list (L3914-3954) + XaeErrorListProbe (L205-260).
         private static Json.JObj XaeGetErrorList(ActionContext ctx)
         {
-            int limit = 200;
-            if (ctx.Payload.Has("limit")) limit = ctx.Payload.Int("limit", 200);
+            // R6: error_list-specific default lowered 200 -> 50 (build-error floods
+            // collapse; count still reports the true total). severityFilter trims to
+            // errors/warnings BEFORE the cap so an errors-only query is never starved
+            // by a leading warning flood.
+            int limit = 50;
+            if (ctx.Payload.Has("limit")) limit = ctx.Payload.Int("limit", 50);
+            string severityFilter = ctx.Payload.Has("severityFilter") ? ctx.Payload.Str("severityFilter") : "all";
 
             string error;
-            ErrorListResult result = ReadErrorList(ctx, limit, out error);
+            ErrorListResult result = ReadErrorList(ctx, limit, severityFilter, out error);
             if (result == null)
             {
                 var unavailable = new Json.JObj();
@@ -479,7 +484,19 @@ namespace Te1000Daemon
             public Json.JArr Items;
         }
 
-        private static ErrorListResult ReadErrorList(ActionContext ctx, int limit, out string error)
+        // R6: ErrorLevel serializes as the strings "vsBuildErrorLevelHigh"/"Medium"/
+        // "Low" (High = error, Medium = warning, Low = message) — NOT "Error". Match
+        // on "High" so an errors-only filter actually catches errors.
+        private static bool SeverityMatches(string level, string filter)
+        {
+            if (string.IsNullOrEmpty(filter) || filter == "all") return true;
+            bool isError = level != null && level.IndexOf("High", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (filter == "errors") return isError;
+            if (filter == "warnings") return !isError; // Medium (warning) + Low (message)
+            return true;
+        }
+
+        private static ErrorListResult ReadErrorList(ActionContext ctx, int limit, string severityFilter, out string error)
         {
             error = null;
             IntPtr pUnk = IntPtr.Zero;
@@ -504,25 +521,32 @@ namespace Te1000Daemon
                 try { errorList.ShowMessages = true; } catch { }
 
                 EnvDTE80.ErrorItems errorItems = errorList.ErrorItems;
-                int totalCount = errorItems.Count;
-                int returnedCount = totalCount < limit ? totalCount : limit;
+                int rawCount = errorItems.Count;
 
+                // R6: walk ALL items, apply the severity filter first, count every
+                // match (matchedTotal), but only collect up to `limit` rows. This
+                // makes count reflect the true matching total while capping payload.
+                int matchedTotal = 0;
                 var items = new Json.JArr();
-                for (int i = 1; i <= returnedCount; i++)
+                for (int i = 1; i <= rawCount; i++)
                 {
                     EnvDTE80.ErrorItem item = errorItems.Item(i);
+                    string level = ComHelpers.SafeStr(delegate() { return item.ErrorLevel; });
+                    if (!SeverityMatches(level, severityFilter)) continue;
+                    matchedTotal++;
+                    if (items.Count >= limit) continue; // keep counting, stop collecting
                     var o = new Json.JObj();
                     o["description"] = ComHelpers.SafeStr(delegate() { return item.Description; });
                     o["fileName"] = ComHelpers.SafeStr(delegate() { return item.FileName; });
                     o["line"] = NullableInt(delegate() { return item.Line; });
                     o["column"] = NullableInt(delegate() { return item.Column; });
                     o["project"] = ComHelpers.SafeStr(delegate() { return item.Project; });
-                    o["errorLevel"] = ComHelpers.SafeStr(delegate() { return item.ErrorLevel; });
+                    o["errorLevel"] = level;
                     items.Add(o);
                 }
 
                 ErrorListResult result = new ErrorListResult();
-                result.TotalCount = totalCount;
+                result.TotalCount = matchedTotal;
                 result.Items = items;
                 return result;
             }

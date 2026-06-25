@@ -160,14 +160,14 @@ const server = new McpServer({ name: "te1000-mcp", version: "2.2.0" });
 server.registerTool(
   "xae",
   toolSchemas.xae,
-  async ({ action, solutionPath, closeExisting, discardChanges, filter, limit, button, remember, mode }) => {
+  async ({ action, solutionPath, closeExisting, discardChanges, filter, limit, severityFilter, button, remember, mode }) => {
     const payload = { mode };
     if (action === "open_solution") {
       need({ solutionPath }, ["solutionPath"], action);
       Object.assign(payload, { solutionPath, visible: true, closeExisting: closeExisting || false, discardChanges: discardChanges === true, mode: mode || "activeOrCreate" });
     }
     if (action === "list_commands") Object.assign(payload, { filter, limit });
-    if (action === "error_list") payload.limit = limit;
+    if (action === "error_list") Object.assign(payload, { limit, severityFilter });
     if (action === "dialog_resolve") {
       need({ button }, ["button"], action);
       Object.assign(payload, { button, remember: remember === true });
@@ -261,25 +261,25 @@ server.registerTool(
 server.registerTool(
   "tc_link",
   toolSchemas.tc_link,
-  async ({ action, a, b, autoResolve, links, save }) => {
+  async ({ action, a, b, autoResolve, links, save, verbose, details }) => {
     if (action === "link") {
       need({ b }, ["b"], action);
-      return textResult(await bridgeCall("twincat_link_variables", { producer: a, consumer: b, autoResolve }));
+      return textResult(await bridgeCall("twincat_link_variables", { producer: a, consumer: b, autoResolve, verbose: verbose === true }));
     }
     if (action === "unlink") return textResult(await bridgeCall("twincat_unlink_variables", { variableA: a, variableB: b }));
     if (action === "link_batch") {
       need({ links }, ["links"], action);
-      return textResult(await bridgeCall("twincat_link_variables_batch", { links, autoResolve, save: save === true }));
+      return textResult(await bridgeCall("twincat_link_variables_batch", { links, autoResolve, save: save === true, details: details === true }));
     }
     if (action === "unlink_batch") {
       need({ links }, ["links"], action);
-      return textResult(await bridgeCall("twincat_unlink_variables_batch", { links, save: save === true }));
+      return textResult(await bridgeCall("twincat_unlink_variables_batch", { links, save: save === true, details: details === true }));
     }
     if (action === "links") {
       need({ a }, ["a"], action);
       return textResult(await bridgeCall("twincat_get_variable_links", { path: a }));
     }
-    return textResult(await bridgeCall("twincat_resolve_variable_path", { variablePath: a }));
+    return textResult(await bridgeCall("twincat_resolve_variable_path", { variablePath: a, verbose: verbose === true }));
   },
 );
 
@@ -461,13 +461,13 @@ server.registerTool(
         }));
       case "create_batch":
         need(p, ["creates"], p.action);
-        return textResult(await bridgeCall("plc_pou_create_batch", { creates: p.creates, save: p.save === true }));
+        return textResult(await bridgeCall("plc_pou_create_batch", { creates: p.creates, save: p.save === true, details: p.details === true }));
       case "create_folder":
         need(p, ["parent", "name"], p.action);
         return textResult(await bridgeCall("plc_pou_create_folder", { parent: p.parent, name: p.name, before: p.before }));
       case "create_folder_batch":
         need(p, ["creates"], p.action);
-        return textResult(await bridgeCall("plc_pou_create_folder_batch", { creates: p.creates, save: p.save === true }));
+        return textResult(await bridgeCall("plc_pou_create_folder_batch", { creates: p.creates, save: p.save === true, details: p.details === true }));
       case "import_template":
         need(p, ["parent", "paths"], p.action);
         return textResult(await bridgeCall("plc_pou_import_template", { parent: p.parent, paths: p.paths, save: p.save === true }));
@@ -493,7 +493,7 @@ server.registerTool(
         return textResult(await bridgeCall("plc_pou_set_decl", { path: p.path, declText: p.declText }));
       case "set_decl_batch":
         need(p, ["items"], p.action);
-        return textResult(await bridgeCall("plc_pou_set_decl_batch", { items: p.items, save: p.save === true }));
+        return textResult(await bridgeCall("plc_pou_set_decl_batch", { items: p.items, save: p.save === true, details: p.details === true }));
       case "set_impl": {
         need(p, ["path"], p.action);
         const hasText = p.implText !== undefined;
@@ -503,7 +503,7 @@ server.registerTool(
       }
       case "set_impl_batch":
         need(p, ["items"], p.action);
-        return textResult(await bridgeCall("plc_pou_set_impl_batch", { items: p.items, save: p.save === true }));
+        return textResult(await bridgeCall("plc_pou_set_impl_batch", { items: p.items, save: p.save === true, details: p.details === true }));
       case "set_document":
         need(p, ["path", "documentXml"], p.action);
         return textResult(await bridgeCall("plc_pou_set_document", { path: p.path, documentXml: p.documentXml }));
@@ -548,7 +548,7 @@ server.registerTool(
         }));
       case "find":
         if ((p.name === undefined || p.name === "") && (p.typeFilter === undefined || p.typeFilter === "")) {
-          throw new Error("find requires at least one of name / typeFilter.");
+          throw new Error("find: pass at least one of name / typeFilter. e.g. {action:'find', name:'MyFB'} or {action:'find', typeFilter:'FB,Method'}");
         }
         return textResult(await bridgeCall("plc_pou_find", {
           plcPath: p.plcPath, path: p.path, name: p.name, typeFilter: p.typeFilter,

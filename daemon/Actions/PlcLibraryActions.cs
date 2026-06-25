@@ -91,10 +91,20 @@ namespace Te1000Daemon
             object item = GetReferencesItem(sm, path);
 
             object[] rows = PlcLibraryHelper.ScanLibraries(item);
+            // R3: optional case-insensitive substring filter on the library name,
+            // applied BEFORE building the array so a targeted scan returns 1-3 rows
+            // instead of the full installed-library catalogue. Omit for the full list.
+            string filter = ctx.Payload.Has("filter") ? ctx.Payload.Str("filter") : null;
+            bool hasFilter = !string.IsNullOrEmpty(filter);
             var libs = new Json.JArr();
             for (int i = 0; i < rows.Length; i++)
             {
                 object[] r = (object[])rows[i];
+                if (hasFilter)
+                {
+                    string name = r[0] == null ? "" : r[0].ToString();
+                    if (name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                }
                 var o = new Json.JObj();
                 o["name"] = r[0];
                 o["version"] = r[1];
