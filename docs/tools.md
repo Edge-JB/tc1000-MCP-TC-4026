@@ -70,7 +70,7 @@ path Beckhoff uses for PLC compilation via automation).
 - `clean` · `build` · `rebuild` — waits for completion by default (`waitForFinish`, `timeoutMs`).
 
 > **Build ≠ activate ≠ download.** A green build only means the project *compiles*. It has no
-> effect on the running cell until you activate the configuration and/or download.
+> effect on the target runtime until you activate the configuration and/or download.
 
 ### `xae_command` 🔒 `ALLOW_XAE_COMMAND_EXEC`
 Execute a raw XAE/DTE command by name (e.g. `View.SolutionExplorer`). Escape hatch for
@@ -198,12 +198,12 @@ NC motion tree: `tasks` (list under `TINC`), `axes` (`path` = task, default firs
 ### `plc_project`
 PLC project lifecycle: `create_from_template`, `open`, `info`, `set_boot_flags`,
 `generate_boot_project` 🔒, `online` 🔒 (Login/Start/Stop/Reset), `plcopen_export`,
-`plcopen_import`, `save_as_library`. The two 🔒 actions touch the live runtime/boot dir and
+`plcopen_import`, `save_as_library`. The two 🔒 actions touch the target runtime/boot dir and
 require `confirm: "ALLOW_PLC_DOWNLOAD"`.
 
 ### `plc_pou`
 Author and surgically edit PLC objects — **offline engineering only** (edits land in memory and
-reach the cell only via a later guarded `plc_download` + restart). All write/rename/move/delete
+reach the target runtime only via a later guarded `plc_download` + restart). All write/rename/move/delete
 paths refuse `TISC` (safety) paths.
 
 - **Author** — `create`, `create_batch`, `import_template`, `create_folder`, `create_folder_batch`.

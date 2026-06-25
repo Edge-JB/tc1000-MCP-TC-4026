@@ -4,12 +4,12 @@ using System.Runtime.InteropServices;
 
 namespace Te1000Daemon
 {
-    // XAE / DTE shell actions ported from te1000-bridge.ps1:
-    //   xae_status (L3689), xae_open_solution (L3720), xae_list_commands (L3769),
-    //   xae_execute_command (L3805), xae_get_active_document (L3845),
-    //   xae_get_selected_items (L3862), xae_focus_tree_item (L3886),
-    //   xae_get_error_list (L3914), xae_clear_error_list (L3957),
-    //   xae_save_all (L5306), xae_solution_build (L5436).
+    // XAE / DTE shell actions:
+    //   xae_status, xae_open_solution, xae_list_commands,
+    //   xae_execute_command, xae_get_active_document,
+    //   xae_get_selected_items, xae_focus_tree_item,
+    //   xae_get_error_list, xae_clear_error_list,
+    //   xae_save_all, xae_solution_build.
     internal static class XaeActions
     {
         public static void Register(Dictionary<string, ActionHandler> h)

@@ -4,7 +4,7 @@ using TCatSysManagerLib;
 
 namespace Te1000Daemon
 {
-    // plc_library actions ported from te1000-bridge.ps1 (L7159-7484).
+    // plc_library actions.
     //
     // The References-node tree path is TIPC^<plc>^<plc> Project^References. The PS
     // bridge resolves it with Resolve-PlcReferencesPath (L1534) and wraps it in

@@ -5,7 +5,7 @@ using System.Xml;
 
 namespace Te1000Daemon
 {
-    // tc_task actions ported from te1000-bridge.ps1 (L7484-7924).
+    // tc_task actions.
     //
     // Real-time tasks live under the TIRT collection node; the project-wide
     // real-time/router settings live under TIRS. list/get read the tree; create

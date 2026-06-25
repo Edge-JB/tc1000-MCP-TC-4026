@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 namespace Te1000Daemon
 {
-    // nc tool group ported from te1000-bridge.ps1 (L5320-5436).
+    // nc tool group.
     // NC tasks/axes live under the TINC (NC configuration) tree node.
     // All three actions are READ-only — no cache invalidation needed.
     // Read lookups go through ctx.Cache.LookupItem. C#5-clean (no interpolation,

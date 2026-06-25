@@ -6,7 +6,7 @@ using System.Text.RegularExpressions;
 
 namespace Te1000Daemon
 {
-    // tc_fieldbus actions ported from te1000-bridge.ps1 (L8520-8941). NON-EtherCAT
+    // tc_fieldbus actions: NON-EtherCAT
     // fieldbus masters/slaves/boxes (PROFINET / PROFIBUS / CANopen / DeviceNet /
     // EAP) created via late-bound CreateChild, plus resource listing/claiming,
     // GSD boxes, EAP netvars, station addresses, DBC import, and raw XML get/set.

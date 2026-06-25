@@ -4,11 +4,9 @@ using System.Xml;
 
 namespace Te1000Daemon
 {
-    // Variable-LINK actions ported from te1000-bridge.ps1 (L4501-4755) plus the
-    // shared helpers Link-Variables (L3264-3298), Resolve-TwinCatVariablePath
-    // (L3408-3448), Get-VariableLinksFromXml (L3491-3543),
-    // Get-VariableSubItemNames (L3545-3571) and Get-VariableLinksRecursive
-    // (L3573-3679).
+    // Variable-LINK actions plus the shared helpers Link-Variables,
+    // Resolve-TwinCatVariablePath, Get-VariableLinksFromXml,
+    // Get-VariableSubItemNames and Get-VariableLinksRecursive.
     //
     // Linking uses the late-bound sysManager.LinkVariables / UnlinkVariables. The
     // PS never calls Assert-NotSafetyPath in any of these handlers, so neither do

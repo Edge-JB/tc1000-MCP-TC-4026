@@ -4,6 +4,74 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-06-24
+
+### Added
+- **Interactive watchdog resolution.** An un-allowlisted modal dialog is no longer
+  a dead-end: the blocked-call error now surfaces the dialog's title/text/buttons
+  and instructs the calling agent to **ask the user** which button to press and
+  whether to remember it. A new COM-free meta action **`xae dialog_resolve {button,
+  remember?}`** clicks the chosen button on the live dialog and, with
+  `remember:true`, appends a **specific** auto-dismiss rule — the exact dialog
+  title **and** its body text, so it cannot later match an unrelated dialog that
+  merely shares a title — to `dialog-allowlist.json` **and** hot-applies it to the
+  running watcher (no daemon restart). Disruptive prompts (activate config /
+  run-mode / restart / download / boot project / TwinSAFE / safety) are **refused
+  for auto-remember** — the one-time human-chosen click still happens, but no rule
+  is persisted, and the response reports `rememberRefused` with the reason.
+  (`DialogWatcher.AddRule`/`HasRuleFor`/`AllowlistPath`,
+  `Dispatcher.dialog_resolve`.)
+
+### Removed
+- **Legacy PowerShell COM bridge fallback removed.** Deleted
+  `powershell/te1000-bridge.ps1`, `powershell/dialog-watch.ps1`, and the
+  `powershell/test-code-engine*.ps1` probes. The native C# daemon
+  (`Te1000Daemon.exe`) is now the **sole backend**; it requires a 64-bit
+  TcXaeShell.
+- **`TE1000_NO_DAEMON` env knob removed**, along with the `index.js` per-call
+  legacy dialog gate/watcher spawn. There is no longer a non-daemon mode and no
+  per-call PowerShell preflight — the daemon's internal `DialogWatcher.cs` thread
+  handles modal dialogs in-process for every call.
+
+### Changed
+- **`dialog-allowlist.json` moved from `powershell/` to the repo root** and now
+  **ships empty (report-only by default)** — a fresh clone auto-clicks nothing.
+  Build the allowlist up yourself, by hand or via `xae dialog_resolve {button,
+  remember:true}`. Same schema; only the path and the shipped ruleset changed.
+
+> `powershell/plc-session.ps1` (the UI-Automation PLC-logout helper used by
+> `plc_session` / `plc_download` auto-logout) and `daemon/build.ps1` (the daemon
+> build script) are **retained**.
+
+### Fixed
+- **Watcher safety backstop.** The dialog watcher now **never auto-clicks** a
+  dialog whose title/body matches the disruptive-operation pattern (activate config
+  / run-mode / restart / download / boot project / TwinSAFE / safety), even if an
+  allowlist rule would otherwise match it. Previously a remembered rule was
+  persisted by title only, so a later same-title disruptive prompt could be
+  auto-dismissed; the denylist is now a shared single source of truth
+  (`DialogPolicy`) checked at both remember-time and click-time, and remembered
+  rules persist the exact title **and** body text.
+- **The allowlist file is never wiped on a failed write.** `AppendAllowlistRule`
+  swaps the updated file into place with `File.Replace` (keeping a backup) instead
+  of deleting the original before the move — a transient I/O failure now leaves the
+  existing `dialog-allowlist.json` intact.
+- **`dialog_resolve` reports an in-memory-only remember.** When a remembered rule
+  is hot-applied to the watcher but the file write fails, the result says so
+  explicitly instead of reporting a clean success.
+- The watcher's copy-on-write rule list is published/read with
+  `Volatile.Write`/`Volatile.Read`, so a hot-applied rule is reliably visible to
+  the poll thread; and the `index.js` result discriminator is narrowed so it cannot
+  mis-render an unrelated daemon result that happens to carry a `resolved` field.
+- **Docs genericized.** README / SECURITY / operations / tools / examples and the
+  tool-action descriptions no longer assume a specific "live cell" or running
+  machine — this MCP drives an XAE instance and makes no assumption about what (if
+  anything) is behind it. The `TE1000_DIALOG_WATCH` / `TE1000_DIALOG_AUTODISMISS` /
+  `TE1000_DIALOG_GRACE_MS` knobs are now documented as applied at **daemon spawn**
+  (an already-running single-instance daemon must be killed for a change to take
+  effect), and `SECURITY.md` cites the C# `PathUtil.AssertNotSafetyPath` guard
+  (not the removed PowerShell name).
+
 ## [2.1.2] — 2026-06-24
 
 ### Fixed
@@ -31,8 +99,8 @@ All notable changes to this project are documented here. The format is based on
 ### Added
 - **`xae dialog_probe`** — a read-only diagnostic action (COM-free daemon meta
   action) that reports whether a modal dialog is currently blocking XAE and, if so,
-  its title / body / buttons. Never clicks anything (report-only), so it is safe to
-  run against a live cell to answer "is XAE wedged on a prompt right now, and on
+  its title / body / buttons. Never clicks anything (report-only), so it is always
+  safe to run — it just answers "is XAE wedged on a prompt right now, and on
   what?". Backed by `ComWorker.Watcher` + `DialogWatcher.Probe(doDismiss:false)`.
   In report-only mode `blocking` reflects whether the dialog would persist — a
   dialog matching an auto-dismiss allowlist rule reports `blocking:false`, since
@@ -186,6 +254,7 @@ nearly the entire automatable TE1000 surface.
   `ProduceXml`/`ConsumeXml`, variable linking, NetId targeting, rescans, NC inspection, and
   guarded activate/restart/download.
 
+[2.2.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases/tag/v2.2.0
 [2.1.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases/tag/v2.1.0
 [2.0.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases
 [1.0.0]: https://github.com/Edge-JB/TwinCAT-XAE-MCP/releases

@@ -4,7 +4,7 @@ using System.Xml;
 
 namespace Te1000Daemon
 {
-    // tc_tree tree-item operations ported from te1000-bridge.ps1 (L3973-5306).
+    // tc_tree tree-item operations.
     // Read lookups go through ctx.Cache.LookupItem; mutating actions invalidate
     // the affected subtree after success. C#5-clean (no interpolation, no out var,
     // no expression-bodied members).

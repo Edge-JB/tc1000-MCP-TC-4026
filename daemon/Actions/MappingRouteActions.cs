@@ -5,7 +5,7 @@ using System.Xml;
 
 namespace Te1000Daemon
 {
-    // Ported from te1000-bridge.ps1 (L7924-8520): mapping-info produce/consume/clear,
+    // mapping-info produce/consume/clear,
     // ADS route list/search/add, silent-mode + target-platform get/set, solution/PLC
     // archive save, independent-file (SaveInOwnFile) get/set, and node Disabled get/set.
     //

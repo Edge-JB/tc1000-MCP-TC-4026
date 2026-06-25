@@ -66,13 +66,14 @@ const XAE_ACTIONS = {
   clear_error_list: "xae_clear_error_list",
   list_commands: "xae_list_commands",
   dialog_probe: "dialog_probe",
+  dialog_resolve: "dialog_resolve",
 };
 
 // --- The tool schemas, keyed by tool name. Each entry is the EXACT config object
 // (description + zod inputSchema raw shape) that registerTool consumes. ----------
 const toolSchemas = {
   xae: {
-    description: "XAE shell: status, open_solution (solutionPath; closeExisting:true reopens, discardChanges:true closes the current solution WITHOUT saving before reopening), save_all, active_document, selected_items, error_list, clear_error_list, list_commands (filter regex, limit), dialog_probe (read-only: is a modal dialog blocking XAE right now? returns its title/text/buttons; never clicks anything).",
+    description: "XAE shell: status, open_solution (solutionPath; closeExisting:true reopens, discardChanges:true closes the current solution WITHOUT saving before reopening), save_all, active_document, selected_items, error_list, clear_error_list, list_commands (filter regex, limit), dialog_probe (read-only: is a modal dialog blocking XAE right now? returns its title/text/buttons; never clicks anything), dialog_resolve (button, remember) — click a chosen button on the live modal dialog and optionally remember it in the allowlist; pair with dialog_probe. Destructive prompts (activate/restart/download/safety) are refused for auto-remember (the click still happens once).",
     inputSchema: {
       action: z.enum(Object.keys(XAE_ACTIONS)),
       solutionPath: z.string().optional(),
@@ -80,6 +81,8 @@ const toolSchemas = {
       discardChanges: z.boolean().optional(),
       filter: z.string().optional(),
       limit: z.number().int().positive().max(5000).optional(),
+      button: z.string().optional(),
+      remember: z.boolean().optional(),
       mode: z.enum(["active", "activeOrCreate", "create"]).optional().describe("DTE attach mode; default active (open_solution: activeOrCreate)"),
     },
   },
@@ -173,9 +176,9 @@ const toolSchemas = {
     description:
       'Bulk variable-mapping (ALL links) ops on the loaded TwinCAT project via ITcSysManager2/3, whole-project (no tree path): ' +
       'produce (read-only) — ProduceMappingInfo serializes every current variable link/mapping to ONE XML blob (the IDE\'s "Export Mapping Information"); the blob is returned as raw XML. ' +
-      'consume (xml) — ConsumeMappingInfo re-applies/merges a previously produced blob, ADDING links; MUTATES the offline config only (no live-cell impact until a later twincat_activate_configuration); optional save:true saves the solution after. ' +
+      'consume (xml) — ConsumeMappingInfo re-applies/merges a previously produced blob, ADDING links; MUTATES the offline config only (no runtime impact until a later twincat_activate_configuration); optional save:true saves the solution after. ' +
       'clear — ClearMappingInfo deletes ALL variable links project-wide; destructive, GUARDED: requires confirm="' + DELETE_CONFIRMATION + '" (reuses the existing delete token); optional save:true. ' +
-      'These are PROJECT-WIDE config-tree ops, NOT runtime/cell writes. SAFETY: the mapping blob spans the whole project and CAN include TwinSAFE I/O image links — produce/consume/clear may touch safety-related links; per project policy nothing should write toward safety, so run produce FIRST as a backup and treat the blob as opaque (export -> store -> consume round-trip). The exact XML schema is undocumented; test-import hand-edited blobs in the IDE before relying on them.',
+      'These are PROJECT-WIDE config-tree ops, NOT runtime writes. SAFETY: the mapping blob spans the whole project and CAN include TwinSAFE I/O image links — produce/consume/clear may touch safety-related links; by policy nothing should write toward safety, so run produce FIRST as a backup and treat the blob as opaque (export -> store -> consume round-trip). The exact XML schema is undocumented; test-import hand-edited blobs in the IDE before relying on them.',
     inputSchema: {
       action: z.enum(["produce", "consume", "clear"]),
       xml: z.string().optional(),
@@ -289,7 +292,7 @@ const toolSchemas = {
 
   plc_pou: {
     description:
-      "PLC object authoring + code edit on the open solution (OFFLINE engineering only — no activate/download/online; edits land in-memory and reach the cell only via a later guarded plc_download + twincat_restart_runtime). Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy. " +
+      "PLC object authoring + code edit on the open solution (OFFLINE engineering only — no activate/download/online; edits land in-memory and reach a runtime only via a later guarded plc_download + twincat_restart_runtime). Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy. " +
       "CREATE — create / create_batch (parent, name, subType, language?, returnType?, extends?, implements?, declText?, before?): CreateChild sub-types 602 Program, 603 Function (returnType required), 604 FunctionBlock, 605 Enum, 606 Struct, 607 Union, 608 Action, 609 Method, 611 Property (returnType required), 615 GVL, 616 Transition, 618 Interface, 619 Visualization, 623 Alias, 629 ParameterList, 631 UML. language IECLANGUAGETYPES 0 NONE/1 ST/2 IL/3 SFC/4 FBD/5 CFC/6 LD (default 1). extends/implements for FB 604 / Program 602 derivation (618 uses extends as its base); declText seeds DUT/GVL decl. For code POUs prefer set_decl after create. " +
       "FOLDERS — create_folder (parent, name, before?) creates a PLC folder (CreateChild sub-type 601 PLCFOLDER, vInfo=null) under parent; parent may be a PLC project subtree node, a POUs/DUTs/GVLs container, or another folder (nesting). Returns the same shape as create: { parentPath, child:{name,pathName,itemType,subType,childCount} } (itemType 601). create_folder_batch (creates:[{parent,name,before?}], save?) loops create_folder continue-on-error and returns the canonical roll-up {count,succeeded,failed,results:[{parent,name,ok,child?|error?}]} — list a parent-folder entry BEFORE its child-folder entry (created in array order). NOTE: create / create_batch already author objects INTO a folder when parent is the folder's tree path (a folder is a valid CreateChild parent) — no separate action needed. " +
       "TEMPLATE — import_template (parent, paths[]) imports POU template file(s) (CreateChild sub-type 58). " +
@@ -376,9 +379,9 @@ const toolSchemas = {
     description:
       'PLC library references / placeholders / repositories via ITcPlcLibraryManager on the References node (TIPC^<plc>^<plc> Project^References). referencesPath defaults to the first PLC under TIPC. ' +
       'READ (no side effects): list (References → name/kind library|placeholder/displayName/distributor/version), scan (ScanLibraries → installed libs name/version/distributor/displayName), repos (Repositories → name/folder). ' +
-      'WRITE — OFFLINE .plcproj edits, NO live-cell impact (not confirm-gated): add_library (name, version?, company?), add_placeholder (name, defLib?/defVer?/defDist? — omit defLib for the name-only form), set_resolution (placeholder, lib, version?, dist?), freeze (name? — omit to freeze ALL), remove_reference (name = library or placeholder). Each accepts save:true to File.SaveAll after the edit. ' +
+      'WRITE — OFFLINE .plcproj edits, NO runtime impact (not confirm-gated): add_library (name, version?, company?), add_placeholder (name, defLib?/defVer?/defDist? — omit defLib for the name-only form), set_resolution (placeholder, lib, version?, dist?), freeze (name? — omit to freeze ALL), remove_reference (name = library or placeholder). Each accepts save:true to File.SaveAll after the edit. ' +
       'LANDMINE: a .plcproj library-reference edit (add/remove/repin a library or placeholder, set resolution) requires a full solution close+reopen in XAE before it takes effect; adding source files alone does not — the response surfaces this note. ' +
-      'REPO ADMIN — GUARDED, mutates the machine-wide TwinCAT library store (no runtime/cell change, but shared-machine state): install_library (repo, libPath, overwrite?), uninstall_library (repo, lib, version?, dist?), insert_repository (name, folder, index?), remove_repository (name), move_repository (name, index). These require confirm="' + PLC_LIBRARY_REPO_CONFIRMATION + '". Nothing here targets the safety system (References live only under TIPC).',
+      'REPO ADMIN — GUARDED, mutates the machine-wide TwinCAT library store (no runtime change, but shared-machine state): install_library (repo, libPath, overwrite?), uninstall_library (repo, lib, version?, dist?), insert_repository (name, folder, index?), remove_repository (name), move_repository (name, index). These require confirm="' + PLC_LIBRARY_REPO_CONFIRMATION + '". Nothing here targets the safety system (References live only under TIPC).',
     inputSchema: {
       action: z.enum([
         "list", "scan", "repos",
@@ -438,7 +441,7 @@ const toolSchemas = {
 
   tc_settings: {
     description:
-      'XAE engineering settings & packaging. OFFLINE/engineering-only: NONE of these write toward the live cell or change runtime state (their cell effect, if any, lands only on a SEPARATE later activate/download), so none are confirm-gated. Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy in set_disabled/set_independent_file/save_plc_archive. Actions: ' +
+      'XAE engineering settings & packaging. OFFLINE/engineering-only: NONE of these write toward a runtime or change runtime state (their runtime effect, if any, lands only on a SEPARATE later activate/download), so none are confirm-gated. Tree paths use ^ separators; safety (TISC-rooted) paths are rejected by policy in set_disabled/set_independent_file/save_plc_archive. Actions: ' +
       'get_silent_mode / set_silent_mode (enabled) — TcAutomationSettings.SilentMode; suppresses AI message-box dialogs (TC3.1>=4020.0; older builds throw). A good companion to the dialog watchdog. ' +
       'get_target_platform / set_target_platform (platform = "TwinCAT RT (x86)" | "TwinCAT RT (x64)") — ITcSysManager7.ConfigurationManager.ActiveTargetPlatform; switching platform invalidates prior build output, so rebuild (xae_build) before activate/download. ' +
       'save_solution_archive (file = absolute .tszip) — ITcSysManager9.SaveAsArchive, whole solution; parent dir must exist (not created). ' +
@@ -464,14 +467,14 @@ const toolSchemas = {
 
   tc_fieldbus: {
     description:
-      "Create + configure NON-EtherCAT fieldbus masters/slaves/boxes (PROFINET / PROFIBUS / CANopen / DeviceNet / EAP net-vars) via ITcSmTreeItem CreateChild + ClaimResources + ConsumeXml. OFFLINE CONFIG ONLY — every action edits the in-memory project; NOTHING here pushes to the live cell or runtime (activate/download/restart stay the existing guarded tools), so no confirm token is needed. Safety (TISC) paths are rejected by policy. For EtherCAT terminals/boxes use tc_ethercat instead. " +
+      "Create + configure NON-EtherCAT fieldbus masters/slaves/boxes (PROFINET / PROFIBUS / CANopen / DeviceNet / EAP net-vars) via ITcSmTreeItem CreateChild + ClaimResources + ConsumeXml. OFFLINE CONFIG ONLY — every action edits the in-memory project; NOTHING here pushes to a runtime (activate/download/restart stay the existing guarded tools), so no confirm token is needed. Safety (TISC) paths are rejected by policy. For EtherCAT terminals/boxes use tc_ethercat instead. " +
       "BATCH-FIRST: to create more than one device use create_batch (N ops in ONE DTE attach, continue-on-error roll-up {count,succeeded,failed,results:[{parent,name,ok,child?,claimed?,error?}]}). " +
       "SubType cheat-sheet — PROFINET ctrl 113/119/126/140, dev 115/118/142/143; PROFIBUS master 86 slave 97; CANopen master 87 slave 98; DeviceNet master 41/73/88 slave 62/74/99 monitor 59 box 5203; EAP device 112 publisher 9051 subscriber 9052. " +
       "Actions: " +
       "create_device (parent? default TIID / EAP device path, name, subType, before?, vInfo?, claimIndex?, save?) — CreateChild a master/slave/box; claimIndex immediately ClaimResources to bind underlying hardware; a wrong subType/vInfo ghost is cleaned up and reported as failure; " +
       "create_batch (creates:[{parent?,name,subType,before?,vInfo?,claimIndex?}], save?); " +
       "list_resources (path) — read-only; probes ITcSmTreeItem5.ResourcesCount then ResourceCount (Beckhoff pages disagree on the name) and reports which answered; " +
-      "claim_resources (path, index [1-based per Beckhoff examples], save?) — bind the node to underlying FC/EL hardware (offline config edit, NOT a cell write); " +
+      "claim_resources (path, index [1-based per Beckhoff examples], save?) — bind the node to underlying FC/EL hardware (offline config edit, NOT a runtime write); " +
       "create_gsd_box (controllerPath, name, gsdPath, moduleIdentNumber, subType [REQUIRED — PN device subType, depends on controller variant], boxFlags? [GENERATE_NAME_FROM_PAB 0x0004 / GET_STATIONNAME 0x0400 / SET_NOT_IP_TO_OS 0x4000], dapNumber?, before?, save?) — PROFINET GSD/GSDML box; vInfo = gsdPath#moduleIdentNumber#boxFlags#dapNumber. CAVEAT: GSD box subType + vInfo format from a doc summary, confirm against infosys 1041677067 before relying on it; " +
       "add_netvar (boxPath = EAP publisher/subscriber box, name, dataType [IEC type as vInfo, e.g. BOOL/INT], before?, save?) — EAP pub/sub variable (SubType 0; resulting ItemType 35 publisher / 36 subscriber); " +
       "set_station_address (path = PROFIBUS slave/box, address, save?) — discovers the address element via ProduceXml then ConsumeXml a minimal envelope (the bare-number form is unverified and NOT shipped); if discovery fails, use get_xml + set_xml; " +

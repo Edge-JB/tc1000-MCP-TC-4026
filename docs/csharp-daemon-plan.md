@@ -10,6 +10,11 @@
 > and the worktree lives at `C:\ProgramData\te1000-mcp-daemon`. Coverage and validation
 > records are in [csharp-daemon-coverage.md](csharp-daemon-coverage.md) and
 > [csharp-daemon-validation.md](csharp-daemon-validation.md).
+>
+> The plan below kept the legacy PowerShell bridge as a `TE1000_NO_DAEMON` fallback. That
+> decision was **later reversed**: the PS COM bridge, its dialog watcher, and the fallback path
+> were removed, and the native daemon is now the sole backend (see CHANGELOG 2.2.0). References
+> below to that fallback are historical planning context only.
 
 ## Goal
 Replace the per-call `powershell.exe` spawn model with a **persistent C#/.NET daemon** that

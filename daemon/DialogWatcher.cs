@@ -9,7 +9,7 @@ using System.Threading;
 
 namespace Te1000Daemon
 {
-    // ---- DlgWin / DlgWatch: lifted VERBATIM from dialog-watch.ps1 L46-141 ----
+    // ---- DlgWin / DlgWatch: native C# dialog watchdog ----
     public sealed class DlgWin
     {
         public long Hwnd;
@@ -186,6 +186,24 @@ namespace Te1000Daemon
         }
     }
 
+    // Shared policy: dialogs whose title/body indicate a disruptive XAE operation
+    // (activate config, run-mode change, restart, download, boot project, or
+    // TwinSAFE/safety). The watcher NEVER auto-clicks one of these even if an
+    // allowlist rule matches it, and dialog_resolve refuses to persist a remember
+    // rule for one. Single source of truth so the guard code and the documented
+    // policy cannot drift apart.
+    internal static class DialogPolicy
+    {
+        public const string DisruptivePattern =
+            @"activate.*config|run[\s-]*mode|restart|download|boot\s*project|twinsafe|safety|set.*run|reset.*twincat";
+
+        public static bool LooksDisruptive(string title, string text)
+        {
+            string hay = (title ?? "") + " " + (text ?? "");
+            return Regex.IsMatch(hay, DisruptivePattern, RegexOptions.IgnoreCase);
+        }
+    }
+
     // Allowlist rule (mirrors dialog-allowlist.json shape).
     internal sealed class DlgRule
     {
@@ -237,7 +255,12 @@ namespace Te1000Daemon
         private readonly string[] _processNames;
         private readonly int _pollMs;
         private readonly bool _autoDismiss;
-        private readonly List<DlgRule> _rules;
+        private readonly string _allowlistPath;
+        // Copy-on-write rule list: the watcher thread reads this field into a local
+        // and iterates that immutable snapshot, while AddRule (runtime) reassigns
+        // the field wholesale under _gate — so a runtime add can never race the
+        // poll mid-iteration. Plain field (NOT readonly) so it can be reassigned.
+        private List<DlgRule> _rules;
         private Thread _thread;
         private volatile bool _stop;
 
@@ -258,9 +281,14 @@ namespace Te1000Daemon
                 : new[] { processName };
             _pollMs = pollMs;
             _autoDismiss = autoDismiss;
+            _allowlistPath = allowlistPath;
             _rules = LoadRules(allowlistPath);
             _latest = new DialogSnapshot { Found = false, Blocking = false, Ts = NowMs() };
         }
+
+        // The dialog-allowlist.json path this watcher loaded its rules from, so
+        // dialog_resolve can append a remembered rule to the same file.
+        public string AllowlistPath { get { return _allowlistPath; } }
 
         private static long NowMs() { return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); }
 
@@ -343,7 +371,12 @@ namespace Te1000Daemon
         // tell the report-only path whether the dialog will be cleared automatically.
         private DlgRule MatchRule(string title, string text)
         {
-            foreach (var r in _rules)
+            // Read the copy-on-write field ONCE into a local so we iterate an
+            // immutable snapshot even if AddRule reassigns the field mid-walk.
+            // Volatile.Read pairs with AddRule's Volatile.Write so this lock-free
+            // reader is guaranteed to observe the freshly-published list.
+            var rules = Volatile.Read(ref _rules);
+            foreach (var r in rules)
             {
                 if (string.IsNullOrEmpty(r.Match)) continue;
                 bool titleOk = Regex.IsMatch(title ?? "", r.Match, RegexOptions.IgnoreCase);
@@ -351,6 +384,28 @@ namespace Te1000Daemon
                 if (titleOk && textOk) return r;
             }
             return null;
+        }
+
+        // Runtime-add a rule (copy-on-write): build a NEW list = current + the new
+        // rule, then reassign the field under _gate. The watcher thread reads the
+        // field into a local before iterating, so it never sees a half-built list.
+        public void AddRule(string match, string textMatch, string button)
+        {
+            if (string.IsNullOrEmpty(match)) return;
+            lock (_gate)
+            {
+                var next = new List<DlgRule>(_rules);
+                next.Add(new DlgRule { Match = match, TextMatch = textMatch, Button = button });
+                Volatile.Write(ref _rules, next);
+            }
+        }
+
+        // True if any current rule already matches this dialog (same title/text
+        // logic as the auto-dismiss path). Used to avoid duplicate appends and to
+        // tell dialog_resolve the dialog is already covered.
+        public bool HasRuleFor(string title, string text)
+        {
+            return MatchRule(title, text) != null;
         }
 
         // One-shot probe (also used for a pre-flight gate). Auto-dismisses an
@@ -382,10 +437,15 @@ namespace Te1000Daemon
             // would auto-click. Resolved WITHOUT clicking so the report-only path can
             // distinguish a true block from an about-to-be-auto-dismissed dialog.
             DlgRule rule = MatchRule(title, text);
+            // Safety backstop: never auto-click a disruptive prompt, even if a
+            // (possibly over-broad or hand-added) allowlist rule matches it. Only an
+            // allowlisted, NON-disruptive dialog is auto-dismissed; anything that
+            // looks disruptive is always surfaced for a human to resolve.
+            bool willAutoDismiss = rule != null && !DialogPolicy.LooksDisruptive(title, text);
             bool dismissed = false;
             string dismissedButton = null;
 
-            if (doDismiss && rule != null && DlgWatch.Click(dlg.Hwnd, rule.Button))
+            if (doDismiss && willAutoDismiss && DlgWatch.Click(dlg.Hwnd, rule.Button))
             {
                 dismissed = true;
                 dismissedButton = rule.Button;
@@ -396,9 +456,9 @@ namespace Te1000Daemon
                 Found = true,
                 // Blocking = present AND not going to clear on its own. When dismissing,
                 // a still-blocking result means the click failed. When only reporting
-                // (doDismiss:false), a dialog that matches an allowlist rule is NOT a
-                // persistent block — the watcher Loop will dismiss it — so don't flag it.
-                Blocking = doDismiss ? !dismissed : (rule == null),
+                // (doDismiss:false), a dialog the watcher will auto-dismiss is NOT a
+                // persistent block; a disruptive dialog (never auto-clicked) always is.
+                Blocking = doDismiss ? !dismissed : !willAutoDismiss,
                 Dismissed = dismissed,
                 DismissedButton = dismissedButton,
                 Title = title,

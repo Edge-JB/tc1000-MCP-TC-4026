@@ -8,7 +8,7 @@ using TCatSysManagerLib;
 
 namespace Te1000Daemon
 {
-    // plc_pou actions ported from te1000-bridge.ps1 (L5993-7159) — the largest
+    // plc_pou actions — the largest
     // tool group: create/folder/import/get/set/replace/insert/append/outline/
     // tree/find/search/check/delete/rename/move over the IEC PLC project tree.
     //

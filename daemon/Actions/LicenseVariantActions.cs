@@ -5,7 +5,6 @@ using System.Xml;
 
 namespace Te1000Daemon
 {
-    // Ported from te1000-bridge.ps1 L9561-9792.
     // License actions operate on the TIRC^License tree node (ProduceXml read /
     // ConsumeXml + CreateChild mutate). Variant actions operate on the
     // sysManager itself (ProjectVariantConfig / CurrentProjectVariant on

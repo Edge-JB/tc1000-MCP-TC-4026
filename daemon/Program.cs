@@ -90,7 +90,7 @@ namespace Te1000Daemon
             return sb.ToString();
         }
 
-        // The allowlist ships alongside the PS bridge: <repo>/powershell/dialog-allowlist.json.
+        // The allowlist lives at the repo root: <repo>/dialog-allowlist.json.
         // The exe lives at <repo>/daemon/bin/Release; walk up to find it.
         private static string DefaultAllowlistPath()
         {
@@ -99,7 +99,7 @@ namespace Te1000Daemon
                 string dir = AppDomain.CurrentDomain.BaseDirectory;
                 for (int up = 0; up < 6 && dir != null; up++)
                 {
-                    string candidate = Path.Combine(dir, "powershell", "dialog-allowlist.json");
+                    string candidate = Path.Combine(dir, "dialog-allowlist.json");
                     if (File.Exists(candidate)) return candidate;
                     var parent = Directory.GetParent(dir);
                     dir = parent != null ? parent.FullName : null;

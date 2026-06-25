@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace Te1000Daemon
 {
-    // Verbatim port of Ensure-ComMessageFilter (te1000-bridge.ps1 L116-174).
+    // COM message filter (Ensure-ComMessageFilter).
     //
     // XAE/VS DTE rejects incoming COM calls while busy (RPC_E_CALL_REJECTED
     // 0x80010001). Beckhoff TE1000 docs require an IOleMessageFilter that retries

@@ -7,8 +7,8 @@ Copy-pasteable recipes for driving TwinCAT through `te1000-mcp`. They assume an 
 Each recipe shows the tool name followed by its arguments. Tree paths use `^` separators — see
 the [tool reference](../docs/tools.md) for path roots and batch semantics.
 
-> 🔒 Actions marked here as guarded require a `confirm` token and touch the live target. Read
-> [Safety & guards](../README.md#safety--guards) before running them on a real cell.
+> 🔒 Actions marked here as guarded require a `confirm` token and touch the target runtime. Read
+> [Safety & guards](../README.md#safety--guards) before running them against a TwinCAT runtime.
 
 ---
 
@@ -58,9 +58,9 @@ tc_link
   action: "link_batch"
   save: true
   links: [
-    { a: "TIPC^Cabsort Lite^Cabsort Lite Instance^PlcTask Inputs^MAIN.bStart",
+    { a: "TIPC^MyPlc^MyPlc Instance^PlcTask Inputs^MAIN.bStart",
       b: "TIID^Device 2 (EtherCAT)^Term 1^Channel 1^Input" },
-    { a: "TIPC^Cabsort Lite^Cabsort Lite Instance^PlcTask Outputs^MAIN.bRun",
+    { a: "TIPC^MyPlc^MyPlc Instance^PlcTask Outputs^MAIN.bRun",
       b: "TIID^Device 2 (EtherCAT)^Term 2^Channel 1^Output" }
   ]
 ```
@@ -101,13 +101,13 @@ xae   action: "save_all"
 
 ## 5. Author and surgically edit a POU (offline)
 
-`plc_pou` edits land in memory — they reach the cell only via a later guarded `plc_download`.
+`plc_pou` edits land in memory — they reach the target runtime only via a later guarded `plc_download`.
 
 ```text
 # create a program POU
 plc_pou
   action: "create"
-  parent: "TIPC^Cabsort Lite^Cabsort Lite Project^POUs"
+  parent: "TIPC^MyPlc^MyPlc Project^POUs"
   name: "pConveyor"
   pouType: "program"
   language: "ST"
@@ -128,19 +128,19 @@ plc_pou
 ## 6. Safe build → activate → download flow
 
 ```text
-xae_build   action: "build"        # compile only — no effect on the live cell yet
+xae_build   action: "build"        # compile only — no effect on the target runtime yet
 
 # inspect results before going further
 xae         action: "error_list"
 
-# the next three touch the LIVE target and are each guarded:
+# the next three touch the target runtime and are each guarded:
 twincat_activate_configuration   confirm: "ALLOW_TWINCAT_ACTIVATE"   # 🔒
 plc_download                     confirm: "ALLOW_PLC_DOWNLOAD"       # 🔒  (auto-logs-out first)
 twincat_restart_runtime          confirm: "ALLOW_TWINCAT_RESTART"    # 🔒
 ```
 
-> Leave work at "build green, not activated" unless you intend to interrupt the running machine.
-> A green build does **not** change the live cell.
+> Leave work at "build green, not activated" unless you intend to interrupt whatever the runtime
+> is driving. A green build does **not** change the target runtime.
 
 ## 7. Preview before you delete
 

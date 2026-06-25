@@ -6,8 +6,7 @@ using System.Reflection;
 
 namespace Te1000Daemon
 {
-    // Measurement (TE130X Scope-View) + TwinCAT Analytics action group, ported
-    // from te1000-bridge.ps1 (L9330-9559).
+    // Measurement (TE130X Scope-View) + TwinCAT Analytics action group.
     //
     // Scope actions drive the TE130X Scope-View Automation Interface. The scope
     // automation object exposes IMeasurementScope, which is a vtable/IUnknown

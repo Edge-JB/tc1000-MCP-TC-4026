@@ -9,8 +9,8 @@ namespace Te1000Daemon
     // XaeActions.ReadErrorList). The daemon exe lives under C:\ProgramData and the
     // PIAs (EnvDTE / EnvDTE80 / Microsoft.VisualStudio.Interop) are neither copied
     // local nor in a GAC view the runtime probes, so we resolve them from the
-    // TcXaeShell PublicAssemblies dir on demand — mirroring the PS bridge's
-    // Get-XaePublicAssembliesPath (te1000-bridge.ps1 L64-76).
+    // TcXaeShell PublicAssemblies dir on demand — resolving the XAE public
+    // assemblies path.
     public static class VsInterop
     {
         private static int _installed;

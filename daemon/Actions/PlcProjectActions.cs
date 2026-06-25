@@ -4,7 +4,7 @@ using System.Globalization;
 
 namespace Te1000Daemon
 {
-    // plc_project actions ported from te1000-bridge.ps1 (L5629-5993).
+    // plc_project actions.
     //
     // The PLC ROOT node is TIPC^<name>; the project INSTANCE node is its first
     // child. Each handler resolves a fresh tree-item RCW via ComHelpers.GetTreeItem

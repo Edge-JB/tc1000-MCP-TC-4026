@@ -3,8 +3,7 @@ using System.Collections.Generic;
 
 namespace Te1000Daemon
 {
-    // activate / restart / download / login / logout actions ported from
-    // te1000-bridge.ps1 (L5505-5629).
+    // activate / restart / download / login / logout actions.
     //
     // These are config / live-cell verbs. index.js enforces the confirm tokens
     // upstream (ALLOW_TWINCAT_ACTIVATE / ALLOW_TWINCAT_RESTART / ALLOW_PLC_DOWNLOAD)

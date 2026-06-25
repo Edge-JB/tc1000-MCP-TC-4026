@@ -2,8 +2,9 @@
 
 `te1000-mcp` is two cooperating processes: a **Node MCP front** that owns the MCP
 protocol and tool surface, and a **persistent native C#/.NET daemon** that holds the
-COM/DTE session and does the actual TwinCAT XAE work. A legacy PowerShell bridge is
-retained as an automatic fallback.
+COM/DTE session and does the actual TwinCAT XAE work. The native C#/.NET daemon is the
+**sole backend**; it was ported from an earlier per-call PowerShell COM bridge, which has
+since been removed.
 
 ```
   MCP client (agent)
@@ -13,15 +14,12 @@ retained as an automatic fallback.
    (Node 20)  named pipe     (persistent, x64,            running TwinCAT project
    daemonClient.js           net472, STA COM session)
    toolSchemas.js
-        │
-        └─ fallback: Windows PowerShell ─► powershell/te1000-bridge.ps1 ─► XAE
-           (legacy per-call spawn)
 ```
 
 ## Why the daemon exists
 
-The original design spawned a fresh 32-bit `powershell.exe` bridge — plus a second
-`powershell.exe` dialog watcher — on **every** MCP call. Each spawn paid:
+The **original** design (since removed) spawned a fresh 32-bit `powershell.exe` bridge —
+plus a second `powershell.exe` dialog watcher — on **every** MCP call. Each spawn paid:
 
 1. **A cold per-call process model** — re-acquiring the DTE / `ITcSysManager` COM handles
    via a Running-Object-Table (ROT) walk + `Marshal.GetActiveObject`, and JIT-compiling the
@@ -37,24 +35,19 @@ the hot path makes few or zero COM round-trips on a warm cache.
 
 - **`index.js`** speaks MCP/JSON-RPC over stdio, validates input with
   [zod](https://zod.dev), enforces the confirmation-token guards (off by default), and maps
-  each grouped tool `action` onto a fine-grained bridge action name. By default it routes
-  those actions to the daemon.
+  each grouped tool `action` onto a fine-grained daemon action name. It routes those actions
+  to the daemon.
 - **`toolSchemas.js`** is the single source of truth for every tool's input schema, the
   confirmation tokens, and the XAE action map. `index.js` imports from it.
 - **`daemonClient.js`** is the named-pipe client. It auto-spawns the daemon on first use,
   reconnects on a dropped pipe, correlates responses by `id`, and maps the daemon's
-  `errorKind` back to the exact user-facing error text the legacy watchdog produced.
+  `errorKind` back to user-facing error text.
 
-### Daemon-vs-legacy routing
+### Daemon routing
 
-The front uses the daemon when `TE1000_NO_DAEMON` is **not** `1` **and** a 64-bit TcXaeShell
-is present (detected via
-`C:\Program Files\Beckhoff\TcXaeShell\Common7\IDE\PublicAssemblies\envdte.dll`). Otherwise it
-uses the legacy PowerShell bridge. At run time, if a daemon call fails because the exe is
-missing, the connect times out, or the pipe keeps dropping, that call **falls back** to the
-legacy bridge and a process-lifetime **latch** routes all subsequent calls straight to the
-bridge (so they don't re-pay the ~20 s connect timeout). The fallback path re-applies the
-same dialog pre-flight gate the always-legacy path runs.
+The front requires a 64-bit TcXaeShell (detected via
+`C:\Program Files\Beckhoff\TcXaeShell\Common7\IDE\PublicAssemblies\envdte.dll`); the native
+C#/.NET daemon is the only backend. All actions route to the daemon over the pipe.
 
 ## The pipe protocol
 
@@ -134,22 +127,23 @@ model. Invalidation keeps it correct:
   `FileSystemWatcher` handler runs on its own thread and is strictly COM-free; the dirty check
   runs inline on the STA worker.
 
-## The legacy PowerShell bridge (fallback)
+## Historical note: the PowerShell bridge
 
-`powershell/te1000-bridge.ps1` is unchanged. The front spawns it per call (64-bit PowerShell
-for the x64 shell; SysWOW64 32-bit PowerShell for a legacy DTE.15.0 shell), with a separate
-`powershell/dialog-watch.ps1` watcher and a pre-flight gate. It implements the same action
-names and returns the same JSON, so the daemon and the bridge are interchangeable from the
-agent's point of view. The daemon and the legacy watcher read the **same**
-`powershell/dialog-allowlist.json`.
+The daemon's action handlers were **ported from** an earlier PowerShell COM bridge
+(`powershell/te1000-bridge.ps1`) that the front spawned per call, with a separate
+dialog-watcher process and a pre-flight gate. That bridge, its watcher, and the per-call
+fallback path have all been **removed** — the native daemon is now the sole backend. The
+daemon's `DialogWatcher.cs` is a faithful in-process port of that watcher, and it reads
+`dialog-allowlist.json` (repo root). Action handlers are 1:1 ports of the old PS cases (the
+porting brief describes the mechanical mapping), so result shapes are byte-identical to what
+the bridge produced.
 
 ## Safety policy
 
 Nothing in this toolchain writes toward the TwinSAFE/TISC safety system. Authoring actions
-reject safety-rooted paths via a **case-insensitive** guard (`PathUtil.AssertNotSafetyPath`
-in the daemon, `Assert-NotSafetyPath` in the bridge; regex `^\s*TISC(\^|$)`, IgnoreCase).
-Safety remains read-only/diagnostic. The dialog allowlist must never auto-answer Activate /
-Run-mode / restart / download / safety prompts.
+reject safety-rooted paths via a **case-insensitive** guard (`PathUtil.AssertNotSafetyPath`;
+regex `^\s*TISC(\^|$)`, IgnoreCase). Safety remains read-only/diagnostic. The dialog
+allowlist must never auto-answer Activate / Run-mode / restart / download / safety prompts.
 
 ## Build & run
 

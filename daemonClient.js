@@ -9,9 +9,9 @@
 // On connect failure the daemon exe is auto-spawned (detached) and the client
 // waits for the pipe. Responses are correlated by id. Reconnects on pipe drop.
 //
-// The Node host (index.js) maps daemon errorKind -> the same user-facing error
-// messages the legacy PS-bridge watchdog produced, so agent-visible behavior is
-// unchanged.
+// The Node host (index.js) maps daemon errorKind -> user-facing error messages;
+// the daemon is the only backend, so runViaDaemon surfaces any error to the
+// caller (there is no fallback path).
 
 const net = require("net");
 const path = require("path");
@@ -124,7 +124,7 @@ async function ensureConnected() {
           if (!daemonExeExists()) {
             throw new Error(
               "Te1000Daemon.exe not found at " + EXE_PATH +
-              ". Build it (daemon/build.ps1) or set TE1000_NO_DAEMON=1 to use the legacy PowerShell bridge.",
+              ". Build it (daemon/build.ps1).",
             );
           }
           spawnDaemon();
@@ -169,7 +169,7 @@ function sendOnce(action, payload) {
         const e = new Error(
           `Te1000Daemon request '${action}' timed out after ${REQUEST_TIMEOUT_MS} ms with no response (daemon may be wedged or the reply was dropped).`,
         );
-        e.daemonUnavailable = true; // let runBridge fall back to the legacy bridge
+        e.daemonUnavailable = true; // daemon is the only backend; error is surfaced to the caller
         reject(e);
       }, REQUEST_TIMEOUT_MS);
     }
@@ -191,14 +191,20 @@ function toError(action, resp) {
   const btns = Array.isArray(d.buttons) && d.buttons.length
     ? d.buttons.map((b) => `[${b}]`).join(" ") : "(none detected)";
   if (kind === "dialog_blocked") {
+    const labels = Array.isArray(d.buttons) && d.buttons.length
+      ? d.buttons.map((b) => `'${b}'`).join(", ") : "(none detected)";
     return new Error(
       `XAE is blocked on a modal dialog, so this '${action}' call cannot complete.\n` +
+      `This dialog is NOT in the auto-dismiss allowlist (dialog-allowlist.json).\n` +
       `  Title:   ${d.title || "(untitled)"}\n` +
       `  Message: ${d.text || "(no text)"}\n` +
       `  Buttons: ${btns}\n` +
-      `The dialog is still open on the machine — clear it there, or add a rule to ` +
-      `powershell/dialog-allowlist.json to auto-dismiss this dialog next time. ` +
-      `The operation's result is indeterminate.`,
+      `ASK THE USER which button to press and whether to remember it (add to the ` +
+      `allowlist so this dialog is auto-dismissed next time). The choices are: ${labels}.\n` +
+      `Then call the 'xae' tool with action 'dialog_resolve', e.g. ` +
+      `{action:'dialog_resolve', button:'No', remember:false}. ` +
+      `(remember:true persists a rule, but destructive prompts — activate/restart/download/safety — are refused for auto-remember.) ` +
+      `The operation's result is indeterminate until the dialog is cleared.`,
     );
   }
   if (kind === "timeout") {
@@ -207,8 +213,8 @@ function toError(action, resp) {
       `(${resp.error || ""})`.trim(),
     );
   }
-  // Parity: the legacy PS bridge path said "Bridge returned failure"; keep the
-  // agent-visible text stable rather than introducing "Daemon returned failure".
+  // Keep the agent-visible text stable ("Bridge returned failure") for parity
+  // with the historical error surface rather than "Daemon returned failure".
   return new Error(resp.error || "Bridge returned failure");
 }
 
@@ -229,9 +235,8 @@ async function runViaDaemon(action, payload = {}) {
         resp = await sendOnce(action, payload); // reconnect + retry once
       } catch (e2) {
         // The pipe is still dropping after a reconnect attempt (a daemon that
-        // connects but immediately closes every frame). Surface this as a
-        // daemon-unavailable error so index.js can fall back to the legacy
-        // bridge instead of treating it as a hard failure (H4a).
+        // connects but immediately closes every frame). Flag it daemon-unavailable
+        // and surface the error to the caller — the daemon is the only backend.
         if (isRetryablePipeError(e2)) e2.daemonUnavailable = true;
         throw e2;
       }

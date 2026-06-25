@@ -6,8 +6,7 @@ using TCatSysManagerLib;
 
 namespace Te1000Daemon
 {
-    // twincat_module_* and twincat_cpp_* actions ported from te1000-bridge.ps1
-    // (L8941-9328).
+    // twincat_module_* and twincat_cpp_* actions.
     //
     // module actions operate under TIRC^TcCOM Objects (create/get_xml/set_xml/
     // enable_symbols) or via the typed ITcModuleManager3 enumeration (list) and

@@ -1,0 +1,14 @@
+{
+  "_comment": "Auto-dismiss rules for XAE modal dialogs that would otherwise block te1000 MCP calls. The daemon's in-process dialog watcher (daemon/DialogWatcher.cs) tries each rule in order against any modal dialog it detects; the FIRST match wins and its button is clicked. A dialog that matches no rule is SURFACED to the calling agent (the MCP call fails with the dialog's title/text/buttons) so the agent can ask the user how to resolve it, then call 'xae dialog_resolve {button, remember?}' to click the chosen button on the live dialog. dialog_resolve with remember:true APPENDS a rule here AND hot-applies it to the running watcher (no daemon restart needed). Disruptive prompts are refused for auto-remember (see _safety). Ships EMPTY (report-only) by default — a fresh clone auto-clicks NOTHING; build the list up yourself, by hand or via dialog_resolve {button, remember:true}.",
+  "_rule_format": {
+    "match": "REQUIRED regex tested (case-insensitive, -match) against the dialog TITLE",
+    "textMatch": "OPTIONAL regex tested against the dialog BODY text; rule only fires if this also matches",
+    "button": "EXACT button label to click (the '&' accelerator is ignored, case-insensitive). e.g. 'Yes', 'No', 'OK'"
+  },
+  "_safety": "These rules cause buttons to be clicked in your XAE instance automatically and unattended — only add dialogs you are certain are safe to auto-answer. NEVER add rules for Activate Configuration / Run-mode / restart / download / boot project / TwinSAFE / safety prompts — those must stay human-confirmed. This is enforced in two places: (1) 'xae dialog_resolve' REFUSES to persist a remember rule when remember:true matches a disruptive prompt (activate.*config / run-mode / restart / download / boot project / twinsafe / safety / set.*run / reset.*twincat) — the one-time human-chosen click still happens and it reports rememberRefused with the reason; and (2) the watcher itself never auto-clicks a dialog matching that pattern, even if a rule here would otherwise match it. Prefer matching the non-destructive button (No/Cancel) when in doubt.",
+  "_examples": [
+    { "match": "File Modification Detected", "button": "Yes" },
+    { "match": "Microsoft Visual Studio", "textMatch": "has been modified outside", "button": "Yes" }
+  ],
+  "rules": []
+}

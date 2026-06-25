@@ -3,9 +3,8 @@ using System.Text.RegularExpressions;
 
 namespace Te1000Daemon
 {
-    // Pure '^'-path helpers ported from te1000-bridge.ps1 (no COM). The TISC
-    // safety rejection MUST match the PS bridge byte-for-byte (Assert-NotSafetyPath
-    // L1576) — nothing in this toolchain may write toward the EL6910 safety system.
+    // Pure '^'-path helpers (no COM). The TISC safety rejection is exact —
+    // nothing in this toolchain may write toward the EL6910 safety system.
     public static class PathUtil
     {
         // Assert-NotSafetyPath (L1576-1587): reject any path rooted at the TISC

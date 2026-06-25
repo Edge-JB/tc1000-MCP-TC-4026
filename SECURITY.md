@@ -1,9 +1,10 @@
 # Security Policy
 
 `te1000-mcp` (TwinCAT-XAE-MCP) is an MCP server that drives a **real engineering tool** and can
-**deploy to a live PLC**. Because of that, security here is not only about the Node/PowerShell code
-— it is also about the **safety guards** that keep an AI agent from touching a running machine
-without an explicit, human-supplied confirmation. We take reports about either seriously.
+**activate or download to a TwinCAT runtime**. Because of that, security here is not only about the
+Node front end and C# daemon code — it is also about the **safety guards** that keep an AI agent
+from touching a target runtime without an explicit, human-supplied confirmation. We take reports
+about either seriously.
 
 ## Supported versions
 
@@ -41,15 +42,15 @@ Please include:
 In addition to ordinary code vulnerabilities (input handling, injection, dependency CVEs), the
 following are in scope because they undermine the project's safety model:
 
-- A way to perform a **live-target, destructive, or licensing action** (activate, restart,
+- A way to perform a **runtime-affecting, destructive, or licensing action** (activate, restart,
   download, deletes, license writes) **without the required `confirm` token**, or to bypass the
-  guard enforcement in either `index.js` **or** `powershell/te1000-bridge.ps1`.
+  guard enforcement in either `index.js` **or** the native daemon (`daemon/`).
 - A path that lets a tool **write toward the safety project** (any `TISC`-rooted path) despite
-  `Assert-NotSafetyPath`.
+  `PathUtil.AssertNotSafetyPath`.
 - A way to make the **dialog watchdog auto-answer** a prompt it must never auto-answer (Activate
   Configuration, Run-mode, restart, download, or any safety prompt).
 
-Out of scope: the inherent fact that *confirmed* guarded actions reach the live target — that is
+Out of scope: the inherent fact that *confirmed* guarded actions reach the target runtime — that is
 the intended, documented behavior (see [`docs/operations.md`](docs/operations.md) and
 [`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
@@ -59,4 +60,4 @@ the intended, documented behavior (see [`docs/operations.md`](docs/operations.md
 - We will work with you on a fix and a coordinated disclosure timeline, and credit you in the
   release notes if you would like.
 
-Thank you for helping keep `te1000-mcp` — and the machines it can reach — safe.
+Thank you for helping keep `te1000-mcp` — and the runtimes it can reach — safe.

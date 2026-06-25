@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 // te1000-mcp: MCP server for the Beckhoff TwinCAT XAE / TE1000 Automation
-// Interface, via the PowerShell COM bridge (powershell/te1000-bridge.ps1).
+// Interface. Every action is served by a persistent native C#/.NET daemon
+// (daemon/Te1000Daemon.exe) over a named pipe (see daemonClient.js): it acquires
+// DTE+sysmanager ONCE and watches for modal dialogs on an internal thread,
+// eliminating the per-call powershell.exe spawn and the O(tree-size) re-walk.
 // v2: tool surface grouped by noun with action enums, terse schemas, compact
-// outputs — agent context is the scarce resource. The bridge is unchanged and
-// still answers the original fine-grained action names; this file maps the
-// merged tools onto them. plc_login/plc_logout were dropped from the surface
-// (DTE on the 64-bit shell exposes no window automation, so they never worked
-// here); reach them via xae_command if ever needed on another shell.
+// outputs — agent context is the scarce resource. The daemon answers the
+// original fine-grained action names; this file maps the merged tools onto them.
+// plc_login/plc_logout were dropped from the surface (DTE on the 64-bit shell
+// exposes no window automation, so they never worked here); reach them via
+// xae_command if ever needed on another shell.
 "use strict";
 
 const { spawn } = require("child_process");
 const path = require("path");
-const os = require("os");
-const fs = require("fs");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const daemonClient = require("./daemonClient.js");
@@ -21,18 +22,6 @@ const daemonClient = require("./daemonClient.js");
 // map also live there (the schema descriptions interpolate the tokens), and are
 // re-imported here so the handlers reference the same definitions.
 const { toolSchemas, XAE_ACTIONS } = require("./toolSchemas.js");
-
-// --- Daemon vs. legacy PowerShell bridge -----------------------------------
-// v2.1: a persistent native C#/.NET daemon (daemon/Te1000Daemon.exe) serves the
-// action surface over a named pipe, acquiring DTE+sysmanager ONCE and watching
-// for modal dialogs on an internal thread — eliminating the per-call
-// powershell.exe spawn (+watcher) and the O(tree-size) re-walk. The legacy PS
-// bridge stays as a full fallback behind TE1000_NO_DAEMON=1.
-//
-// Daemon requires the 64-bit TcXaeShell (DTE.17.0 / x64 exe). On a 32-bit-only
-// shell we auto-fall back to the legacy PS spawn (which already picks SysWOW64).
-const HAS_X64_SHELL = fs.existsSync("C:\\Program Files\\Beckhoff\\TcXaeShell\\Common7\\IDE\\PublicAssemblies\\envdte.dll");
-const USE_DAEMON = process.env.TE1000_NO_DAEMON !== "1" && HAS_X64_SHELL;
 
 // Confirmation tokens are defined in toolSchemas.js (so the schema descriptions and
 // the handler guards share one definition) and re-exported on that module.
@@ -51,91 +40,11 @@ const {
   LICENSE_ACTIVATE_CONFIRMATION,
 } = require("./toolSchemas.js");
 
-// --- Modal-dialog watchdog -------------------------------------------------
-// A bridge COM call into XAE blocks until any modal dialog it raises is
-// dismissed by a human, hanging the MCP call forever. dialog-watch.ps1 runs
-// alongside each call: it detects the modal dialog, auto-clicks allowlisted
-// ones, and otherwise lets us fail the call with the dialog's details instead
-// of hanging. Toggle/tune via env:
-//   TE1000_DIALOG_WATCH=0        disable the watchdog entirely
-//   TE1000_DIALOG_AUTODISMISS=0  detect+report only, never auto-click
-//   TE1000_DIALOG_GRACE_MS=N     how long a blocking dialog must persist before
-//                                we abandon the call (default 4000)
-//   TE1000_BRIDGE_TIMEOUT_MS=N   optional wall-clock backstop (default 0 = off,
-//                                so long builds are never killed)
-const DIALOG_WATCH = process.env.TE1000_DIALOG_WATCH !== "0";
-const AUTO_DISMISS = process.env.TE1000_DIALOG_AUTODISMISS !== "0";
-const BLOCK_GRACE_MS = Number(process.env.TE1000_DIALOG_GRACE_MS) || 4000;
-const HARD_TIMEOUT_MS = Number(process.env.TE1000_BRIDGE_TIMEOUT_MS) || 0;
-let callSeq = 0;
-
-function killTree(child) {
-  if (!child || child.pid === undefined) return;
-  try { child.kill(); } catch {}
-  try { spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
-}
-
-// 64-bit TcXaeShell (DTE.17.0) needs 64-bit PowerShell; the legacy 32-bit shell (DTE.15.0) needs SysWOW64.
-function resolveBridgePaths() {
+// 64-bit TcXaeShell (DTE.17.0) implies a 64-bit Windows, so the live UIA helper
+// (sessionCall below) runs under 64-bit Windows PowerShell.
+function ps64Exe() {
   const winDir = process.env.WINDIR || "C:\\Windows";
-  const ps64 = path.join(winDir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const psWow = path.join(winDir, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const use64 = fs.existsSync("C:\\Program Files\\Beckhoff\\TcXaeShell\\Common7\\IDE\\PublicAssemblies\\envdte.dll");
-  return {
-    psExe: use64 ? ps64 : psWow,
-    scriptPath: path.join(__dirname, "powershell", "te1000-bridge.ps1"),
-    watchPath: path.join(__dirname, "powershell", "dialog-watch.ps1"),
-    allowlistPath: path.join(__dirname, "powershell", "dialog-allowlist.json"),
-  };
-}
-
-// One-shot dialog probe (auto-dismisses allowlisted dialogs when AUTO_DISMISS).
-// Returns the snapshot object, or null if the probe couldn't run.
-function probeDialogOnce() {
-  return new Promise((resolve) => {
-    const { psExe, watchPath, allowlistPath } = resolveBridgePaths();
-    const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", watchPath, "-Mode", "probe", "-AllowlistPath", allowlistPath];
-    if (AUTO_DISMISS) args.push("-AutoDismiss");
-    let out = "";
-    let done = false;
-    const finish = (v) => { if (!done) { done = true; resolve(v); } };
-    try {
-      const c = spawn(psExe, args, { stdio: ["ignore", "pipe", "ignore"] });
-      c.stdout.on("data", (d) => { out += d.toString(); });
-      c.on("error", () => finish(null));
-      c.on("close", () => {
-        const line = out.trim().split(/\r?\n/).filter(Boolean).pop();
-        try { finish(JSON.parse(line)); } catch { finish(null); }
-      });
-      setTimeout(() => { try { c.kill(); } catch {} finish(null); }, 15000); // don't let the gate itself hang
-    } catch { finish(null); }
-  });
-}
-
-// Pre-flight: a modal dialog already sitting in XAE (file changed outside the
-// editor, lost target connection, an earlier un-cleared prompt) corrupts the
-// next command's result ("No solution is open", etc.) and hangs the old code.
-// So before running anything: probe, auto-dismiss if allowlisted, and refuse to
-// run with the dialog's details if a blocking prompt remains.
-async function preflightGate(action) {
-  if (!DIALOG_WATCH) return;
-  let snap = await probeDialogOnce();
-  if (snap && snap.found && snap.dismissed) {
-    await new Promise((r) => setTimeout(r, 400)); // let the dismissed dialog tear down
-    snap = await probeDialogOnce();
-  }
-  if (snap && snap.found && snap.blocking) {
-    const btns = Array.isArray(snap.buttons) && snap.buttons.length ? snap.buttons.map((b) => `[${b}]`).join(" ") : "(none detected)";
-    throw new Error(
-      `Pre-flight blocked '${action}': XAE already has a modal dialog open, so the command was NOT run ` +
-      `(a lingering prompt corrupts command results and would otherwise hang).\n` +
-      `  Title:   ${snap.title || "(untitled)"}\n` +
-      `  Message: ${snap.text || "(no text)"}\n` +
-      `  Buttons: ${btns}\n` +
-      `Clear it on the machine, or add a rule to powershell/dialog-allowlist.json to auto-dismiss ` +
-      `it (then this call proceeds automatically).`,
-    );
-  }
+  return path.join(winDir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
 // PLC online-session control via UI Automation (powershell/plc-session.ps1).
@@ -145,7 +54,7 @@ async function preflightGate(action) {
 // button (never Login). Returns the parsed snapshot, or null if it couldn't run.
 function sessionCall(mode) {
   return new Promise((resolve) => {
-    const { psExe } = resolveBridgePaths();
+    const psExe = ps64Exe();
     const scriptPath = path.join(__dirname, "powershell", "plc-session.ps1");
     const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-Mode", mode];
     let out = "";
@@ -166,172 +75,11 @@ function sessionCall(mode) {
 
 async function bridgeCall(action, payload = {}) {
   if (process.env.TE1000_PROGID && !payload.progId) payload.progId = process.env.TE1000_PROGID;
-  // In daemon mode the daemon runs the dialog watcher internally and refuses /
-  // recycles on a persistent modal, so the per-call preflight probe (an extra
-  // powershell.exe spawn) is redundant. Legacy mode keeps the preflight gate.
-  // (When daemon mode FALLS BACK to the legacy bridge, runBridge re-applies the
-  // preflight gate before the legacy call — see runBridge / runLegacyWithGate.)
-  if (!USE_DAEMON) await preflightGate(action);
   return runBridge(action, payload);
 }
 
-// Process-lifetime latch: once the daemon proves unavailable (not found / can't
-// connect / persistently dropping the pipe), route subsequent calls straight to
-// the legacy bridge instead of each paying the full CONNECT_TIMEOUT (~20s). M1.
-let daemonUnavailableLatched = false;
-
-// A daemon error means "fall back to legacy" when: the exe is missing, the
-// connect timed out, or (H4a) the client flagged the call daemon-unavailable
-// (persistent pipe-closed after its one retry, or a per-request timeout).
-function shouldFallBackToLegacy(err) {
-  if (err && err.daemonUnavailable) return true;
-  return /Te1000Daemon\.exe not found|Timed out connecting to Te1000Daemon/i.test(err && err.message || "");
-}
-
-// Run the legacy bridge, but first re-apply the same dialog preflight gate the
-// non-daemon path always runs (H4b). Skipping it on fallback would let a lingering
-// modal corrupt/hang the legacy call.
-async function runLegacyWithGate(action, payload) {
-  await preflightGate(action);
-  return runBridgeLegacy(action, payload);
-}
-
 function runBridge(action, payload = {}) {
-  if (USE_DAEMON && !daemonUnavailableLatched) {
-    return daemonClient.runViaDaemon(action, payload).catch((err) => {
-      // If the daemon is unreachable/failed/persistently dropping, fall back to
-      // the legacy PowerShell bridge for this call so the MCP stays functional,
-      // and latch so future calls skip the connect attempt entirely (M1).
-      if (shouldFallBackToLegacy(err)) {
-        if (!daemonUnavailableLatched) {
-          daemonUnavailableLatched = true;
-          console.error("te1000-mcp: daemon unavailable, latching to legacy PS bridge:", err.message);
-        }
-        return runLegacyWithGate(action, payload);
-      }
-      throw err;
-    });
-  }
-  // Latched-unavailable or daemon disabled: legacy path WITH the preflight gate
-  // (the latched-daemon path would otherwise skip it).
-  if (USE_DAEMON && daemonUnavailableLatched) return runLegacyWithGate(action, payload);
-  return runBridgeLegacy(action, payload);
-}
-
-function runBridgeLegacy(action, payload = {}) {
-  return new Promise((resolve, reject) => {
-    const scriptPath = path.join(__dirname, "powershell", "te1000-bridge.ps1");
-    const watchPath = path.join(__dirname, "powershell", "dialog-watch.ps1");
-    const allowlistPath = path.join(__dirname, "powershell", "dialog-allowlist.json");
-    const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
-    // 64-bit TcXaeShell (DTE.17.0) needs 64-bit PowerShell; the legacy 32-bit shell (DTE.15.0) needs SysWOW64.
-    const winDir = process.env.WINDIR || "C:\\Windows";
-    const ps64 = path.join(winDir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const psWow = path.join(winDir, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const use64 = fs.existsSync("C:\\Program Files\\Beckhoff\\TcXaeShell\\Common7\\IDE\\PublicAssemblies\\envdte.dll");
-    const psExe = use64 ? ps64 : psWow;
-    const child = spawn(
-      psExe,
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-Action", action, "-PayloadBase64", encodedPayload],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-
-    // --- dialog watchdog ---------------------------------------------------
-    let settled = false;
-    let watcher = null;
-    let pollTimer = null;
-    let hardTimer = null;
-    let blockingSince = null;
-    let lastDialog = null;
-    const outFile = path.join(os.tmpdir(), `te1000-dlg-${process.pid}-${Date.now()}-${callSeq++}.json`);
-    const stopFile = `${outFile}.stop`;
-
-    const cleanup = () => {
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-      if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
-      try { fs.writeFileSync(stopFile, "1"); } catch {}
-      if (watcher) { try { watcher.kill(); } catch {} watcher = null; }
-      setTimeout(() => { for (const f of [outFile, stopFile]) { try { fs.unlinkSync(f); } catch {} } }, 2000);
-    };
-
-    if (DIALOG_WATCH) {
-      const wargs = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", watchPath, "-Mode", "guard",
-        "-OutFile", outFile, "-StopFile", stopFile, "-AllowlistPath", allowlistPath];
-      if (AUTO_DISMISS) wargs.push("-AutoDismiss");
-      try {
-        watcher = spawn(psExe, wargs, { stdio: "ignore" });
-        watcher.on("error", () => {});
-      } catch { watcher = null; }
-
-      pollTimer = setInterval(() => {
-        if (settled) return;
-        let snap;
-        try { snap = JSON.parse(fs.readFileSync(outFile, "utf8")); } catch { return; }
-        if (snap && snap.found && snap.blocking) {
-          lastDialog = snap;
-          if (blockingSince === null) blockingSince = Date.now();
-          else if (Date.now() - blockingSince >= BLOCK_GRACE_MS) {
-            settled = true;
-            const d = lastDialog || {};
-            const btns = Array.isArray(d.buttons) && d.buttons.length ? d.buttons.map((b) => `[${b}]`).join(" ") : "(none detected)";
-            killTree(child);
-            cleanup();
-            reject(new Error(
-              `XAE is blocked on a modal dialog, so this '${action}' call cannot complete.\n` +
-              `  Title:   ${d.title || "(untitled)"}\n` +
-              `  Message: ${d.text || "(no text)"}\n` +
-              `  Buttons: ${btns}\n` +
-              `The dialog is still open on the machine — clear it there, or add a rule to ` +
-              `powershell/dialog-allowlist.json to auto-dismiss this dialog next time. ` +
-              `The operation's result is indeterminate.`,
-            ));
-          }
-        } else {
-          blockingSince = null;
-        }
-      }, 1000);
-    }
-
-    if (HARD_TIMEOUT_MS > 0) {
-      hardTimer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        killTree(child);
-        cleanup();
-        reject(new Error(`Bridge call '${action}' exceeded TE1000_BRIDGE_TIMEOUT_MS (${HARD_TIMEOUT_MS} ms); no modal dialog was detected — XAE may be busy.`));
-      }, HARD_TIMEOUT_MS);
-    }
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(err);
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (code !== 0) {
-        reject(new Error(`Bridge failed with exit code ${code}: ${stderr || stdout}`.trim()));
-        return;
-      }
-      try {
-        const parsed = JSON.parse(stdout);
-        if (!parsed.ok) {
-          reject(new Error(parsed.error || "Bridge returned failure"));
-          return;
-        }
-        resolve(parsed.data);
-      } catch (error) {
-        reject(new Error(`Failed to parse bridge output: ${error.message}\n${stdout}`));
-      }
-    });
-  });
+  return daemonClient.runViaDaemon(action, payload);
 }
 
 function text(s) {
@@ -357,6 +105,21 @@ function prune(v) {
 
 function textResult(data) {
   if (data && typeof data === "object") {
+    if ("resolved" in data && ("clicked" in data || data.resolved === false)) {
+      if (data.resolved === false) return text(`no modal dialog open (${data.reason || "nothing to resolve"})`);
+      const lines = [
+        `${data.clicked ? "clicked" : "FAILED to click"} [${data.button}] on "${data.title || ""}"`,
+      ];
+      if (data.remembered) {
+        // remembered:true means the rule was applied in-memory (hot-applied to the
+        // watcher). A refuseReason alongside it means the FILE write failed — surface
+        // it so the user knows it won't persist across a daemon restart.
+        if (data.refuseReason) lines.push(`remembered IN-MEMORY only (hot-applied to the watcher) — NOT persisted: ${data.refuseReason}`);
+        else lines.push("remembered: added an auto-dismiss rule to dialog-allowlist.json (hot-applied to the watcher)");
+      } else if (data.rememberRefused) lines.push(`NOT remembered: ${data.refuseReason || "disruptive prompt refused for auto-remember"}`);
+      else if (data.refuseReason) lines.push(`NOT remembered: ${data.refuseReason}`);
+      return text(lines.join("\n"));
+    }
     if ("watching" in data && "found" in data) {
       if (!data.watching) return text("dialog watcher is disabled (daemon started with --no-watch)");
       if (!data.found) return text("no modal dialog open in XAE");
@@ -392,12 +155,12 @@ function need(params, keys, action) {
   }
 }
 
-const server = new McpServer({ name: "te1000-mcp", version: "2.1.2" });
+const server = new McpServer({ name: "te1000-mcp", version: "2.2.0" });
 
 server.registerTool(
   "xae",
   toolSchemas.xae,
-  async ({ action, solutionPath, closeExisting, discardChanges, filter, limit, mode }) => {
+  async ({ action, solutionPath, closeExisting, discardChanges, filter, limit, button, remember, mode }) => {
     const payload = { mode };
     if (action === "open_solution") {
       need({ solutionPath }, ["solutionPath"], action);
@@ -405,6 +168,10 @@ server.registerTool(
     }
     if (action === "list_commands") Object.assign(payload, { filter, limit });
     if (action === "error_list") payload.limit = limit;
+    if (action === "dialog_resolve") {
+      need({ button }, ["button"], action);
+      Object.assign(payload, { button, remember: remember === true });
+    }
     return textResult(await bridgeCall(XAE_ACTIONS[action], payload));
   },
 );
@@ -1184,12 +951,7 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(
-    "te1000-mcp server running on stdio (" +
-    (USE_DAEMON ? "native daemon mode" : "legacy PowerShell bridge mode") +
-    (process.env.TE1000_NO_DAEMON === "1" ? "; TE1000_NO_DAEMON=1" : (!HAS_X64_SHELL ? "; no x64 shell detected" : "")) +
-    ")",
-  );
+  console.error("te1000-mcp server running on stdio (native daemon mode)");
 }
 
 main().catch((error) => {
